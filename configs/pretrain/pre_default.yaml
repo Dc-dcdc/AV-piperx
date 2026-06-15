@@ -38,7 +38,7 @@ video_backend: pyav # 视频解码引擎，读取视频文件转化为图像张�
 eval:
   checkpoint_metric: "loss" # 筛选指标：可选 'loss' 或 'reward'
   max_checkpoints: 15     # 最多保存loss最小的几个模型快照
-  n_episodes: 20              # 每次评估跑多少个完整的 episode
+  n_episodes: 10              # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 1    # 最多保存前几个 episode 的录像视频
   # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
   batch_size: 1

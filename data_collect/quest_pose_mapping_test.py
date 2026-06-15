@@ -308,13 +308,11 @@ def run_mujoco_viewer_loop(args) -> None:
         host=args.host,
         port=args.port,
         timeout=recv_timeout,
-        convert_to_mujoco=args.convert_to_mujoco, # 是否转为右手坐标系
     )
     try:
         print(f"Listening for Quest3 UDP JSON on {args.host}:{args.port}")
         print(f"MuJoCo viewer XML: {xml_path}")
         print("Pipeline: QuestReceive -> QuestPoseMapper -> MuJoCo mocap cubes")
-        print(f"Coordinate conversion: {'Unity/Quest -> MuJoCo' if args.convert_to_mujoco else 'disabled, raw Unity/Quest pose'}")
         print(f"Relative pose: {args.use_relative_pose}; head frame: {args.use_head_frame}; target frame: {args.target_frame_body}")
         print("Start: A/X or first packet, depending on --start-on-button.")
         print("Reset: B/Y returns cubes to XML initial pose.")
@@ -431,13 +429,11 @@ def run_quest_control_viewer_loop(args) -> None:
         host=args.host,
         port=args.port,
         timeout=recv_timeout,
-        convert_to_mujoco=args.convert_to_mujoco,
     )
     try:
         print(f"Listening for Quest3 UDP JSON on {args.host}:{args.port}")
         print(f"MuJoCo viewer XML: {xml_path}")
         print("Pipeline: QuestReceive -> QuestControl.run -> MuJoCo mocap cubes")
-        print(f"Coordinate conversion: {'Unity/Quest -> MuJoCo' if args.convert_to_mujoco else 'disabled, raw Unity/Quest pose'}")
         print("QuestControl mode: three mocap cubes directly visualize QuestControl.run() output.")
         print(f"Individual hand anchors: {args.individual_hand_anchors}")
         print("Start: A/X or first packet, depending on --start-on-button.")
@@ -528,7 +524,6 @@ def run_print_loop(args) -> None:
         host=args.host,
         port=args.port,
         timeout=args.timeout,
-        convert_to_mujoco=args.convert_to_mujoco,
     )
     try:
         print(f"Listening for Quest3 UDP JSON on {args.host}:{args.port}")
@@ -563,7 +558,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=1.0, help="等待 UDP 数据的超时时间，单位秒。")
     parser.add_argument("--print-hz", type=float, default=30.0, help="终端最大打印频率；填 0 表示每个包都打印。")
     parser.add_argument("--format", choices=("default", "raw", "both"), default="default", help="终端输出格式；raw/both 仅兼容保留，当前显示解析后的 HeadsetData。")
-    parser.add_argument("--convert-to-mujoco", type=_str_to_bool, default=True, help="是否将 Unity/Quest 坐标转换到 MuJoCo 坐标，填写 true/false。")
     parser.add_argument("--use-relative-pose", type=_str_to_bool, default=True, help="是否使用头显锚定后的相对位姿映射，填写 true/false。")
     parser.add_argument("--use-head-frame", type=_str_to_bool, default=True, help="是否用开始时的头显 yaw 作为控制坐标系，填写 true/false。")
     parser.add_argument("--allow-partial-anchor", type=_str_to_bool, default=False, help="是否允许只有部分 Quest 位姿有效时开始锚定，填写 true/false。")

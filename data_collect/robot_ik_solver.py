@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 from dataclasses import dataclass
@@ -64,12 +63,14 @@ class PoseActionIKSolver:
     }
     QUEST_SOURCE_BY_ARM = {"left": "left", "right": "right", "middle": "head"}
 
+    # 初始化 IK 求解器、末端 site 和各臂控制器。
     def __init__(
         self,
         sim_env,
         *,
         head_control: bool = True,
         lock_roll: bool = True,
+        lock_pitch: bool = False,
         hand_position_scale: float = 1.0,
         hand_max_delta: float = 1.0,
         head_position_scale: float = 1.0,
@@ -82,6 +83,7 @@ class PoseActionIKSolver:
         self.physics = sim_env._physics
         self.head_control = bool(head_control)
         self.lock_roll = bool(lock_roll)
+        self.lock_pitch = bool(lock_pitch)
         self.hand_position_scale = float(hand_position_scale)
         self.hand_max_delta = float(hand_max_delta)
         self.head_position_scale = float(head_position_scale)
@@ -164,50 +166,38 @@ class PoseActionIKSolver:
         }
         self.reset(active=active_on_reset)
 
-    @classmethod
-    def from_args(cls, sim_env, args: argparse.Namespace) -> PoseActionIKSolver:
-        return cls(
-            sim_env,
-            head_control=args.head_control,
-            lock_roll=args.lock_roll,
-            hand_position_scale=args.hand_position_scale,
-            hand_max_delta=args.hand_max_delta,
-            head_position_scale=args.head_position_scale,
-            head_max_delta=args.head_max_delta,
-            workspace_low=args.workspace_low,
-            workspace_high=args.workspace_high,
-        )
-
+    # 查找 MuJoCo 模型中的指定末端 site，用来读取末端位姿
     def _find_site(self, site_name: str):
         site = self.sim_env._mjcf_root.find("site", site_name)
         if site is None:
             raise RuntimeError(f"Cannot find EEF site: {site_name}")
         return site
 
+    # 读取末端 site 在世界系下的位置和四元数。
     def _read_eef_pose(self, eef_site) -> tuple[np.ndarray, np.ndarray]:
         site = self.physics.bind(eef_site)
         pos = site.xpos.copy().astype(np.float64)
         quat = xyzw_to_wxyz(mat2quat(site.xmat.reshape(3, 3))).astype(np.float64)
         return pos, quat
 
-    # 获取机械臂的状态，包括要用的关节、EEF site、IK 控制器
+    # 构建每条机械臂的 IK 状态配置。
     def _make_arm_states(self) -> list[ArmIKState]:
         left_pos, left_quat = self._read_eef_pose(self._left_eef_site)
         right_pos, right_quat = self._read_eef_pose(self._right_eef_site)
         states = [
             ArmIKState(
-                name="left",
-                joints=self.sim_env._left_joints[:6],
-                eef_site=self._left_eef_site,
-                ik=self._left_controller,
-                action_slice=slice(0, 6),
-                position_scale=self.hand_position_scale,  
-                max_delta=self.hand_max_delta,
-                eef_anchor_pos=left_pos.copy(),
-                eef_anchor_quat=left_quat.copy(),
-                target_pos=left_pos.copy(),
-                target_quat=left_quat.copy(),
-                gripper_index=6,
+                name="left",  
+                joints=self.sim_env._left_joints[:6],   # 左臂参与 IK 的 6 个关节。
+                eef_site=self._left_eef_site,           # 末端 site。
+                ik=self._left_controller,               # 使用的 GradIK 求解器。
+                action_slice=slice(0, 6),               # 关节结果写入 action 的范围。
+                position_scale=self.hand_position_scale,# 位移缩放系数。
+                max_delta=self.hand_max_delta,          # 相对锚点的最大位移。
+                eef_anchor_pos=left_pos.copy(),         # 末端锚点位置。
+                eef_anchor_quat=left_quat.copy(),       # 末端锚点姿态。
+                target_pos=left_pos.copy(),             # 当前目标位置。
+                target_quat=left_quat.copy(),           # 当前目标姿态。
+                gripper_index=6,                        # 夹爪写入 action 的下标。
             ),
             ArmIKState(
                 name="right",
@@ -245,6 +235,7 @@ class PoseActionIKSolver:
             )
         return states
 
+    # 重置各臂锚点、目标位姿和激活状态。
     def reset(self, *, active: bool = False) -> None:
         for state in self.states:
             pos, quat = self._read_eef_pose(state.eef_site)
@@ -257,14 +248,12 @@ class PoseActionIKSolver:
             state.last_q_target = None
             state.last_q_error = None
 
-    def activate_all(self) -> int:
-        self.reset(active=True)
-        return len(self.states)
-
+    # 判断当前 Quest 数据是否足够用于开始锚定。
     def can_anchor_from_data(self, data: HeadsetData, *, allow_partial: bool = False) -> bool:
         readiness = [self._quest_source_ready(data, self.QUEST_SOURCE_BY_ARM[state.name]) for state in self.states]
         return any(readiness) if allow_partial else all(readiness)
 
+    # 根据可用 Quest 数据激活对应机械臂并刷新锚点。
     def activate_from_data(self, data: HeadsetData, *, require_all: bool = True) -> int:
         missing = sorted(
             {
@@ -304,6 +293,7 @@ class PoseActionIKSolver:
             print(f"Quest IK anchored {active_count} arm(s). EEF anchors: {summary}")
         return active_count
 
+    # 读取当前三条机械臂的末端位姿。
     def current_three_arm_poses(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         poses = []
         for name in ("left", "right", "middle"):
@@ -311,6 +301,7 @@ class PoseActionIKSolver:
             poses.append(np.concatenate([pos, quat]).astype(np.float64))
         return poses[0], poses[1], poses[2]
 
+    # 将 QuestControl 输出的位姿动作转换为 env.step 的关节动作。
     def pose2joint(
         self,
         pose_action: np.ndarray,
@@ -343,8 +334,10 @@ class PoseActionIKSolver:
             state.target_pos = self._apply_workspace(state.eef_anchor_pos + target_delta)
 
             state.target_quat = self._unit_quat(np.asarray(pose_action[quat_slice], dtype=np.float64), default_w_last=False)
-            if self.lock_roll and state.name == "middle":
-                state.target_quat = self._middle_quat_without_roll(state.target_quat, state.eef_anchor_quat)
+
+            # 中间臂可按配置锁定头显相对初始姿态中的 pitch/roll。
+            if state.name == "middle" and (self.lock_roll or self.lock_pitch):
+                state.target_quat = self._middle_quat_with_locked_axes(state.target_quat, state.eef_anchor_quat)
 
             if state.gripper_index is not None and gripper_pose_index is not None:
                 close_value = float(np.clip(pose_action[gripper_pose_index], 0.0, 1.0))
@@ -364,20 +357,13 @@ class PoseActionIKSolver:
 
         return action, active_count
 
-    def pose_action_to_joint_action(
-        self,
-        pose_action: np.ndarray,
-        obs: dict | None = None,
-        *,
-        current_action: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, int]:
-        return self.pose2joint(pose_action, obs, current_action=current_action)
-
+    # 将目标位置限制在配置的工作空间范围内。
     def _apply_workspace(self, target_pos: np.ndarray) -> np.ndarray:
         if self.workspace_low is None or self.workspace_high is None:
             return target_pos
         return np.clip(target_pos, self.workspace_low, self.workspace_high)
 
+    # 读取当前环境关节状态作为动作基准。
     def _current_agent_pos(self) -> np.ndarray:
         left_qpos = self.physics.bind(self.sim_env._left_joints).qpos.copy()
         right_qpos = self.physics.bind(self.sim_env._right_joints).qpos.copy()
@@ -391,6 +377,7 @@ class PoseActionIKSolver:
             return np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float64)
         return np.concatenate([left_qpos, right_qpos]).astype(np.float64)
 
+    # 取出指定 Quest 源的位姿。
     @staticmethod
     def _quest_pose(data: HeadsetData, source: str) -> tuple[np.ndarray, np.ndarray]:
         if source == "head":
@@ -401,11 +388,13 @@ class PoseActionIKSolver:
             return data.r_pos.copy(), data.r_quat.copy()
         raise ValueError(f"Unsupported Quest source: {source}")
 
+    # 判断指定 Quest 源是否有可用位姿。
     @classmethod
     def _quest_source_ready(cls, data: HeadsetData, source: str) -> bool:
         pos, quat = cls._quest_pose(data, source)
         return bool(np.linalg.norm(pos) > 1e-6 and np.linalg.norm(quat) > 1e-6)
 
+    # 归一化四元数，输入无效时返回默认值。
     @staticmethod
     def _unit_quat(quat: np.ndarray, *, default_w_last: bool) -> np.ndarray:
         quat = np.asarray(quat, dtype=np.float64).reshape(4)
@@ -414,7 +403,8 @@ class PoseActionIKSolver:
             return np.array([0.0, 0.0, 0.0, 1.0] if default_w_last else [1.0, 0.0, 0.0, 0.0], dtype=np.float64)
         return quat / norm
 
-    def _middle_quat_without_roll(self, target_quat_wxyz: np.ndarray, anchor_quat_wxyz: np.ndarray) -> np.ndarray:
+    # 根据配置锁定中间臂相对初始姿态的 pitch/roll。
+    def _middle_quat_with_locked_axes(self, target_quat_wxyz: np.ndarray, anchor_quat_wxyz: np.ndarray) -> np.ndarray:
         target_quat_wxyz = self._unit_quat(target_quat_wxyz, default_w_last=False)
         anchor_quat_wxyz = self._unit_quat(anchor_quat_wxyz, default_w_last=False)
 
@@ -424,5 +414,9 @@ class PoseActionIKSolver:
         anchor_rot = R.from_quat(
             np.array([anchor_quat_wxyz[1], anchor_quat_wxyz[2], anchor_quat_wxyz[3], anchor_quat_wxyz[0]], dtype=np.float64)
         )
-        yaw, pitch, _roll = (anchor_rot.inv() * target_rot).as_euler("zyx", degrees=False)
-        return xyzw_to_wxyz((anchor_rot * R.from_euler("zyx", [yaw, pitch, 0.0], degrees=False)).as_quat().astype(np.float64))
+        yaw, pitch, roll = (anchor_rot.inv() * target_rot).as_euler("zyx", degrees=False)
+        if self.lock_pitch:
+            pitch = 0.0
+        if self.lock_roll:
+            roll = 0.0
+        return xyzw_to_wxyz((anchor_rot * R.from_euler("zyx", [yaw, pitch, roll], degrees=False)).as_quat().astype(np.float64))

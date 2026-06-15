@@ -263,7 +263,7 @@ def transform_coordinates(
     S = np.array([
         [1.0,  0.0, 0.0],   # MuJoCo x = Unity x
         [0.0, 0.0, 1.0],    # MuJoCo y = Unity z
-        [0.0,  -1.0, 0.0],  # MuJoCo z = -Unity y
+        [0.0,  1.0, 0.0],   # MuJoCo z =  Unity y
     ], dtype=np.float64)
     S_inv = np.linalg.inv(S)
 

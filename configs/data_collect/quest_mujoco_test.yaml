@@ -1,0 +1,41 @@
+# Quest3 -> MuJoCo 三臂遥操作测试默认配置
+
+# ===== 1. Quest3 位姿通信 =====
+host: 0.0.0.0  # 监听所有网卡地址
+port: 5005  # Quest3 数据接收端口
+timeout: 0.05  # socket 超时阈值（秒）
+
+# ===== 2. 仿真与控制 =====
+env_id: guided_vision/SewNeedle-3Arms-v0  # 仿真环境名称
+hand_position_scale: 1.0      # 手部位置缩放系数
+head_position_scale: 1.2      # 头部位置缩放系数
+hand_max_delta: 1.0           # 左右臂末端相对锚点的最大位移
+head_max_delta: 1.0           # 中间臂末端相对锚点的最大位移
+head_control: true            # 是否使用头显控制中间臂
+individual_hand_anchors: true  # 左右臂是否分别使用各自手柄锚点
+lock_roll: true               # 是否锁定中间臂 roll 角
+episode_length: 100000        # 任务最大步数
+workspace_low: null           # 末端目标工作空间下界，格式 [x, y, z]
+workspace_high: null          # 末端目标工作空间上界，格式 [x, y, z]
+mujoco_gl: auto               # MuJoCo 渲染后端
+allow_partial_anchor: false   # 是否允许部分 Quest 设备可用时就锚定
+start_on_first_packet: false  # 是否在首帧有效 Quest 数据到达后启动
+
+# ===== 3. 显示与图像发送 =====
+display_camera: zed_cam_left  # 本地显示和 Unity 图像流使用的相机
+# 可选值: ['zed_cam_left', 'zed_cam_right', 'overhead_cam', 'worms_eye_cam', 'wrist_cam_left', 'wrist_cam_right']
+render_width: 640             # 渲染图像宽度
+render_height: 480            # 渲染图像高度
+window_name: Quest3 MuJoCo Teleop  # 窗口标题
+unity_image_stream: true      # 是否向 Unity/Quest 发送渲染图像
+unity_image_host: auto        # Unity 图像接收端 IP，auto 表示跟随 Quest 来源 IP
+unity_image_port: 5010        # Unity 图像接收端 UDP 端口
+unity_image_hz: 25.0          # 图像发送帧率
+unity_image_jpeg_quality: 55  # JPEG 压缩质量，范围 1-100
+unity_image_chunk_size: 1000  # UDP 图像分片大小，单位字节
+unity_image_log_interval: 2.0 # 图像发送状态打印间隔，0 表示不打印
+viewer: true                  # 是否显示 MuJoCo 视图
+camera_window: true           # 是否打开相机窗口
+
+# ===== 4. 状态打印 =====
+status_hz_interval: 0.5  # 终端状态打印间隔，单位秒

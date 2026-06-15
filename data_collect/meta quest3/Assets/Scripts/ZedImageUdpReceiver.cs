@@ -35,11 +35,17 @@ public class ZedImageUdpReceiver : MonoBehaviour
     [Tooltip("自动创建的画面板距离相机多少米。")]
     public float displayDistance = 2.0f;
 
+    [Tooltip("自动创建的画面板相对相机的垂直偏移，负数向下，单位米。")]
+    public float displayYOffset = -0.25f;
+
+    [Tooltip("自动创建的画面板俯仰角，降低画面后可调节到正对头显，单位度。")]
+    public float displayPitchDegrees = 7.0f;
+
     [Tooltip("自动创建的画面板宽度，单位米。")]
     public float displayWidthMeters = 1.28f;
 
     [Tooltip("自动创建的画面板高度，单位米。")]
-    public float displayHeightMeters = 0.72f;
+    public float displayHeightMeters = 0.96f;
 
     [Tooltip("是否打印接收帧状态。")]
     public bool logFrames = false;
@@ -377,8 +383,8 @@ public class ZedImageUdpReceiver : MonoBehaviour
             canvas.renderMode = RenderMode.WorldSpace;
             canvas.worldCamera = cam;
             canvasObject.transform.SetParent(cam.transform, false);
-            canvasObject.transform.localPosition = new Vector3(0f, 0f, displayDistance);
-            canvasObject.transform.localRotation = Quaternion.identity;
+            canvasObject.transform.localPosition = new Vector3(0f, displayYOffset, displayDistance);
+            canvasObject.transform.localRotation = Quaternion.Euler(displayPitchDegrees, 0f, 0f);
             canvasObject.transform.localScale = Vector3.one * 0.001f;
         }
         else
