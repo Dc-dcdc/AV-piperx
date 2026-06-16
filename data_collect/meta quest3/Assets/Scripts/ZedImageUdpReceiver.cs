@@ -9,6 +9,12 @@ using UnityEngine.UI;
 
 public class ZedImageUdpReceiver : MonoBehaviour
 {
+    public enum ImageDisplayMode
+    {
+        Mono,
+        StereoSideBySide,
+    }
+
     private const int HeaderSize = 16;
     private const byte Magic0 = (byte)'Z';
     private const byte Magic1 = (byte)'I';
@@ -23,8 +29,14 @@ public class ZedImageUdpReceiver : MonoBehaviour
     public float staleFrameTimeout = 1.0f;
 
     [Header("Display")]
-    [Tooltip("可选：手动绑定场景中的 RawImage。留空时会自动在相机前创建一个世界空间画面板。")]
+    [Tooltip("可选：手动绑定单目显示 RawImage。留空且未绑定左右眼 RawImage 时，会自动在相机前创建一个世界空间画面板。")]
     public RawImage targetImage;
+
+    [Tooltip("可选：手动绑定左眼 RawImage。StereoSideBySide 模式下显示输入图像左半边。")]
+    public RawImage leftEyeImage;
+
+    [Tooltip("可选：手动绑定右眼 RawImage。StereoSideBySide 模式下显示输入图像右半边。")]
+    public RawImage rightEyeImage;
 
     [Tooltip("未绑定 RawImage 时自动创建显示面板。")]
     public bool autoCreateDisplay = true;
@@ -46,6 +58,16 @@ public class ZedImageUdpReceiver : MonoBehaviour
 
     [Tooltip("自动创建的画面板高度，单位米。")]
     public float displayHeightMeters = 0.96f;
+
+    [Header("VR Stereo")]
+    [Tooltip("Mono 显示整张图；StereoSideBySide 表示输入图像为左右眼横向拼接图。")]
+    public ImageDisplayMode displayMode = ImageDisplayMode.Mono;
+
+    [Tooltip("StereoSideBySide 使用的分眼采样 Shader。留空时自动查找 Custom/StereoSideBySideRawImage。")]
+    public Shader stereoSideBySideShader;
+
+    [Tooltip("左右眼显示反了时勾选，用于交换左右半图。")]
+    public bool stereoSwapEyes = false;
 
     [Tooltip("是否打印接收帧状态。")]
     public bool logFrames = false;
@@ -85,9 +107,11 @@ public class ZedImageUdpReceiver : MonoBehaviour
     private Thread receiveThread;
     private volatile bool running;
     private Texture2D displayTexture;
+    private Material stereoMaterial;
     private AspectRatioFitter aspectFitter;
     private double lastCompleteFrameTime;
     private float lastStatusLogTime;
+    private bool stereoShaderWarningLogged;
 
     private class FrameAssembly
     {
@@ -143,6 +167,7 @@ public class ZedImageUdpReceiver : MonoBehaviour
     private void Update()
     {
         EnsureDisplayTarget();
+        ApplyDisplayMaterial();
         ApplyLatestFrame();
         UpdateStatusText();
         LogStaleState();
@@ -322,7 +347,7 @@ public class ZedImageUdpReceiver : MonoBehaviour
             }
         }
 
-        if (jpeg == null || targetImage == null)
+        if (jpeg == null || !HasDisplayTarget())
         {
             return;
         }
@@ -341,9 +366,7 @@ public class ZedImageUdpReceiver : MonoBehaviour
             return;
         }
 
-        targetImage.enabled = true;
-        targetImage.color = Color.white;
-        targetImage.texture = displayTexture;
+        ApplyTextureToDisplayTargets();
         lock (frameLock)
         {
             decodedFrameCount += 1;
@@ -351,7 +374,10 @@ public class ZedImageUdpReceiver : MonoBehaviour
         }
         if (aspectFitter != null && displayTexture.height > 0)
         {
-            aspectFitter.aspectRatio = (float)displayTexture.width / displayTexture.height;
+            float visibleWidth = displayMode == ImageDisplayMode.StereoSideBySide
+                ? displayTexture.width * 0.5f
+                : displayTexture.width;
+            aspectFitter.aspectRatio = visibleWidth / displayTexture.height;
         }
 
         if (logFrames)
@@ -360,9 +386,59 @@ public class ZedImageUdpReceiver : MonoBehaviour
         }
     }
 
+    private bool HasDisplayTarget()
+    {
+        return targetImage != null || leftEyeImage != null || rightEyeImage != null;
+    }
+
+    private void ApplyTextureToDisplayTargets()
+    {
+        if (displayTexture == null)
+        {
+            return;
+        }
+
+        bool useSeparateEyeImages = displayMode == ImageDisplayMode.StereoSideBySide
+            && (leftEyeImage != null || rightEyeImage != null);
+
+        if (useSeparateEyeImages)
+        {
+            Rect leftRect = stereoSwapEyes
+                ? new Rect(0.5f, 0f, 0.5f, 1f)
+                : new Rect(0f, 0f, 0.5f, 1f);
+            Rect rightRect = stereoSwapEyes
+                ? new Rect(0f, 0f, 0.5f, 1f)
+                : new Rect(0.5f, 0f, 0.5f, 1f);
+
+            ApplyRawImageTexture(leftEyeImage, leftRect);
+            ApplyRawImageTexture(rightEyeImage, rightRect);
+            ApplyRawImageTexture(targetImage, new Rect(0f, 0f, 1f, 1f));
+            return;
+        }
+
+        ApplyRawImageTexture(targetImage, new Rect(0f, 0f, 1f, 1f));
+        ApplyRawImageTexture(leftEyeImage, new Rect(0f, 0f, 1f, 1f));
+        ApplyRawImageTexture(rightEyeImage, new Rect(0f, 0f, 1f, 1f));
+        ApplyDisplayMaterial();
+    }
+
+    private void ApplyRawImageTexture(RawImage image, Rect uvRect)
+    {
+        if (image == null)
+        {
+            return;
+        }
+
+        image.enabled = true;
+        image.color = Color.white;
+        image.texture = displayTexture;
+        image.material = null;
+        image.uvRect = uvRect;
+    }
+
     private void EnsureDisplayTarget()
     {
-        if (targetImage != null || !autoCreateDisplay)
+        if (HasDisplayTarget() || !autoCreateDisplay)
         {
             return;
         }
@@ -403,6 +479,7 @@ public class ZedImageUdpReceiver : MonoBehaviour
         targetImage = imageObject.AddComponent<RawImage>();
         targetImage.enabled = false;
         targetImage.color = Color.white;
+        ApplyDisplayMaterial();
         aspectFitter = imageObject.AddComponent<AspectRatioFitter>();
         aspectFitter.aspectMode = AspectRatioFitter.AspectMode.FitInParent;
         aspectFitter.aspectRatio = Mathf.Max(0.01f, displayWidthMeters / Mathf.Max(0.01f, displayHeightMeters));
@@ -484,6 +561,10 @@ public class ZedImageUdpReceiver : MonoBehaviour
         if (decoded > 0 && now - frameTime < staleFrameTimeout)
         {
             statusText.text = $"UDP image OK  frame={appliedFrame}\nfrom {remote}";
+            if (displayMode == ImageDisplayMode.StereoSideBySide)
+            {
+                statusText.text += "\nstereo: side-by-side";
+            }
             statusText.color = new Color(0.45f, 1f, 0.55f, 0.9f);
             return;
         }
@@ -569,6 +650,51 @@ public class ZedImageUdpReceiver : MonoBehaviour
         return DateTime.UtcNow.Subtract(UnixEpoch).TotalSeconds;
     }
 
+    private void ApplyDisplayMaterial()
+    {
+        if (targetImage == null)
+        {
+            return;
+        }
+
+        if (displayMode == ImageDisplayMode.Mono || leftEyeImage != null || rightEyeImage != null)
+        {
+            targetImage.material = null;
+            targetImage.uvRect = new Rect(0f, 0f, 1f, 1f);
+            return;
+        }
+
+        Shader shader = stereoSideBySideShader != null
+            ? stereoSideBySideShader
+            : Shader.Find("Custom/StereoSideBySideRawImage");
+
+        if (shader == null)
+        {
+            targetImage.material = null;
+            if (!stereoShaderWarningLogged)
+            {
+                Debug.LogWarning("StereoSideBySide requires shader Custom/StereoSideBySideRawImage.");
+                stereoShaderWarningLogged = true;
+            }
+            return;
+        }
+
+        if (stereoMaterial == null || stereoMaterial.shader != shader)
+        {
+            if (stereoMaterial != null)
+            {
+                Destroy(stereoMaterial);
+            }
+            stereoMaterial = new Material(shader)
+            {
+                name = "Stereo Side-by-Side RawImage Material",
+            };
+        }
+
+        stereoMaterial.SetFloat("_SwapEyes", stereoSwapEyes ? 1f : 0f);
+        targetImage.material = stereoMaterial;
+    }
+
     private void OnDisable()
     {
         StopReceiver();
@@ -577,6 +703,11 @@ public class ZedImageUdpReceiver : MonoBehaviour
     private void OnDestroy()
     {
         StopReceiver();
+        if (stereoMaterial != null)
+        {
+            Destroy(stereoMaterial);
+            stereoMaterial = null;
+        }
     }
 
     private void OnApplicationQuit()

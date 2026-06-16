@@ -23,6 +23,7 @@
   meta_data/stats.safetensors               # action、observation.state 和图像观测的均值、方差、最小值、最大值。
   meta_data/episode_data_index.safetensors  # 每条 episode 在 parquet 全局帧序列中的起止索引。
   videos/observation.images.<camera>_episode_000000.mp4  # 每个相机对应的 episode 视频，parquet 通过 path + timestamp 引用具体帧。
+                                                        # 视频会统一重编码为 LeRobot 短 GOP MP4，方便训练时随机读帧。
     
 其中 raw 的 joint_action 或 pose_action 会根据 --action-key 映射到
 LeRobot 数据集中的 action 字段。
@@ -271,7 +272,50 @@ def frame_count_for(record: EpisodeRecord, action_key: str) -> int:
     return int(frame_count)
 
 
-# 将相机图片帧编码为 MP4，或复制已有视频。
+# 将已有 raw MP4 直接转码为 LeRobot 训练友好的短 GOP MP4，避免中间 PNG 帧带来的大量 I/O。
+def transcode_video_to_lerobot_encoding(
+    src_video: Path,
+    dst_video: Path,
+    fps: int,
+    encoding: dict[str, Any],
+    overwrite: bool,
+) -> None:
+    dst_video.parent.mkdir(parents=True, exist_ok=True)
+    vcodec = str(encoding.get("vcodec", "libx264"))
+    pix_fmt = str(encoding.get("pix_fmt", "yuv420p"))
+    g = encoding.get("g", 2)
+    crf = encoding.get("crf", 23)
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y" if overwrite else "-n",
+        "-i",
+        str(src_video),
+        "-an",
+        "-vf",
+        f"fps={int(fps)}",
+        "-vcodec",
+        vcodec,
+        "-pix_fmt",
+        pix_fmt,
+    ]
+    if vcodec == "libx264":
+        ffmpeg_cmd += ["-preset", "veryfast"]
+    if g is not None:
+        ffmpeg_cmd += ["-g", str(g)]
+    if crf is not None:
+        ffmpeg_cmd += ["-crf", str(crf)]
+    ffmpeg_cmd.append(str(dst_video))
+
+    subprocess.run(ffmpeg_cmd, check=True, stdin=subprocess.DEVNULL)
+    if not dst_video.exists():
+        raise OSError(f"Video transcoding did not create output file: {dst_video}")
+
+
+# 将相机图片帧或已有 MP4 统一重编码为 LeRobot 训练友好的短 GOP MP4。
 def copy_or_encode_video(
     record: EpisodeRecord,
     camera: str,
@@ -306,7 +350,23 @@ def copy_or_encode_video(
 
     src = record.source_dir / "videos" / f"{camera}.mp4"
     if src.exists():
-        shutil.copy2(src, dst)
+        # 不直接复制采集阶段的 mp4。普通 mp4 的关键帧间隔可能较长，
+        # 训练时随机取帧会拖慢 PyAV 解码；这里统一转码为 g=2 的短 GOP 视频。
+        encoding = get_runtime_encoding()
+        logging.info(
+            "Transcoding %s camera=%s episode=%06d encoding=%s",
+            src,
+            camera,
+            episode_index,
+            encoding,
+        )
+        transcode_video_to_lerobot_encoding(
+            src_video=src,
+            dst_video=dst,
+            fps=fps,
+            encoding=encoding,
+            overwrite=True,
+        )
         return f"videos/{video_name}"
 
     raise FileNotFoundError(f"Missing both {src} and image frames under {images_dir}.")
@@ -756,10 +816,10 @@ if __name__ == "__main__":
     ACTION_KEY = "joint_action"
 
     # 存放原始采集数据的目录
-    RAW_DIR = "outputs/4_data_collect/quest_teleop/quest_teleop_SewNeedle-3Arms-v0"
+    RAW_DIR = "outputs/4_data_collect/quest_teleop/quest_teleop_SewNeedle-3Arms-v0_rgb"
 
     # 本地 HF 数据集生成目录。
-    OUTPUT_DIR = "outputs/5_hf_datasets/quest_teleop_sew_needle_3arms_joint"
+    OUTPUT_DIR = "outputs/5_hf_datasets/quest_teleop_sew_needle_3arms_rgb_joint"
 
     # 本地 HF数据目录 已存在时是否覆盖重建。
     OVERWRITE = True
@@ -767,11 +827,14 @@ if __name__ == "__main__":
     # 最多转换多少条 episode；None 表示全部转换。
     MAX_EPISODES = None
 
+    # 默认转换全部相机，方便同一份 HF 数据集复用于不同训练配置。
+    CAMERAS = None
 
     convert_data_folder_to_hf(
         raw_dir=RAW_DIR,
         output_dir=OUTPUT_DIR,
         overwrite=OVERWRITE,
         max_episodes=MAX_EPISODES,
+        cameras=CAMERAS,
         action_key=ACTION_KEY,
     )

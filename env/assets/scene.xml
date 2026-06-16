@@ -38,6 +38,7 @@
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
     <material name="table" texture="small_meta_table_diffuse"/>
     <material name="metal" rgba="0.517 0.529 0.537 1"/>
+    <material name="depth_wall" rgba="0.45 0.48 0.50 1"/>
   </asset>
 
   <default>
@@ -53,6 +54,13 @@
     <geom mesh="tabletop" material="table" class="visual" pos="0 0 -0.75" quat="1 0 0 1"/>
     <geom mesh="tablelegs" material="table" class="visual" pos="0 0 -0.75" quat="1 0 0 1"/>
     <geom name="table" pos="0 0 -0.1009" size="0.61 0.37 0.1" type="box" class="collision"/>
+
+    <!-- 深度背景挡板：只参与视觉和深度渲染，不参与碰撞，用于减少远处 zfar 深度像素。 -->
+    <geom name="depth_wall_back" class="visual" type="box" material="depth_wall" pos="0 0.50 0.24" size="0.72 0.015 1"/>
+    <!-- <geom name="depth_wall_front" class="visual" type="box" material="depth_wall" pos="0 -0.50 0.24" size="0.72 0.015 0.24"/> -->
+    <geom name="depth_wall_left" class="visual" type="box" material="depth_wall" pos="-0.72 0 0.24" size="0.015 0.50 1"/>
+    <geom name="depth_wall_right" class="visual" type="box" material="depth_wall" pos="0.72 0 0.24" size="0.015 0.50 1"/>
+
     <camera name="overhead_cam" pos="0 -0.303794 1.02524" fovy="58" mode="fixed" quat="0.976332 0.216277 0 0"/>
     <camera name="worms_eye_cam" pos="0 -0.377167 0.0316055" fovy="58" mode="fixed" quat="0.672659 0.739953 0 0"/>
     <geom class="frame" pos="0.44 -0.361 1.03" quat="0 1 0 1" mesh="extrusion_2040_880"/>

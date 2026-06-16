@@ -180,10 +180,10 @@ if __name__ == "__main__":
         raise SystemExit
 
     # convert_data_to_hf.py 生成的本地 HF 数据集目录。
-    LOCAL_DIR = "outputs/5_hf_datasets/quest_teleop_sew_needle_3arms"
+    LOCAL_DIR = "outputs/5_hf_datasets/quest_teleop_sew_needle_3arms_rgb_joint"
 
     # Hugging Face 数据集仓库，格式必须是 用户名/数据集名。
-    HF_REPO_ID = "Dc-dc/quest_teleop_sew_needle_3arms_joint"
+    HF_REPO_ID = "Dc-dc/quest_teleop_sew_needle_3arms_rgb_joint"
 
     # 是否上传为私有数据集。
     PRIVATE = False

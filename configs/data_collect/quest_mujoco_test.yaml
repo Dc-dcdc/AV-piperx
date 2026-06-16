@@ -1,4 +1,8 @@
 # Quest3 -> MuJoCo 三臂遥操作测试默认配置
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+  - _self_
 
 # ===== 1. Quest3 位姿通信 =====
 host: 0.0.0.0  # 监听所有网卡地址
@@ -39,3 +43,11 @@ camera_window: true           # 是否打开相机窗口
 
 # ===== 4. 状态打印 =====
 status_hz_interval: 0.5  # 终端状态打印间隔，单位秒
+
+# ===== 5. Hydra 输出控制 =====
+hydra:
+  run:
+    dir: .  # 不额外创建 outputs/日期/时间 运行目录
+  job:
+    chdir: false  # 运行时不切换工作目录
+  output_subdir: null  # 不保存 .hydra 配置快照

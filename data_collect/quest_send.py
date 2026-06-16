@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import socket
 import struct
+import queue
+import threading
 import time
 
 import cv2
@@ -43,6 +45,7 @@ class UnityImageStreamer:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
         self.frame_id = 0
+        self.last_enqueue_t = 0.0
         self.last_send_t = 0.0
         self.last_error_t = 0.0
         self.last_log_t = 0.0
@@ -53,6 +56,9 @@ class UnityImageStreamer:
         self.last_ack_text = ""
         self.last_ack_addr = None
         self.last_ack_t = 0.0
+        self._lock = threading.Lock()
+        self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=1)
+        self._closed = False
 
         if self.auto_host or self.broadcast_host:
             self.endpoint = (self.BROADCAST_HOST, self.port)
@@ -65,19 +71,50 @@ class UnityImageStreamer:
             self.endpoint = (host, self.port)
             print(f"Unity image target: {host}:{self.port}")
 
+        self._thread = threading.Thread(target=self._send_loop, name="unity-image-streamer", daemon=True)
+        self._thread.start()
+
     def update_auto_host(self, host: str) -> None:
         if not self.auto_host or not host:
             return
         endpoint = (host, self.port)
-        if self.endpoint != endpoint:
-            self.endpoint = endpoint
+        changed = False
+        with self._lock:
+            if self.endpoint != endpoint:
+                self.endpoint = endpoint
+                changed = True
+        if changed:
             print(f"Unity image auto target: {host}:{self.port}")
 
     def maybe_send_bgr(self, frame_bgr: np.ndarray) -> None:
         now = time.time()
-        if self.send_interval > 0.0 and now - self.last_send_t < self.send_interval:
+        if self._closed:
             return
+        if self.send_interval > 0.0 and now - self.last_enqueue_t < self.send_interval:
+            return
+        self.last_enqueue_t = now
 
+        try:
+            self._queue.put_nowait(frame_bgr)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(frame_bgr)
+            except queue.Full:
+                pass
+
+    def _send_loop(self) -> None:
+        while True:
+            frame_bgr = self._queue.get()
+            if frame_bgr is None:
+                break
+            self._send_bgr_now(frame_bgr)
+
+    def _send_bgr_now(self, frame_bgr: np.ndarray) -> None:
+        now = time.time()
         ok, encoded = cv2.imencode(
             ".jpg",
             frame_bgr,
@@ -98,11 +135,13 @@ class UnityImageStreamer:
         total_bytes = len(payload)
         packets_sent = 0
         try:
+            with self._lock:
+                endpoint = self.endpoint
             for chunk_index in range(chunk_count):
                 start = chunk_index * self.chunk_size
                 chunk = payload[start : start + self.chunk_size]
                 header = self.HEADER.pack(self.MAGIC, frame_id, chunk_index, chunk_count, total_bytes)
-                self.sock.sendto(header + chunk, self.endpoint)
+                self.sock.sendto(header + chunk, endpoint)
                 packets_sent += 1
             self.frame_id = (self.frame_id + 1) & 0xFFFFFFFF
             self.last_send_t = now
@@ -113,7 +152,7 @@ class UnityImageStreamer:
             self._maybe_log(now, total_bytes, chunk_count)
         except OSError as exc:
             if now - self.last_error_t > 1.0:
-                print(f"Failed to send Unity image frame to {self.endpoint[0]}:{self.endpoint[1]}: {exc}")
+                print(f"Failed to send Unity image frame to {endpoint[0]}:{endpoint[1]}: {exc}")
                 self.last_error_t = now
 
     def _drain_acks(self, now: float) -> None:
@@ -154,4 +193,17 @@ class UnityImageStreamer:
         self.last_log_t = now
 
     def close(self) -> None:
+        self._closed = True
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                pass
+        self._thread.join(timeout=1.0)
         self.sock.close()

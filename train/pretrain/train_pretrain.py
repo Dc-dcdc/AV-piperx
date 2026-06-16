@@ -620,7 +620,7 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
-        # "dataset_repo_id=Dc-dc/quest_teleop_sew_needle_3arms_jonit",
+        "dataset_repo_id=Dc-dc/quest_teleop_sew_needle_3arms_rgb_joint",
         "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
         "policy=pre_zed_wrist_diffusion", # 策略
         "resume=false",

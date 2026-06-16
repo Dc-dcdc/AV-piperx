@@ -345,10 +345,10 @@ if __name__ == "__main__":
         "env_id=guided_vision/SewNeedle-3Arms-v0",
         "display_camera=zed_cam_left",
         "lock_roll=True",                            # 是否锁定中间臂 roll 角
-        "render_width=640"                           # 渲染图像宽度
-        "render_height=480"                          # 渲染图像高度
-        "unity_image_stream=true"                    # 是否向 Unity/Quest 发送渲染图像
-        "unity_image_hz=25.0"                        # 图像发送帧率
+        "render_width=640",                          # 渲染图像宽度
+        "render_height=480",                         # 渲染图像高度
+        "unity_image_stream=true",                   # 是否向 Unity/Quest 发送渲染图像
+        "unity_image_hz=25.0",                       # 图像发送帧率
     ]
 
     for arg in default_args:

@@ -62,6 +62,12 @@ class PoseActionIKSolver:
         "middle": (slice(16, 19), slice(19, 23), None),
     }
     QUEST_SOURCE_BY_ARM = {"left": "left", "right": "right", "middle": "head"}
+    HAND_IK_POSITION_WEIGHT = 500.0
+    HAND_IK_ROTATION_WEIGHT = 100.0
+    HAND_IK_JOINT_DISPLACEMENT_WEIGHT = 50.0
+    HAND_IK_MAX_ROT_DIFF = 0.8
+    HAND_IK_JOINT_P = 0.9
+    HAND_IK_MAX_ITERATIONS = 50
 
     # 初始化 IK 求解器、末端 site 和各臂控制器。
     def __init__(
@@ -102,16 +108,16 @@ class PoseActionIKSolver:
             eef_site=self._left_eef_site,
             step_size=0.0001,
             min_cost_delta=1.0e-12,
-            max_iterations=50,
-            position_weight=500.0,
-            rotation_weight=100.0,
+            max_iterations=self.HAND_IK_MAX_ITERATIONS,
+            position_weight=self.HAND_IK_POSITION_WEIGHT,
+            rotation_weight=self.HAND_IK_ROTATION_WEIGHT,
             joint_center_weight=np.array([10.0, 10.0, 1.0, 50.0, 1.0, 1.0], dtype=np.float64),
-            joint_displacement_weight=np.array(6 * [50.0], dtype=np.float64),
+            joint_displacement_weight=np.array(6 * [self.HAND_IK_JOINT_DISPLACEMENT_WEIGHT], dtype=np.float64),
             position_threshold=0.001,
             rotation_threshold=0.001,
             max_pos_diff=0.1,
-            max_rot_diff=0.3,
-            joint_p=0.9,
+            max_rot_diff=self.HAND_IK_MAX_ROT_DIFF,
+            joint_p=self.HAND_IK_JOINT_P,
         )
         self._right_controller = GradIK(
             physics=self.physics,
@@ -120,16 +126,16 @@ class PoseActionIKSolver:
             eef_site=self._right_eef_site,
             step_size=0.0001,
             min_cost_delta=1.0e-12,
-            max_iterations=50,
-            position_weight=500.0,
-            rotation_weight=100.0,
+            max_iterations=self.HAND_IK_MAX_ITERATIONS,
+            position_weight=self.HAND_IK_POSITION_WEIGHT,
+            rotation_weight=self.HAND_IK_ROTATION_WEIGHT,
             joint_center_weight=np.array([10.0, 10.0, 1.0, 50.0, 1.0, 1.0], dtype=np.float64),
-            joint_displacement_weight=np.array(6 * [50.0], dtype=np.float64),
+            joint_displacement_weight=np.array(6 * [self.HAND_IK_JOINT_DISPLACEMENT_WEIGHT], dtype=np.float64),
             position_threshold=0.001,
             rotation_threshold=0.001,
             max_pos_diff=0.1,
-            max_rot_diff=0.3,
-            joint_p=0.9,
+            max_rot_diff=self.HAND_IK_MAX_ROT_DIFF,
+            joint_p=self.HAND_IK_JOINT_P,
         )
 
         self._middle_controller = None
@@ -301,6 +307,44 @@ class PoseActionIKSolver:
             poses.append(np.concatenate([pos, quat]).astype(np.float64))
         return poses[0], poses[1], poses[2]
 
+    # 计算各激活机械臂目标姿态与当前实际 site 姿态之间的角度误差。
+    def rotation_error_degrees(self) -> dict[str, float]:
+        errors = {}
+        for state in self.states:
+            if not state.active:
+                continue
+            _actual_pos, actual_quat = self._read_eef_pose(state.eef_site)
+            target_quat = self._unit_quat(state.target_quat, default_w_last=False)
+            actual_quat = self._unit_quat(actual_quat, default_w_last=False)
+            quat_dot = abs(float(np.dot(target_quat, actual_quat)))
+            quat_dot = float(np.clip(quat_dot, -1.0, 1.0))
+            errors[state.name] = float(np.degrees(2.0 * np.arccos(quat_dot)))
+        return errors
+
+    # 拆分姿态误差：目标到实际、目标到 IK 解、IK 解到实际。
+    def rotation_error_breakdown_degrees(self) -> dict[str, dict[str, float]]:
+        errors = {}
+        for state in self.states:
+            if not state.active:
+                continue
+
+            _actual_pos, actual_quat = self._read_eef_pose(state.eef_site)
+            target_quat = self._unit_quat(state.target_quat, default_w_last=False)
+            actual_quat = self._unit_quat(actual_quat, default_w_last=False)
+            values = {
+                "target_actual": self._quat_angle_degrees(target_quat, actual_quat),
+            }
+
+            if state.last_q_target is not None and hasattr(state.ik, "fk_fn"):
+                command_mat = state.ik.fk_fn(state.last_q_target.astype(np.float64))
+                command_quat = xyzw_to_wxyz(mat2quat(command_mat[:3, :3])).astype(np.float64)
+                command_quat = self._unit_quat(command_quat, default_w_last=False)
+                values["target_ik"] = self._quat_angle_degrees(target_quat, command_quat)
+                values["ik_actual"] = self._quat_angle_degrees(command_quat, actual_quat)
+
+            errors[state.name] = values
+        return errors
+
     # 将 QuestControl 输出的位姿动作转换为 env.step 的关节动作。
     def pose2joint(
         self,
@@ -402,6 +446,13 @@ class PoseActionIKSolver:
         if norm < 1e-8:
             return np.array([0.0, 0.0, 0.0, 1.0] if default_w_last else [1.0, 0.0, 0.0, 0.0], dtype=np.float64)
         return quat / norm
+
+    # 计算两个 wxyz 四元数之间的最短旋转角，单位为度。
+    @staticmethod
+    def _quat_angle_degrees(quat_a_wxyz: np.ndarray, quat_b_wxyz: np.ndarray) -> float:
+        quat_dot = abs(float(np.dot(quat_a_wxyz, quat_b_wxyz)))
+        quat_dot = float(np.clip(quat_dot, -1.0, 1.0))
+        return float(np.degrees(2.0 * np.arccos(quat_dot)))
 
     # 根据配置锁定中间臂相对初始姿态的 pitch/roll。
     def _middle_quat_with_locked_axes(self, target_quat_wxyz: np.ndarray, anchor_quat_wxyz: np.ndarray) -> np.ndarray:

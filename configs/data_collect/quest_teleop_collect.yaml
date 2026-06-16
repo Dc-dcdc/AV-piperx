@@ -1,4 +1,8 @@
 # Quest3 -> MuJoCo 遥操数据采集默认配置
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+  - _self_
 
 # ===== 1. Quest3 位姿通信 =====
 host: 0.0.0.0  # 监听所有网卡地址
@@ -9,8 +13,11 @@ timeout: 0.05  # socket 超时阈值，单位秒
 output_dir: outputs/4_data_collect/quest_teleop  # 采集数据输出根目录
 run_name: null     # 本次采集名称，null 表示按任务名自动生成
 append: true       # 是否追加到已有 run_name 目录，同一任务默认写入同一数据集
-fps: 25            # 数据时间戳和相机视频帧率
-save_videos: true  # 是否直接保存每条 episode 的相机 mp4 视频
+fps: 25            # 数据采集、时间戳和相机视频帧率
+save_rgb: true     # 是否在 A+X 确认保存后回放轨迹并渲染 RGB 视频，不影响实时遥操闭环
+save_videos: true  # 是否将回放渲染出的 RGB 图像保存为每条 episode 的 mp4 视频，需 save_rgb=true
+save_depth: false  # 是否保存 record_cameras 中每个相机的逐像素深度图，保存到 arrays.npz 的 depth__相机名
+video_queue_size: 300  # 后台视频写入队列容量，越大越不易卡顿但占用更多内存
 save_pose_action: true  # 是否额外保存 Quest 映射后的末端位姿动作
 min_steps_to_save: 2     # episode 少于该步数时自动丢弃
 max_steps_per_episode: 1000    # 单条 episode 最大采集步数
@@ -46,16 +53,33 @@ render_width: 640   # 渲染图像宽度
 render_height: 480  # 渲染图像高度
 window_name: Quest3 Teleop Collect  # 本地 OpenCV 窗口名称
 viewer: true                  # 是否打开 MuJoCo viewer
-camera_window: true           # 是否打开本地 OpenCV 相机窗口
+camera_window: false          # 是否打开本地 OpenCV 相机窗口，关闭可减少一次额外渲染
+depth_window: false           # 是否打开本地 OpenCV 深度图窗口，仅用于查看，不影响保存数据
+depth_window_name: Quest3 Teleop Depth  # 本地深度图窗口名称
+depth_display_camera: null    # 深度图窗口使用的相机，null 表示跟随 display_camera
+depth_vis_min: 0.0            # 深度图显示归一化下限，单位为 MuJoCo 世界长度
+depth_vis_max: 2.0            # 深度图显示归一化上限，单位为 MuJoCo 世界长度
 
 # ===== 5. 发送给 Unity/Quest 的画面 =====
 unity_image_stream: true       # 是否向 Unity/Quest 发送渲染图像
+unity_image_source: rgb        # 发送给 Unity/Quest 的画面来源，支持 rgb/depth
+unity_image_stereo: false      # 是否按 [左眼|右眼] 横向拼接发送给 Quest，用于 Unity 立体显示
+unity_left_camera: zed_cam_left   # 立体显示左眼使用的 MuJoCo 相机
+unity_right_camera: zed_cam_right # 立体显示右眼使用的 MuJoCo 相机
 unity_image_host: auto         # Unity 图像接收端 IP，auto 表示跟随 Quest 来源 IP
 unity_image_port: 5010         # Unity 图像接收端 UDP 端口
-unity_image_hz: 25.0           # 图像发送帧率，这需要与SIM_DT时间对齐
+unity_image_hz: 25.0           # 图像发送帧率，通常与 fps 保持一致
 unity_image_jpeg_quality: 55   # JPEG 压缩质量，范围 1-100
 unity_image_chunk_size: 1000   # UDP 图像分片大小，单位字节
 unity_image_log_interval: 2.0  # 图像发送状态打印间隔，0 表示不打印
 
 # ===== 6. 状态打印 =====
 status_hz_interval: 0.5  # 终端状态打印间隔，单位秒
+
+# ===== 7. Hydra 输出控制 =====
+hydra:
+  run:
+    dir: .  # 不额外创建 outputs/日期/时间 运行目录
+  job:
+    chdir: false  # 运行时不切换工作目录
+  output_subdir: null  # 不保存 .hydra 配置快照

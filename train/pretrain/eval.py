@@ -635,7 +635,7 @@ if __name__ == "__main__":
     eval_cfg = SimpleNamespace(
         seed=100,
         # 模型路径设置 (直接指向 0000600_loss=0.1540 文件夹即可，代码会自动寻找内部结构)
-        ckpt_path="outputs/3_finetune/train/2026-06-03/13-05-03_SewNeedle-3Arms-v0_ft_zed_wrist_diffusion/checkpoints/000034_sr=0.85_reward=584.92_Ploss=0.0014_Vloss=0.6356",
+        ckpt_path="outputs/3_finetune/train/2026-06-03/13-05-03_SewNeedle-3Arms-v0_ft_zed_wrist_diffusion/checkpoints/000046_sr=0.85_reward=583.72_Ploss=0.0004_Vloss=0.6156",
         # ⚙️ 评估参数设置
         n_episodes=100,             # 评估多少个任务                 
         max_episodes_rendered=0,  # 保存多少个视频 

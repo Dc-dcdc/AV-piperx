@@ -152,7 +152,7 @@ class SewNeedleEnv(GuidedVisionEnv):
         if (
             not self.needle_start_through
             and curr_dists['head_pos'][0] - curr_dists['entrance_pos'][0] < 0.001
-            and curr_dists['dist_head_to_entrance'] < 0.02
+            and curr_dists['dist_head_to_entrance'] < 0.03
         ):
             self.needle_start_through = True
             reward += 25.0
@@ -164,7 +164,7 @@ class SewNeedleEnv(GuidedVisionEnv):
             self.needle_start_through                                 # 必须先完成进洞阶段
             and not self.needle_reached_exit                          # 针头还没有到达出口
             and curr_dists['head_pos'][0] < curr_dists['exit_pos'][0] # 针头必须在出口的负方向（洞口的另一侧）
-            and curr_dists['dist_head_to_exit'] < 0.02                # 针头必须足够接近出口（防止从墙外面绕过）
+            and curr_dists['dist_head_to_exit'] < 0.03                # 针头必须足够接近出口（防止从墙外面绕过）
         ):
             self.needle_reached_exit = True
             reward += 50.0
@@ -184,7 +184,7 @@ class SewNeedleEnv(GuidedVisionEnv):
             self.left_has_grasped                                       # 必须先完成左手接应阶段，避免从前面几何位置误触发。
             and not self.needle_completely_through                      # 针尾还没有完全拔出
             and curr_dists['tail_pos'][0] < curr_dists['exit_pos'][0]   # 针尾必须在出口的负方向（洞口的另一侧）
-            and curr_dists['dist_tail_to_exit'] < 0.02                  # 
+            and curr_dists['dist_tail_to_exit'] < 0.03                  # 针尾部与出口距离
         ):
             self.needle_completely_through = True
             reward += 100.0
