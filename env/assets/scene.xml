@@ -1,5 +1,6 @@
 <mujoco model="aloha_scene">
-  <compiler meshdir="meshes" texturedir="meshes"/>
+<!-- meshdir/texturedir="."：XML 中的 file 路径直接从 env/assets 开始写，例如 meshes/aloha/xxx.stl。 -->
+  <compiler meshdir="." texturedir="."/>
 
   <include file="aloha_sim.xml"/>
 
@@ -15,26 +16,26 @@
 
   <asset>
     <!-- table extrusions and frame -->
-    <mesh file="extrusion_2040_880.stl"/>
-    <mesh file="extrusion_150.stl"/>
-    <mesh file="corner_bracket.stl"/>
-    <mesh file="extrusion_1220.stl"/>
-    <mesh file="extrusion_1000.stl"/>
-    <mesh file="angled_extrusion.stl"/>
-    <mesh file="extrusion_600.stl"/>    
-    <mesh file="overhead_mount.stl"/>
-    <mesh file="extrusion_2040_1000.stl"/>
-    <mesh file="wormseye_mount.stl"/>
-    <mesh name="extrusion_840" file="extrusion_1220.stl" scale="1 1 0.68852459016"/>
+    <mesh file="meshes/extrusion_2040_880.stl"/>
+    <mesh file="meshes/extrusion_150.stl"/>
+    <mesh file="meshes/corner_bracket.stl"/>
+    <mesh file="meshes/extrusion_1220.stl"/>
+    <mesh file="meshes/extrusion_1000.stl"/>
+    <mesh file="meshes/angled_extrusion.stl"/>
+    <mesh file="meshes/extrusion_600.stl"/>    
+    <mesh file="meshes/overhead_mount.stl"/>
+    <mesh file="meshes/extrusion_2040_1000.stl"/>
+    <mesh file="meshes/wormseye_mount.stl"/>
+    <mesh name="extrusion_840" file="meshes/extrusion_1220.stl" scale="1 1 0.68852459016"/>
 
     <!-- Table dimensions (length x width x height in meters): 1.21x0.76x0.75 -->
-    <mesh file="tablelegs.obj"/>
-    <mesh file="tabletop.obj"/>
+    <mesh file="meshes/tablelegs.obj"/>
+    <mesh file="meshes/tabletop.obj"/>
 
     <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
       markrgb="0.8 0.8 0.8" width="300" height="300"/>
-    <texture type="2d" file="small_meta_table_diffuse.png"/>
+    <texture type="2d" file="meshes/small_meta_table_diffuse.png"/>
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
     <material name="table" texture="small_meta_table_diffuse"/>
     <material name="metal" rgba="0.517 0.529 0.537 1"/>
@@ -56,10 +57,10 @@
     <geom name="table" pos="0 0 -0.1009" size="0.61 0.37 0.1" type="box" class="collision"/>
 
     <!-- 深度背景挡板：只参与视觉和深度渲染，不参与碰撞，用于减少远处 zfar 深度像素。 -->
-    <geom name="depth_wall_back" class="visual" type="box" material="depth_wall" pos="0 0.50 0.24" size="0.72 0.015 1"/>
+    <geom name="depth_wall_back" class="visual" type="box" material="depth_wall" pos="0 0.70 0.24" size="1.0 0.015 1"/>
     <!-- <geom name="depth_wall_front" class="visual" type="box" material="depth_wall" pos="0 -0.50 0.24" size="0.72 0.015 0.24"/> -->
-    <geom name="depth_wall_left" class="visual" type="box" material="depth_wall" pos="-0.72 0 0.24" size="0.015 0.50 1"/>
-    <geom name="depth_wall_right" class="visual" type="box" material="depth_wall" pos="0.72 0 0.24" size="0.015 0.50 1"/>
+    <geom name="depth_wall_left" class="visual" type="box" material="depth_wall" pos="-1.0 0 0.24" size="0.015 0.70 1"/>
+    <geom name="depth_wall_right" class="visual" type="box" material="depth_wall" pos="1.0 0 0.24" size="0.015 0.70 1"/>
 
     <camera name="overhead_cam" pos="0 -0.303794 1.02524" fovy="58" mode="fixed" quat="0.976332 0.216277 0 0"/>
     <camera name="worms_eye_cam" pos="0 -0.377167 0.0316055" fovy="58" mode="fixed" quat="0.672659 0.739953 0 0"/>

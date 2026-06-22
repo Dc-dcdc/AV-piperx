@@ -1,0 +1,19 @@
+# @package _global_
+
+dataset_repo_id: iantc104/gv_quest_teleop_insert_cylinder_3arms  # 圆柱插入任务数据集，上传后按实际 HF repo 修改
+fps: 25
+
+eval:
+  # ALOHA 仿真环境建议先关闭异步环境，避免 MuJoCo/渲染上下文冲突。
+  use_async_envs: false
+
+env:
+  name: guided_vision
+  task: InsertCylinder-3Arms-v0
+  state_dim: 21
+  action_dim: 21
+  fps: ${fps}
+  episode_length: 400
+
+wandb:
+  project: ${env.task}_finetune

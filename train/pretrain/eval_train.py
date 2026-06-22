@@ -1,15 +1,7 @@
 import os
-# 告诉底层的 CuBLAS 使用固定的工作区配置，以保证计算的绝对确定性
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-# 🌟 终极防线：强行限制底层所有的数学库和物理引擎仅使用单线程！
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
-# 独立评估优先使用 EGL 离屏渲染，避免 GLFW/X11 窗口后端带来的额外波动。
+# 训练中评估只设置离屏渲染后端；不要在 import 时强行限线程或禁 TF32。
 os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
 import torch
 import logging
 import numpy as np
@@ -18,22 +10,11 @@ import json
 import shutil
 from pathlib import Path
 from contextlib import nullcontext
-import gymnasium as gym
-import yaml
 from tqdm import tqdm
 import random
 import time
-import sys
-from types import SimpleNamespace
-from lerobot.common.policies.factory import make_policy
-from lerobot.common.utils.utils import get_safe_torch_device, init_logging
 from lerobot.common.envs.utils import preprocess_observation
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if ROOT_DIR not in sys.path:
-    sys.path.append(ROOT_DIR)
-
-import env.task.sim_envs
 # ==========================================
 # 🌟 [新增] 自定义 Top-K 快照管理器(包含视频同步清理)
 # ==========================================
@@ -142,42 +123,6 @@ def seed_env_spaces(env, seed: int):
         if hasattr(space, "seed"):
             space.seed(seed)
 
-def patch_act_position_embedding_for_determinism():
-    """ACT 的 CUDA cumsum 非确定；评估时用等价 arange 坐标替代。"""
-    try:
-        from lerobot.common.policies.act.modeling_act import ACTSinusoidalPositionEmbedding2d
-    except Exception as exc:
-        logging.warning(f"无法应用 ACT 确定性补丁: {exc}")
-        return
-
-    if getattr(ACTSinusoidalPositionEmbedding2d, "_dppo_deterministic_patch", False):
-        return
-
-    def deterministic_forward(self, x):
-        height, width = x.shape[-2:]
-        y_range = torch.arange(1, height + 1, dtype=torch.float32, device=x.device)
-        y_range = y_range.view(1, height, 1).expand(1, height, width)
-        x_range = torch.arange(1, width + 1, dtype=torch.float32, device=x.device)
-        x_range = x_range.view(1, 1, width).expand(1, height, width)
-
-        y_range = y_range / (y_range[:, -1:, :] + self._eps) * self._two_pi
-        x_range = x_range / (x_range[:, :, -1:] + self._eps) * self._two_pi
-
-        inverse_frequency = self._temperature ** (
-            2 * (torch.arange(self.dimension, dtype=torch.float32, device=x.device) // 2) / self.dimension
-        )
-
-        x_range = x_range.unsqueeze(-1) / inverse_frequency
-        y_range = y_range.unsqueeze(-1) / inverse_frequency
-
-        pos_embed_x = torch.stack((x_range[..., 0::2].sin(), x_range[..., 1::2].cos()), dim=-1).flatten(3)
-        pos_embed_y = torch.stack((y_range[..., 0::2].sin(), y_range[..., 1::2].cos()), dim=-1).flatten(3)
-        return torch.cat((pos_embed_y, pos_embed_x), dim=3).permute(0, 3, 1, 2)
-
-    ACTSinusoidalPositionEmbedding2d.forward = deterministic_forward
-    ACTSinusoidalPositionEmbedding2d._dppo_deterministic_patch = True
-    logging.info("已启用 ACT 评估确定性补丁: positional embedding 使用 arange 替代 CUDA cumsum")
-
 def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     """
     完全自主实现的评估代码。没有任何黑盒。
@@ -200,7 +145,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     fps = getattr(cfg_eval, "fps", 25)
     max_steps = getattr(cfg_eval, "max_steps", 300)
     raw_camera = getattr(cfg_eval, "render_camera", 'overhead_cam')
-    render_camera = raw_camera
+    render_cameras = [raw_camera] if isinstance(raw_camera, str) else list(raw_camera)
     # 从配置中提取基础种子，默认为 1000
     base_seed = getattr(cfg_eval, "seed", 1000)
     # 计算所有评估回合推理的总耗时
@@ -214,7 +159,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
         seed_env_spaces(env, ep_seed)
         obs, _ = env.reset(seed=ep_seed)
         done = False
-        frames = []
+        frames_by_camera = {camera: [] for camera in render_cameras} if ep < max_rendered else {}
         ep_reward = 0
         # LeRobot/DPPO 的 Policy 内置了 action chunking 队列
         policy.reset() # 清空模型的动作缓冲历史
@@ -228,8 +173,8 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
             steps_taken = step + 1
             # 1. 如果还在需要渲染的额度内，才调用渲染 (提升非渲染 episode 的评估速度)
             if ep < max_rendered:
-                frames.append(env.unwrapped.render(render_camera)) # gym创建需要加上 .unwrapped
-                # frames.append(env.render(render_camera))  #直接创建环境不需要
+                for camera in render_cameras:
+                    frames_by_camera[camera].append(env.unwrapped.render([camera])) # gym创建需要加上 .unwrapped
 
             def prepare_obs(obj):
                 """递归字典，拷贝连续内存，并强行在最前面增加一个 Batch 维度"""
@@ -298,15 +243,15 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
         )
 
         # 6. 根据配置的帧率和最大渲染数量保存视频
-        if ep < max_rendered and len(frames) > 0:
+        if ep < max_rendered and frames_by_camera:
             status = "Success" if successes[ep] else "Fail"
-            # 格式：012500_reward=150.5_cam_overhead_ep_0.mp4
-            video_name = f"{render_camera[0]}_ep_{ep}_reward={ep_reward:.1f}_{status}.mp4"
-            video_path = videos_dir / video_name
-            imageio.mimsave(str(video_path), frames, fps=fps)
-            # logging.info(f"  保存视频: {video_path.name}")
-            
-            saved_video_paths.append(str(video_path))
+            for camera, frames in frames_by_camera.items():
+                if len(frames) == 0:
+                    continue
+                video_name = f"{camera}_ep_{ep}_reward={ep_reward:.1f}_{status}.mp4"
+                video_path = videos_dir / video_name
+                imageio.mimsave(str(video_path), frames, fps=fps)
+                saved_video_paths.append(str(video_path))
 
         # 记录每回合的推理时间
         if len(ep_inference_times) > 0:
@@ -339,8 +284,6 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
         max_time = 0.0
     policy.train() # 恢复训练模式
     
-    # 计算实际应该返回的视频列表长度
-    actual_rendered = min(max_rendered, n_episodes)
     return {
         "aggregated": {
             "success_rate": float(np.mean(successes)),
@@ -366,6 +309,9 @@ def evaluate_and_checkpoint_if_needed(
         base_identifier = f"{step_identifier}_loss={train_loss:.4f}"
     else:
         base_identifier = step_identifier
+    final_identifier = base_identifier
+    temp_video_dir = None
+    ar = -float("inf")
     
     # 1. 评估逻辑 (优先读取 cfg.eval.eval_freq)
     eval_freq = getattr(cfg.training, "eval_freq", 0)
@@ -414,243 +360,9 @@ def evaluate_and_checkpoint_if_needed(
 
         # 触发 Top-K 筛选与清理
         if train_loss is not None:
-            if ckpt_path.exists():
+            if ckpt_path.exists() and manager is not None:
                 manager.update(step, train_loss, ckpt_path, reward=ar)
+            elif manager is None:
+                logging.warning("⚠️ 警告: 未传入 TopKCheckpointManager，跳过 Top-K 模型清理逻辑。")
         else:
             logging.warning("⚠️ 警告: 未传入 train_loss，跳过 Top-K 模型清理逻辑，将保留所有权重。")
-
-
-def seed_everything(seed: int):
-    """Set seed for absolute reproducibility."""
-    
-    # 1. 锁死 Python 字典和集合的哈希种子 
-    # (防止字典遍历顺序在不同运行中发生变化，导致 Batch 数据错位)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-
-    # 2. 锁死 Python / Numpy / PyTorch (CPU & 所有 GPU)
-    seed_runtime(seed)
-
-    # 3. 锁死线程数，减少 CPU 规约/物理仿真侧的调度差异
-    try:
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
-    except RuntimeError:
-        # set_num_interop_threads 只能在并行工作开始前调用；已开始时跳过即可。
-        pass
-
-    # 4. 锁死 CuDNN 底层算法 (极其关键)
-    # 关闭自动调优，强行使用确定性卷积算法
-    torch.backends.mkldnn.enabled = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.set_float32_matmul_precision("highest")
-    if torch.cuda.is_available():
-        torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-        torch.backends.cuda.enable_math_sdp(True)
-
-    # 5. 强制 PyTorch 使用确定性算子
-    # 如果底层调用了非确定性算子，会强制回退到确定性实现，或者抛出警告
-    torch.use_deterministic_algorithms(True, warn_only=True)
-
-def ensure_python_hash_seed(seed: int):
-    """PYTHONHASHSEED 必须在解释器启动前生效；独立运行时自动重启一次补齐。"""
-    desired = str(seed)
-    if os.environ.get("PYTHONHASHSEED") == desired:
-        return
-
-    env = os.environ.copy()
-    env["PYTHONHASHSEED"] = desired
-    logging.warning(f"PYTHONHASHSEED 需要在 Python 启动前设置，正在用 PYTHONHASHSEED={desired} 自动重启 eval.py。")
-    os.execvpe(sys.executable, [sys.executable] + sys.argv, env)
-
-def main(eval_cfg):
-    ckpt_path = eval_cfg.ckpt_path
-
-    seed_everything(eval_cfg.seed)
-    patch_act_position_embedding_for_determinism()
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"❌ 找不到权重路径: {ckpt_path}\n请检查路径是否正确。")
-    # ==========================================
-    # 🌟 1.自动探测 LeRobot 的 pretrained_model 子文件夹
-    # ==========================================
-    hf_model_dir = os.path.join(ckpt_path, "pretrained_model")
-    if os.path.exists(hf_model_dir):
-        logging.info(f"检测到 LeRobot 标准快照结构，将自动读取子目录: pretrained_model")
-        load_dir = hf_model_dir
-    else:
-        load_dir = ckpt_path # 兼容其他保存格式
-
-    # 准备设备；如需最强确定性，可在 eval_cfg 中设为 "cpu"。
-    device = get_safe_torch_device(getattr(eval_cfg, "device", "cuda"))
-    logging.info(f"初始化评估程序... 使用设备: {device}")
-
-    
-    # ==========================================
-    # 🌟 2.实例化 Policy 并加载权重
-    # ==========================================
-    logging.info(f"正在从目录重建网络并加载权重: {load_dir}")
-    try:
-        
-        from pathlib import Path
-        from lerobot.common.utils.utils import init_hydra_config
-
-        # 1. 寻找 config.yaml 路径
-        config_yaml_path = Path(load_dir) / "config.yaml"
-        if not config_yaml_path.exists():
-            config_yaml_path = Path(load_dir).parent / "config.yaml"
-            
-        if not config_yaml_path.exists():
-            raise FileNotFoundError(f"找不到 config.yaml，无法初始化 hydra_cfg！")
-
-        # 2. 根据 yaml 文件初始化 hydra_cfg 对象
-        hydra_cfg = init_hydra_config(str(config_yaml_path))
-        hydra_cfg.device = str(device)
-        # if hydra_cfg.policy.name == "diffusion" and "do_mask_loss_for_padding" not in hydra_cfg.policy:
-        #     hydra_cfg.policy.do_mask_loss_for_padding = False
-
-        # 3. 🌟 核心：直接使用 make_policy，让框架接管底层张量与 EMA 加载
-        policy = make_policy(
-            hydra_cfg=hydra_cfg, 
-            pretrained_policy_name_or_path=str(load_dir)
-        )
-        
-        logging.info("  成功使用 make_policy 加载策略！底层 Normalizer 与平滑权重已自动生效。")
-        # 手动推入 GPU
-        policy.to(device)
-    except Exception as e:
-        raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
-    
-    # ==========================================
-    # 🌟 3.读取快照中的配置，使环境和训练时的对齐
-    # ==========================================
-    all_obs_keys = policy.config.input_shapes.keys()
-    ref_cams = [k.replace("observation.images.", "") for k in all_obs_keys if "observation.images." in k]
-    if not ref_cams:
-        raise ValueError(f"❌ 严重冲突：模型中未找到相机相关参数。请检查模型输入是否正确。")
-    
-    obs_cameras = list(dict.fromkeys(ref_cams + eval_cfg.render_camera))
-    # 动态读取环境元数据 (直接从 load_dir 读取)
-    
-    config_yaml_path = Path(load_dir) / "config.yaml"
-
-    if config_yaml_path.exists():
-        with open(config_yaml_path, "r") as f:
-            full_cfg = yaml.safe_load(f)
-            
-            # 安全地从 YAML 的字典树中提取 env.name 和 env.task
-            env_cfg = full_cfg.get("env", {})
-            env_name = env_cfg.get("name", getattr(env_cfg, "name", "guided_vision"))
-            env_task = env_cfg.get("task", getattr(env_cfg, "task", "SewNeedle-3Arms-v0"))
-            logging.info(f"成功从预训练文件夹读取完整环境配置: {env_name}/{env_task}")
-    else:
-        # 极限防呆后备
-        env_name = getattr(eval_cfg, "name", "guided_vision")
-        env_task = getattr(eval_cfg, "task", "SewNeedle-3Arms-v0")
-        logging.warning(f"  未找到 config.yaml，使用本地设定的后备环境: {env_name}/{env_task}")
-
-    # 拼接 Gym ID
-    env_id = f"{env_name}/{env_task}"
-    logging.info(f"正在通过 Gym 注册表构建环境: {env_id}")
-    # 使用 gym.make 创建环境，并通过 kwargs 强行覆盖你需要的相机
-    eval_env = gym.make(
-        id=env_id, 
-        cameras=obs_cameras  # 👈 这里的传参会直接覆盖 __init__.py 里的默认套餐！
-    )
-    env_desc = f"{env_id} -> {eval_env.unwrapped.__class__.__module__}.{eval_env.unwrapped.__class__.__name__}"
-    logging.info(f"当前评估环境: {env_desc}")
-    # print(f"当前评估环境: {env_desc}", flush=True)
-    logging.info(f"环境加载成功！最终挂载的相机: {obs_cameras}")
-
-    # ==========================================
-    # 🌟 4.设置视频输出目录 (默认在 000000 文件夹同级新建 eval_videos 文件夹)
-    # ==========================================
-    videos_dir = os.path.join(ckpt_path, "extra_eval_videos")
-    logging.info(f"开始测试! 录像将保存在: {videos_dir}")
-
-    # ==========================================
-    # 🌟 5.调用评估函数
-    # ==========================================
-    with torch.autocast(device_type=device.type) if getattr(eval_cfg, "use_amp", False) else nullcontext():
-        eval_info = custom_eval_policy(
-            env=eval_env,
-            policy=policy,
-            cfg_eval=eval_cfg,     
-            videos_dir=videos_dir,
-            device=device
-        )
-
-    # ==========================================
-    # 🌟 6.整理指标，重命名文件夹归档视频
-    # ==========================================
-    import shutil
-    sr = eval_info["aggregated"]["success_rate"]
-    ar = eval_info["aggregated"]["average_reward"]
-    avg_infer = eval_info["aggregated"]["avg_inference_ms"]
-    max_infer = eval_info["aggregated"]["max_inference_ms"]
-    # 生成直观的文件夹名称 (例如: eval_seed100_sr85.0_ar150.5)
-    new_folder_name = f"eval_seed={eval_cfg.seed}_ep={eval_cfg.n_episodes}_sr={sr*100:.1f}_ar={ar:.2f}"
-    new_videos_dir = os.path.join(videos_dir, new_folder_name)
-    os.makedirs(new_videos_dir, exist_ok=True)
-    
-    # 将刚刚生成的视频全部移动到新文件夹中
-    moved_count = 0
-    for video_path in eval_info["video_paths"]:
-        if os.path.exists(video_path):
-            file_name = os.path.basename(video_path)
-            shutil.move(video_path, os.path.join(new_videos_dir, file_name))
-            moved_count += 1
-
-    episode_results_path = os.path.join(new_videos_dir, "episode_results.json")
-    with open(episode_results_path, "w", encoding="utf-8") as f:
-        json.dump(eval_info["episodes"], f, indent=2, ensure_ascii=False)
-    logging.info(f"逐 episode 评估明细已保存: {episode_results_path}")
-
-    # ==========================================
-    # 🌟 7.打印最终结果
-    # ==========================================
-    logging.info("="*50)
-    logging.info(f"--独立评估完成！")
-    logging.info(f"--成功率 (Success Rate): {sr*100:.1f}%")
-    logging.info(f"--平均奖励 (Average Reward): {ar:.2f}")
-    logging.info(f"--平均推理时间 (Average Inference Time): {avg_infer:.2f} ms")
-    logging.info(f"--最大推理时间 (Max Inference Time): {max_infer:.2f} ms")
-    logging.info("="*50)
-
-# =========================================================================
-# 🌟 独立评估测试入口，推荐使用lerobot保存的快照格式，只需要给路径，环境配置会自动对齐
-# =========================================================================
-if __name__ == "__main__":
-
-    init_logging()
-    logging.getLogger().setLevel(logging.INFO)
-    for handler in logging.getLogger().handlers:
-        handler.setLevel(logging.INFO)
-
-    # ==========================================
-    # 🎯 核心配置区：在这里自由修改你的评估参数！
-    # ==========================================
-    eval_cfg = SimpleNamespace(
-        seed=100,
-        # 模型路径设置 (直接指向 0000600_loss=0.1540 文件夹即可，代码会自动寻找内部结构)
-        ckpt_path="outputs/3_finetune/train/2026-06-03/13-05-03_SewNeedle-3Arms-v0_ft_zed_wrist_diffusion/checkpoints/000046_sr=0.85_reward=583.72_Ploss=0.0004_Vloss=0.6156",
-        # ⚙️ 评估参数设置
-        n_episodes=100,             # 评估多少个任务                 
-        max_episodes_rendered=0,  # 保存多少个视频 
-        fps=25,                   # 视频帧率，和环境控制频率对齐
-        max_steps=300,            # 每个任务的最大步数
-        device="cuda",            # 如需完全规避 CUDA 非确定算子，可临时改成 "cpu"
-        
-        # 相机设置
-        # ['zed_cam_left', 'zed_cam_right', 'overhead_cam', 'worms_eye_cam' , 'wrist_cam_left', 'wrist_cam_right'],
-        render_camera=['overhead_cam'],         # 保存video的相机视角    
-        # ⚡ 混合精度设置 (推荐在评估时设为 False 以保证确定性)
-        use_amp=False,          
-    )
-    ensure_python_hash_seed(eval_cfg.seed)
-    # ==========================================print("cuda available:", torch.cuda.is_available())
-    # 启动
-    main(eval_cfg=eval_cfg)
-                                         

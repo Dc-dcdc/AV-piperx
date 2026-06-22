@@ -67,7 +67,7 @@ class PoseActionIKSolver:
     HAND_IK_JOINT_DISPLACEMENT_WEIGHT = 50.0
     HAND_IK_MAX_ROT_DIFF = 0.8
     HAND_IK_JOINT_P = 0.9
-    HAND_IK_MAX_ITERATIONS = 50
+    HAND_IK_MAX_ITERATIONS = 100
 
     # 初始化 IK 求解器、末端 site 和各臂控制器。
     def __init__(

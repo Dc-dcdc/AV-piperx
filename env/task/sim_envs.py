@@ -30,6 +30,12 @@ class GuidedVisionEnv(gym.Env):
             cameras: list[str] = CAMERAS,
             observation_height: int = 480,
             observation_width: int = 640,
+            left_arm_pose: list[float] | None = None,
+            right_arm_pose: list[float] | None = None,
+            middle_arm_pose: list[float] | None = None,
+            left_base_pos: list[float] | None = None,
+            right_base_pos: list[float] | None = None,
+            middle_base_pos: list[float] | None = None,
         ):
         super().__init__()
         assert num_arms in [2, 3], f"Invalid number of arms: {num_arms}"
@@ -40,7 +46,21 @@ class GuidedVisionEnv(gym.Env):
         # ==========================================
         self.cameras = cameras # 使用的摄像头列表
         self.num_arms = num_arms
+        self.left_arm_pose = np.asarray(left_arm_pose if left_arm_pose is not None else LEFT_ARM_POSE, dtype=np.float64)
+        self.right_arm_pose = np.asarray(right_arm_pose if right_arm_pose is not None else RIGHT_ARM_POSE, dtype=np.float64)
+        self.middle_arm_pose = np.asarray(middle_arm_pose if middle_arm_pose is not None else MIDDLE_ARM_POSE, dtype=np.float64)
         self._mjcf_root = mjcf.from_path(xml_path)                       # 加载 MJCF 模型
+        for body_name, base_pos in (
+            ("left_base_link", left_base_pos),
+            ("right_base_link", right_base_pos),
+            (MIDDLE_BASE_LINK, middle_base_pos),
+        ):
+            if base_pos is None:
+                continue
+            body = self._mjcf_root.find("body", body_name)
+            if body is None:
+                raise ValueError(f"找不到需要设置初始位置的 body: {body_name}")
+            body.pos = np.asarray(base_pos, dtype=np.float64)
         self._physics = mjcf.Physics.from_mjcf_model(self._mjcf_root)    # 构建物理引擎
         self.observation_height = observation_height
         self.observation_width = observation_width
@@ -174,17 +194,17 @@ class GuidedVisionEnv(gym.Env):
         # 🌟 新增：重置回合内部的步数计数器
         self._current_step = 0
         # 恢复默认位姿
-        self._physics.bind(self._left_joints).qpos = LEFT_ARM_POSE
+        self._physics.bind(self._left_joints).qpos = self.left_arm_pose
         self._physics.bind(self._left_gripper_joints).qpos = self.left_gripper_unnorm_fn(1) # 夹爪张开到最大
-        self._physics.bind(self._right_joints).qpos = RIGHT_ARM_POSE
+        self._physics.bind(self._right_joints).qpos = self.right_arm_pose
         self._physics.bind(self._right_gripper_joints).qpos = self.right_gripper_unnorm_fn(1)
-        self._physics.bind(self._middle_joints).qpos = MIDDLE_ARM_POSE
+        self._physics.bind(self._middle_joints).qpos = self.middle_arm_pose
         # 初始化控制器
-        self._physics.bind(self._left_actuators).ctrl = LEFT_ARM_POSE
+        self._physics.bind(self._left_actuators).ctrl = self.left_arm_pose
         self._physics.bind(self._left_actuators[6]).ctrl = self.left_gripper_unnorm_fn(1)
-        self._physics.bind(self._right_actuators).ctrl = RIGHT_ARM_POSE
+        self._physics.bind(self._right_actuators).ctrl = self.right_arm_pose
         self._physics.bind(self._right_actuators[6]).ctrl = self.right_gripper_unnorm_fn(1)
-        self._physics.bind(self._middle_actuators).ctrl = MIDDLE_ARM_POSE
+        self._physics.bind(self._middle_actuators).ctrl = self.middle_arm_pose
         # 强制物理引擎进行一次正向运动学计算
         self._physics.forward()
         self.terminated = False
@@ -235,6 +255,9 @@ class GuidedVisionEnv(gym.Env):
             "reward": reward,
             "step": self._current_step,
         }
+        reward_debug = getattr(self, "reward_debug", None)
+        if reward_debug is not None:
+            info["reward_debug"] = reward_debug
 
         return observation, float(reward),  self.terminated, truncated, info
 
@@ -365,258 +388,165 @@ class SlotInsertionEnv(GuidedVisionEnv):
         return reward
 
 
-# ==========================================
-# 本地测试代码 (确保环境逻辑完美运行)
-# ==========================================
-# ==========================================
-# 本地测试代码：加载 LeRobot 策略网络进行实时可视化推理
-# ==========================================
-# ==========================================
-# 本地测试代码：加载 LeRobot 策略网络进行实时可视化推理 (支持多相机画面拼接)
-# ==========================================
-if __name__ == '__main__':
-    import os
-    import yaml
-    import torch
-    import time
-    from pathlib import Path
-    import mujoco.viewer
+if __name__ == "__main__":
+    import argparse
+
     import cv2
-    import numpy as np
 
-    # ==========================================
-    # 🎯 1. 设置权重路径与加载
-    # ==========================================
-    ckpt_path = "outputs/1_hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion/pretrained_model"
-
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"⚠️ 找不到权重路径: {ckpt_path}\n请修改为正确的 ckpt_path。")
-
-    hf_model_dir = os.path.join(ckpt_path, "pretrained_model")
-    load_dir = hf_model_dir if os.path.exists(hf_model_dir) else ckpt_path
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 初始化推理程序... 使用设备: {device}")
-
-    config_yaml_path = Path(load_dir) / "config.yaml"
-    if not config_yaml_path.exists():
-        config_yaml_path = Path(load_dir).parent / "config.yaml"
-    if not config_yaml_path.exists():
-        raise FileNotFoundError(f"⚠️ 找不到模型配置文件 config.yaml: {config_yaml_path}")
-
-    with open(config_yaml_path, "r", encoding="utf-8") as f:
-        full_cfg = yaml.safe_load(f)
-
-    print(f"💾 正在从目录重建网络并加载权重: {load_dir}")
-    from lerobot.common.policies.factory import make_policy
-    from lerobot.common.utils.utils import init_hydra_config
-
-    hydra_cfg = init_hydra_config(str(config_yaml_path))
-    policy = make_policy(
-        hydra_cfg=hydra_cfg,
-        pretrained_policy_name_or_path=str(load_dir),
+    parser = argparse.ArgumentParser(description="加载指定 Gym 任务环境或 MuJoCo XML，并拼接显示指定相机画面。")
+    parser.add_argument(
+        "--env-id",
+        default="guided_vision/InsertCylinder-3Arms-v0",
+        help="要加载的 Gym 环境 ID。默认加载插圆柱任务；传空字符串并指定 --xml 可直接查看 XML。",
     )
-    print("✅ 成功使用 make_policy 加载策略！底层 Normalizer 与平滑权重已自动生效。")
-
-    policy.to(device)
-    policy.eval()
-
-    # ==========================================
-    # 🎯 2. 初始化环境与相机配置
-    # ==========================================
-    all_obs_keys = policy.config.input_shapes.keys()
-    ref_cams = [k.replace("observation.images.", "") for k in all_obs_keys if "observation.images." in k]
-    if not ref_cams:
-        raise ValueError("❌ 模型配置中未找到 observation.images.* 输入，请检查 checkpoint/config.yaml。")
-    obs_cameras = list(dict.fromkeys(ref_cams))
-
-    env_cfg = full_cfg.get("env", {})
-    env_name = env_cfg.get("name", "guided_vision")
-    env_task = env_cfg.get("task", "SewNeedle-3Arms-v0")
-    env_id = f"{env_name}/{env_task}"
-
-    print(f"🚀 正在通过 Gym 注册表初始化环境: {env_id}")
-    print(f"📷 模型观测相机: {obs_cameras}")
-    env = gym.make(
-        id=env_id,
-        disable_env_checker=True,
-        cameras=obs_cameras,
+    parser.add_argument(
+        "--xml",
+        default=None,
+        help="要加载的 MJCF/XML 文件路径。相对路径会按当前工作目录解析。",
     )
-    sim_env = env.unwrapped # 获取底层环境以访问物理引擎渲染接口
-    obs, info = env.reset()
-    policy.reset()
+    parser.add_argument("--num-arms", type=int, default=3, choices=[2, 3], help="使用 2 臂或 3 臂模型。")
+    parser.add_argument("--height", type=int, default=480, help="相机渲染高度。")
+    parser.add_argument("--width", type=int, default=640, help="相机渲染宽度。")
+    parser.add_argument("--max-cols", type=int, default=2, help="OpenCV 拼接窗口中每行最多显示几个相机。")
+    parser.add_argument(
+        "--cameras",
+        nargs="+",
+        default=["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
+        help="需要拼接显示的相机名称。",
+    )
+    args = parser.parse_args()
 
-    def prepare_obs(obj):
-        """Align single-env observations with LeRobot's batched preprocessing format."""
-        if isinstance(obj, dict):
-            return {k: prepare_obs(v) for k, v in obj.items()}
-        if hasattr(obj, "copy"):
-            return np.expand_dims(obj.copy(), axis=0).copy()
-        return obj
+    xml_path = args.xml
 
-    # 🌟 新增：配置需要额外拼接渲染显示的相机列表
-    # 选项参考 CAMERAS 列表: ['zed_cam_left', 'zed_cam_right', 'wrist_cam_left', 'wrist_cam_right', 'overhead_cam', 'worms_eye_cam']
-    display_cameras = ['zed_cam_left', 'zed_cam_right', 'wrist_cam_left', 'wrist_cam_right', 'overhead_cam', 'worms_eye_cam']
-    print(f"📺 将在 OpenCV 窗口中实时拼接显示以下相机: {display_cameras}")
-
-    # ==========================================
-    # 🎯 3. 键盘控制逻辑与 MuJoCo Viewer 接管
-    # ==========================================
-    global_cmd = {
-        "run_policy": False,
-        "force_reset": False
-    }
+    viewer_cmd = {"reset": False, "quit": False}
 
     def key_callback(keycode):
         if keycode == 32:  # Space
-            global_cmd["force_reset"] = True
-        elif keycode == 80 or keycode == 112:  # P 或 p
-            if not global_cmd["run_policy"]:
-                print("▶️ [键盘指令] 开始策略推理...")
-                global_cmd["run_policy"] = True
+            viewer_cmd["reset"] = True
+        elif keycode in (81, 113, 256):  # Q/q/Esc
+            viewer_cmd["quit"] = True
+
+    def make_camera_grid(frames_bgr, max_cols):
+        max_cols = max(1, int(max_cols))
+        grid_rows = []
+        for i in range(0, len(frames_bgr), max_cols):
+            row_frames = frames_bgr[i:i + max_cols]
+            while len(row_frames) < max_cols:
+                row_frames.append(np.zeros_like(frames_bgr[0]))
+            grid_rows.append(np.hstack(row_frames))
+        return np.vstack(grid_rows)
+
+    print(f"显示相机: {args.cameras}")
+    if args.env_id:
+        import env  # 注册 Gym 环境
+
+        print(f"加载 Gym 环境: {args.env_id}")
+        sim_env = gym.make(
+            args.env_id,
+            disable_env_checker=True,
+            num_arms=args.num_arms,
+            episode_length=10**9,
+            cameras=args.cameras,
+            observation_height=args.height,
+            observation_width=args.width,
+        ).unwrapped
+        display_name = args.env_id
+    else:
+        if xml_path is None:
+            xml_path = os.path.join(XML_DIR, "task_insert_cylinder.xml")
+        if not os.path.isabs(xml_path):
+            xml_path = os.path.abspath(xml_path)
+        if not os.path.exists(xml_path):
+            raise FileNotFoundError(f"找不到 MuJoCo XML 文件: {xml_path}")
+        print(f"加载 MuJoCo XML: {xml_path}")
+        sim_env = GuidedVisionEnv(
+            xml_path=xml_path,
+            num_arms=args.num_arms,
+            episode_length=10**9,
+            cameras=args.cameras,
+            observation_height=args.height,
+            observation_width=args.width,
+        )
+        display_name = os.path.basename(xml_path)
+    sim_env.reset()
 
     viewer = mujoco.viewer.launch_passive(
         sim_env._physics.model.ptr,
         sim_env._physics.data.ptr,
         show_left_ui=True,
         show_right_ui=True,
-        key_callback=key_callback
+        key_callback=key_callback,
     )
 
-    print("\n" + "="*50)
-    print("🎮 交互控制说明 (在 3D 窗口或 监控窗口 均可按键):")
-    print("👉 按下 [P] 键: 开始策略推理与运动控制")
-    print("👉 按下 [空格] 键: 强制中断结算，重置环境到初始状态")
-    print("="*50 + "\n")
-
-    episode_reward = 0.0
-    steps = 0
-
-    # ==========================================
-    # 🎯 4. 步进主循环
-    # ==========================================
-    window_name = f"Multi-Camera Monitor"
+    window_name = "MuJoCo Camera Monitor"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    # 强制设定 OpenCV 窗口在桌面上的初始大小 (宽, 高)
-    cv2.resizeWindow(window_name, 1280, 480)
-    while viewer.is_running():
-        step_start = time.time()
+    cv2.resizeWindow(window_name, args.width * args.max_cols, args.height * 2)
 
-        # ------------------------------------
-        # 响应中断：强制重置
-        # ------------------------------------
-        if global_cmd["force_reset"]:
-            print(f"⏹️ [键盘指令] 强制重置！当前进度: 步数 {steps}, 奖励 {episode_reward:.2f}")
-            obs, info = env.reset()
-            policy.reset()
-            episode_reward = 0.0
-            steps = 0
-            global_cmd["force_reset"] = False
-            global_cmd["run_policy"] = False
+    print("\n控制说明:")
+    print("  Space : 重置模型")
+    print("  Q/Esc : 退出")
 
-        # ------------------------------------
-        # 正常策略执行
-        # ------------------------------------
-        if global_cmd["run_policy"]:
-            # [h w c] -> [b c h w] ,并/ 255.0
-            obs = preprocess_observation(prepare_obs(obs))
-            # 键值过滤与设备转移：只保留模型配置中真正需要的输入特征，推入 GPU
-            obs = {
-                k: v.to(device, non_blocking=True)
-                for k, v in obs.items()
-                if k in policy.config.input_shapes  # 🌟 保留这层保护，防止多余状态引发报错
-            }
+    step_count = 0
+    try:
+        while viewer.is_running() and not viewer_cmd["quit"]:
+            step_start = time.time()
 
-            with torch.no_grad():
-                action_tensor = policy.select_action(obs)
-            action = action_tensor.squeeze(0).cpu().numpy()
+            if viewer_cmd["reset"]:
+                sim_env.reset()
+                step_count = 0
+                viewer_cmd["reset"] = False
 
-            try:
-                obs, reward, terminated, truncated, info = env.step(action)
-                episode_reward += float(reward)
-                steps += 1
-            except Exception as e:
-                print(f"💥 物理引擎异常中断: {e}")
-                terminated = True
-
-            if terminated or truncated:
-                reason = "成功" if terminated else "超时/失败"
-                print(f"🔄 回合自然结束 ({reason})！总步数: {steps}, 累计奖励: {episode_reward:.2f}")
-                obs, info = env.reset()
-                policy.reset()
-                episode_reward = 0.0
-                steps = 0
-                global_cmd["run_policy"] = False
-
-        # ------------------------------------
-        # 🌟 实时渲染并拼接多个相机画面
-        # ------------------------------------
-        try:
             frames_bgr = []
-            for cam_name in display_cameras:
-                # 渲染单个相机
-                img_rgb = sim_env._physics.render(height=480, width=640, camera_id=cam_name)
+            for camera_name in args.cameras:
+                img_rgb = sim_env._physics.render(
+                    height=args.height,
+                    width=args.width,
+                    camera_id=camera_name,
+                )
                 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-
-                # 在画面左上角写上该相机的名字，用于区分
-                cv2.putText(img_bgr, cam_name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                cv2.putText(
+                    img_bgr,
+                    camera_name,
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (255, 0, 0),
+                    2,
+                )
                 frames_bgr.append(img_bgr)
 
-            # 如果列表有图像，将它们水平拼接 (hstack)
             if frames_bgr:
-                max_cols = 2  # 👈 在这里设置一行最多放几个画面
-                grid_rows = []
-
-                # 按照 max_cols 将画面分组
-                for i in range(0, len(frames_bgr), max_cols):
-                    row_frames = frames_bgr[i:i + max_cols]
-
-                    # 补齐逻辑：如果最后一行画面数量不足 max_cols，用黑屏画面占位，防止拼接报错
-                    while len(row_frames) < max_cols:
-                        blank_img = np.zeros_like(frames_bgr[0])
-                        row_frames.append(blank_img)
-
-                    # 水平拼接这一行的图像
-                    grid_rows.append(np.hstack(row_frames))
-
-                # 垂直拼接所有行，形成最终的网格
-                combined_img = np.vstack(grid_rows)
-                h, w = combined_img.shape[:2]
-                # 叠加全局进度信息 (左下角)
-                cv2.putText(combined_img, f"Step: {steps} | Reward: {episode_reward:.2f}", (20, h - 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-                # 如果未运行策略，在整个拼接画面的中央叠加暂停大字提示
-                if not global_cmd["run_policy"]:
-                    text = "PAUSED - Press 'P' to Start"
-                    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
-                    text_x = (w - text_size[0]) // 2
-                    text_y = (h + text_size[1]) // 2
-                    cv2.putText(combined_img, text, (text_x, text_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-
-                # 显示最终拼接好的图像
+                combined_img = make_camera_grid(frames_bgr, args.max_cols)
+                h, _ = combined_img.shape[:2]
+                cv2.putText(
+                    combined_img,
+                    f"{display_name} | step={step_count}",
+                    (20, h - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (255, 255, 0),
+                    2,
+                )
                 cv2.imshow(window_name, combined_img)
 
-            # 监听 OpenCV 窗口按键
-            cv_key = cv2.waitKey(1) & 0xFF
-            if cv_key == ord(' '):  # 空格键
-                global_cmd["force_reset"] = True
-            elif cv_key == ord('p') or cv_key == ord('P'):  # P键
-                if not global_cmd["run_policy"]:
-                    print("▶️ [监控窗口指令] 开始策略推理...")
-                    global_cmd["run_policy"] = True
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord(" "):
+                viewer_cmd["reset"] = True
+            elif key in (ord("q"), ord("Q"), 27):
+                viewer_cmd["quit"] = True
 
-        except Exception as e:
-            # 忽略初始第一帧可能的渲染错误
-            pass
+            for _ in range(SIM_PHYSICS_ENV_STEP_RATIO):
+                sim_env._physics.step()
+            step_count += 1
+            viewer.sync()
 
-        # ------------------------------------
-        # 同步与帧率控制
-        # ------------------------------------
-        viewer.sync()
-        time_until_next_step = SIM_DT - (time.time() - step_start)
-        if time_until_next_step > 0:
-            time.sleep(time_until_next_step)
+            time_until_next_step = SIM_DT - (time.time() - step_start)
+            if time_until_next_step > 0:
+                time.sleep(time_until_next_step)
+    finally:
+        cv2.destroyAllWindows()
+        viewer.close()
+        sim_env.close()
 
     # 窗口关闭后清理资源
     cv2.destroyAllWindows()

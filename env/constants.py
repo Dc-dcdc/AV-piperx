@@ -80,9 +80,48 @@ SIM_PHYSICS_ENV_STEP_RATIO = int(SIM_DT/SIM_PHYSICS_DT) #AI 每输出一个动�
 SIM_DT = SIM_PHYSICS_DT * SIM_PHYSICS_ENV_STEP_RATIO # 强制确保最终的 SIM_DT 绝对是底层物理步长的整数倍，这样可以保证仿真器的稳定性
 
 # robot parameters
-LEFT_ARM_POSE = [0, -0.082, 1.06, 0, -0.953, 0, 0.02239] #左臂初始姿态
-RIGHT_ARM_POSE = [0, -0.082, 1.06, 0, -0.953, 0, 0.02239] #右臂初始姿态
+LEFT_ARM_POSE = [0, -0.082, 1.06, 0, -0.953, 0, 0.02239] #左臂默认初始姿态
+RIGHT_ARM_POSE = [0, -0.082, 1.06, 0, -0.953, 0, 0.02239] #右臂默认初始姿态
 MIDDLE_ARM_POSE = [0, -0.8, 0.8, 0, 0.5, 0, 0] #中臂初始姿态
+LEFT_BASE_POS = [-0.469, 0.032, 0.02] #左臂默认底座位置
+RIGHT_BASE_POS = [0.469, 0.032, 0.02] #右臂默认底座位置
+MIDDLE_BASE_POS = [0.0, -0.513, 0.02] #中臂默认底座位置
+
+# 按任务管理 ALOHA 初始配置；env/__init__.py 会读取并传入对应环境。
+ALOHA_INIT_CONFIGS = {
+    "default": {
+        "left_arm_pose": LEFT_ARM_POSE,
+        "right_arm_pose": RIGHT_ARM_POSE,
+        "middle_arm_pose": MIDDLE_ARM_POSE,
+        "left_base_pos": LEFT_BASE_POS,
+        "right_base_pos": RIGHT_BASE_POS,
+        "middle_base_pos": MIDDLE_BASE_POS,
+    },
+    "sew_needle": {
+        "left_arm_pose": LEFT_ARM_POSE,
+        "right_arm_pose": RIGHT_ARM_POSE,
+        "middle_arm_pose": MIDDLE_ARM_POSE,
+        "left_base_pos": LEFT_BASE_POS,
+        "right_base_pos": RIGHT_BASE_POS,
+        "middle_base_pos": MIDDLE_BASE_POS,
+    },
+    "slot_insertion": {
+        "left_arm_pose": LEFT_ARM_POSE,
+        "right_arm_pose": RIGHT_ARM_POSE,
+        "middle_arm_pose": MIDDLE_ARM_POSE,
+        "left_base_pos": LEFT_BASE_POS,
+        "right_base_pos": RIGHT_BASE_POS,
+        "middle_base_pos": MIDDLE_BASE_POS,
+    },
+    "insert_cylinder": {
+        "left_arm_pose": [0, -0.00767, 0.99939, 0, -0.98589, 0, 0.02239,],
+        "right_arm_pose": [0, -0.00767, 0.99939, 0, -0.98589, 0, 0.02239,],
+        "middle_arm_pose": [0, -0.3, 0.3, 0, 0.6, 0, 0],
+        "left_base_pos": [-0.6, 0.15, 0.02],
+        "right_base_pos": [0.6, 0.15, 0.02],
+        "middle_base_pos": [0.0, -0.7, 0.02],
+    },
+}
 LEFT_JOINT_NAMES = [
     "left_waist",
     "left_shoulder",

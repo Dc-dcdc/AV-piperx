@@ -51,6 +51,8 @@ class EpisodeBuffer:
     obs_traces: dict[str, list[np.ndarray]] = field(default_factory=dict)
     joint_actions: list[np.ndarray] = field(default_factory=list)
     pose_actions: list[np.ndarray] = field(default_factory=list)
+    cumulative_rewards: list[float] = field(default_factory=list)
+    reward_debug: list[dict] = field(default_factory=list)
     depth_traces: dict[str, list[np.ndarray]] = field(default_factory=dict)
     initial_time: float | None = None
     initial_qpos: np.ndarray | None = None
@@ -227,6 +229,19 @@ def stack_trace(values: list[np.ndarray]) -> np.ndarray:
         return np.asarray(values, dtype=object)
 
 
+# 将 numpy 类型转换成 json 可以直接保存的 Python 类型。
+def json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return json_safe(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 # 列出 run 目录下已有的有效 episode 目录。
 def list_existing_episode_dirs(run_dir: Path) -> list[Path]:
     episodes_dir = run_dir / "episodes"
@@ -344,6 +359,19 @@ def save_episode_arrays(buffer: EpisodeBuffer, cfg: DictConfig) -> dict[str, dic
     return {"observation": obs_key_map, "depth": depth_key_map}
 
 
+# 将 reward 调试信息单独保存，避免污染训练用 arrays.npz。
+def save_episode_reward_debug(buffer: EpisodeBuffer, cfg: DictConfig) -> str | None:
+    if not bool(cfg.get("save_reward_debug", False)) or not buffer.reward_debug:
+        return None
+
+    reward_debug_path = buffer.tmp_dir / "reward_debug.jsonl"
+    with reward_debug_path.open("w", encoding="utf-8") as f:
+        for item in buffer.reward_debug:
+            json.dump(json_safe(item), f, ensure_ascii=False)
+            f.write("\n")
+    return reward_debug_path.name
+
+
 # 关闭当前 episode 打开的相机视频写入器。
 def close_episode_videos(
     buffer: EpisodeBuffer,
@@ -385,11 +413,17 @@ def record_transition(
     obs,
     joint_action: np.ndarray,
     pose_action: np.ndarray,
+    reward: float,
     info: dict,
+    terminated: bool,
+    truncated: bool,
     record_cameras: list[str],
     save_depth: bool,
+    save_reward_debug: bool,
     depth_frames: dict[str, np.ndarray] | None,
 ) -> None:
+    step_index = buffer.steps
+
     for raw_key, value in flatten_numeric_obs(obs).items():
         buffer.obs_traces.setdefault(raw_key, []).append(value)
 
@@ -403,6 +437,22 @@ def record_transition(
 
     buffer.joint_actions.append(np.asarray(joint_action, dtype=np.float32))
     buffer.pose_actions.append(np.asarray(pose_action, dtype=np.float32))
+    if save_reward_debug:
+        previous_reward = buffer.cumulative_rewards[-1] if buffer.cumulative_rewards else 0.0
+        cumulative_reward = float(previous_reward + float(reward))
+        buffer.cumulative_rewards.append(cumulative_reward)
+        reward_item = {
+            "step": int(step_index),
+            "reward": float(reward),
+            "cumulative_reward": cumulative_reward,
+            "is_success": bool((info or {}).get("is_success", False)),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+        }
+        env_reward_debug = (info or {}).get("reward_debug")
+        if isinstance(env_reward_debug, dict):
+            reward_item.update(json_safe(env_reward_debug))
+        buffer.reward_debug.append(reward_item)
     buffer.final_info = dict(info or {})
 
 
@@ -510,6 +560,7 @@ def finish_episode(
         return None
 
     array_key_maps = save_episode_arrays(buffer, cfg)
+    reward_debug_path = save_episode_reward_debug(buffer, cfg)
     episode_info = {
         "episode": int(buffer.index),
         "success": success,
@@ -519,6 +570,13 @@ def finish_episode(
         "save_rgb": bool(cfg.save_rgb),
         "save_videos": bool(cfg.save_rgb and cfg.save_videos and buffer.video_paths),
         "save_depth": bool(cfg.save_depth),
+        "save_reward_debug": bool(cfg.get("save_reward_debug", False)),
+        "reward_debug_path": reward_debug_path,
+        "final_cumulative_reward": (
+            float(buffer.cumulative_rewards[-1])
+            if bool(cfg.get("save_reward_debug", False)) and buffer.cumulative_rewards
+            else None
+        ),
         "observation_npz_keys": array_key_maps["observation"],
         "depth_npz_keys": array_key_maps["depth"],
         "video_paths": {
@@ -554,6 +612,7 @@ def _print_header(cfg: DictConfig, run_dir: Path, record_cameras: list[str]) -> 
     video_mode = "on, replay after A+X" if cfg.save_rgb and cfg.save_videos else "off"
     print(f"Save videos:   {video_mode}")
     print(f"Save depth:    {'on' if cfg.save_depth else 'off'}")
+    print(f"Reward debug:  {'on' if cfg.get('save_reward_debug', False) else 'off'}")
     print(f"Depth window:  {'on' if cfg.depth_window else 'off'}")
     print(f"FPS:           {cfg.fps}")
     print(f"Loop limit:    {1000.0 / float(cfg.fps):.1f} ms")
@@ -576,7 +635,10 @@ def run(cfg: DictConfig) -> None:
     if float(cfg.fps) <= 0:
         raise ValueError(f"fps must be positive, got {cfg.fps}.")
     loop_period = 1.0 / float(cfg.fps)
-    max_loop_ms = loop_period * 1000.0
+    max_loop_ms = loop_period * 1000.0  # 实际最大的loop时长
+    loop_timeout_margin_ms = 20.0       # 给予一定的缓冲时长
+    slow_loop_limit_ms = max_loop_ms + loop_timeout_margin_ms  # 最终要求每一轮时长限制
+    max_consecutive_slow_loops = 5
     loop_timeout_grace_steps = max(1, int(round(float(cfg.fps) * 0.25)))
     if cfg.unity_image_source not in ("rgb", "depth"):
         raise ValueError(f"unity_image_source must be rgb or depth, got {cfg.unity_image_source!r}.")
@@ -594,6 +656,11 @@ def run(cfg: DictConfig) -> None:
     env_cameras = []
     _print_header(cfg, run_dir, record_cameras)
     print(f"Loop startup grace: {loop_timeout_grace_steps} step(s)")
+    print(
+        "Loop timeout: "
+        f">{slow_loop_limit_ms:.1f} ms "
+        f"for {max_consecutive_slow_loops} consecutive recorded step(s)"
+    )
 
     existing_infos = load_existing_episode_infos(run_dir) if cfg.append else []
     metadata = {
@@ -605,6 +672,7 @@ def run(cfg: DictConfig) -> None:
         "save_rgb": bool(cfg.save_rgb),
         "save_videos": bool(cfg.save_rgb and cfg.save_videos),
         "save_depth": bool(cfg.save_depth),
+        "save_reward_debug": bool(cfg.get("save_reward_debug", False)),
         "video_save_mode": "replay_after_success_confirm",
         "render_width": int(cfg.render_width),
         "render_height": int(cfg.render_height),
@@ -615,14 +683,17 @@ def run(cfg: DictConfig) -> None:
     write_metadata(run_dir, metadata)
     episode_index = next_episode_index(run_dir)
 
-    env_obj = gym.make(
-        cfg.env_id,
-        disable_env_checker=True,
-        cameras=env_cameras,
-        episode_length=cfg.episode_length,
-        observation_height=cfg.render_height,
-        observation_width=cfg.render_width,
-    )
+    env_make_kwargs = {
+        "disable_env_checker": True,
+        "cameras": env_cameras,
+        "episode_length": cfg.episode_length,
+        "observation_height": cfg.render_height,
+        "observation_width": cfg.render_width,
+    }
+    if "InsertCylinder" in str(cfg.env_id):
+        env_make_kwargs["enable_reward_debug"] = bool(cfg.get("save_reward_debug", False))
+
+    env_obj = gym.make(cfg.env_id, **env_make_kwargs)
     sim_env = env_obj.unwrapped
     obs, _ = env_obj.reset()
     physics = sim_env._physics
@@ -708,6 +779,7 @@ def run(cfg: DictConfig) -> None:
     recording = False
     waiting_success_confirm = False
     skip_recording_this_loop = False
+    consecutive_slow_loops = 0
     episode_buffer: EpisodeBuffer | None = None
     latest_data: HeadsetData | None = None
     latest_feedback = None
@@ -798,6 +870,7 @@ def run(cfg: DictConfig) -> None:
                         recording = False
                         waiting_success_confirm = False
                         skip_recording_this_loop = False
+                        consecutive_slow_loops = 0
                         latest_feedback = None
                         print("Env reset, waiting for a new QuestControl anchor.")
                     command["save_success"] = False
@@ -814,6 +887,7 @@ def run(cfg: DictConfig) -> None:
                     recording = False
                     waiting_success_confirm = False
                     skip_recording_this_loop = False
+                    consecutive_slow_loops = 0
                     latest_feedback = None
                     command["reset"] = False
                     print("Reset MuJoCo env. Waiting for a new QuestControl anchor.")
@@ -850,6 +924,7 @@ def run(cfg: DictConfig) -> None:
                             recording = True
                             waiting_success_confirm = False
                             skip_recording_this_loop = True
+                            consecutive_slow_loops = 0
                             print(f"Started episode {episode_index:06d}.")
                     command["anchor"] = False
 
@@ -899,9 +974,13 @@ def run(cfg: DictConfig) -> None:
                             obs=obs_before,
                             joint_action=joint_action,
                             pose_action=pose_action,
+                            reward=float(_reward),
                             info=info,
+                            terminated=bool(terminated),
+                            truncated=bool(truncated),
                             record_cameras=record_cameras,
                             save_depth=bool(cfg.save_depth),
+                            save_reward_debug=bool(cfg.get("save_reward_debug", False)),
                             depth_frames=depth_frames,
                         )
                         timing_t7 = time.perf_counter()
@@ -931,6 +1010,7 @@ def run(cfg: DictConfig) -> None:
                             recording = False
                             waiting_success_confirm = False
                             skip_recording_this_loop = False
+                            consecutive_slow_loops = 0
                             latest_feedback = None
                             print("Episode ended. Env reset, waiting for a new QuestControl anchor.")
 
@@ -1084,26 +1164,38 @@ def run(cfg: DictConfig) -> None:
                         recording
                         and episode_buffer is not None
                         and episode_buffer.steps > loop_timeout_grace_steps
-                        and latest_timing_ms["loop"] > max_loop_ms
                     ):
-                        delayed_loop_ms = latest_timing_ms["loop"]
-                        episode_buffer.final_info["loop_timeout_ms"] = delayed_loop_ms
-                        episode_buffer.final_info["loop_limit_ms"] = max_loop_ms
-                        finish_episode(buffer=episode_buffer, cfg=cfg, metadata=metadata, keep=False)
-                        episode_buffer = None
-                        obs, _ = env_obj.reset()
-                        ik_solver.reset()
-                        quest_control.reset()
-                        recording = False
-                        waiting_success_confirm = False
-                        skip_recording_this_loop = False
-                        latest_feedback = None
-                        latest_depth_stats = {}
-                        last_success_notice = (
-                            f"loop timeout {delayed_loop_ms:.1f}>{max_loop_ms:.1f} ms, episode reset"
-                        )
-                        last_success_notice_t = time.time()
-                        print(last_success_notice)
+                        if latest_timing_ms["loop"] > slow_loop_limit_ms:
+                            consecutive_slow_loops += 1
+                        else:
+                            consecutive_slow_loops = 0
+
+                        if consecutive_slow_loops >= max_consecutive_slow_loops:
+                            delayed_loop_ms = latest_timing_ms["loop"]
+                            episode_buffer.final_info["loop_timeout_ms"] = delayed_loop_ms
+                            episode_buffer.final_info["loop_target_ms"] = max_loop_ms
+                            episode_buffer.final_info["loop_limit_ms"] = slow_loop_limit_ms
+                            episode_buffer.final_info["loop_timeout_margin_ms"] = loop_timeout_margin_ms
+                            episode_buffer.final_info["loop_timeout_consecutive_count"] = consecutive_slow_loops
+                            finish_episode(buffer=episode_buffer, cfg=cfg, metadata=metadata, keep=False)
+                            episode_buffer = None
+                            obs, _ = env_obj.reset()
+                            ik_solver.reset()
+                            quest_control.reset()
+                            recording = False
+                            waiting_success_confirm = False
+                            skip_recording_this_loop = False
+                            consecutive_slow_loops = 0
+                            latest_feedback = None
+                            latest_depth_stats = {}
+                            last_success_notice = (
+                                f"loop timeout {delayed_loop_ms:.1f}>{slow_loop_limit_ms:.1f} ms "
+                                f"x{max_consecutive_slow_loops}, episode reset"
+                            )
+                            last_success_notice_t = time.time()
+                            print(last_success_notice)
+                    else:
+                        consecutive_slow_loops = 0
 
                 now = time.time()
                 if now - last_status_t >= cfg.status_hz_interval:
@@ -1169,24 +1261,25 @@ def quest_teleop_collect_cli(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     default_args = [
-        "env_id=guided_vision/SewNeedle-3Arms-v0",    # 仿真环境 ID
+        "env_id=guided_vision/InsertCylinder-3Arms-v0 ",
         "max_steps_per_episode=400",                  # 最大步长
         "head_control=true",                          # 是否使用头显控制中间臂
-        "lock_pitch=true",                            # 是否锁定中间臂 pitch 角，true 时禁用抬头低头
-        "lock_roll=true",                             # 是否锁定中间臂 roll 角, true 时保持头部水平
+        "lock_pitch=False",                            # 是否锁定中间臂 pitch 角，true 时禁用抬头低头
+        "lock_roll=true",                             # 是否锁定中间臂 roll 角，true 时保持头部水平
         "save_pose_action=true",                      # 是否额外保存 Quest 映射后的末端位姿动作
-        "save_rgb=true",                             # 是否在 A+X 确认后回放轨迹并保存 RGB 视频
+        "save_rgb=true",                              # 是否在 A+X 确认后回放轨迹并保存 RGB 视频
         "save_depth=false",                           # 是否保存 record_cameras 中每个相机的逐像素深度图
-        "depth_window=false",                           # 是否打开本地 OpenCV 深度图窗口
-        "camera_window=false",                         # 是否打开本地 OpenCV RGB 窗口，关闭可减少一次额外渲染
+        "depth_window=false",                         # 是否打开本地 OpenCV 深度图窗口
+        "camera_window=false",                        # 是否打开本地 OpenCV RGB 窗口，关闭可减少一次额外渲染
         "unity_image_source=rgb",                     # 默认发送 RGB 图到 Quest
         "unity_image_stereo=true",                    # 是否按左右眼 side-by-side 发送到 Quest
+        # 不在这里设置 env_id；任务场景只通过 yaml 或命令行 env_id 切换。
         # "unity_image_stream=false",
     ]
 
     for arg in default_args:
-        arg_key = arg.split("=")[0]
-        if not any(arg_key in sys_arg for sys_arg in sys.argv):
+        arg_key = arg.split("=", 1)[0]
+        if not any(sys_arg.split("=", 1)[0] == arg_key for sys_arg in sys.argv):
             sys.argv.append(arg)
 
     quest_teleop_collect_cli()

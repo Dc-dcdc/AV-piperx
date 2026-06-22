@@ -41,8 +41,22 @@ class SewNeedleEnv(GuidedVisionEnv):
         needle_center = (needle_head + needle_tail) / 2.0
         wall_center_x = (hole_entrance[0] + hole_exit[0]) / 2.0
 
+        # 右臂初期靠近奖励使用“到整根针线段的距离”，避免只靠近针体但没靠近固定标记点时奖励反向。
+        needle_vec = needle_tail - needle_head
+        needle_len_sq = float(np.dot(needle_vec, needle_vec))
+        if needle_len_sq > 1e-12:
+            t = np.clip(
+                np.dot(right_gripper_center - needle_head, needle_vec) / needle_len_sq,
+                0.0,
+                1.0,
+            )
+            closest_needle_pos = needle_head + t * needle_vec
+        else:
+            closest_needle_pos = needle_center
+        dist_right_to_needle = np.linalg.norm(right_gripper_center - closest_needle_pos)
+
         # 3. 终极抬举误差解耦计算
-        target_z_target = hole_exit[2] + 0.12
+        target_z_target = hole_exit[2] + 0.012
         z_error = max(0.0, target_z_target - needle_center[2])
         x_error = abs(needle_center[0] - wall_center_x)
         y_error = abs(needle_center[1] - hole_exit[1])
@@ -59,6 +73,7 @@ class SewNeedleEnv(GuidedVisionEnv):
 
             # 强化学习需要计算差分的绝对距离
             'dist_right_to_mark': np.linalg.norm(right_gripper_center - needle_right_pos),
+            'dist_right_to_needle': dist_right_to_needle,
             'dist_head_to_entrance': np.linalg.norm(needle_head - hole_entrance),
             'dist_head_to_exit': np.linalg.norm(needle_head - hole_exit),
             'dist_left_to_mark': np.linalg.norm(left_gripper_center - needle_left_pos),
@@ -97,6 +112,7 @@ class SewNeedleEnv(GuidedVisionEnv):
         self._threaded_needle = False
         self.needle_reached_exit = False                 # 针头穿墙标志位
         self.left_has_grasped = False                    # 左臂成功接针标志位
+        self.needle_was_grasped = False                  # 针是否曾经被任一夹爪抓住过
         self.needle_completely_through = False           # 针完全过孔标志位
         self.needle_start_through = False                # 针开始过孔标志位
         self._prev_dists = self._calculate_distances()   # 记录物理引擎第一帧的距离，作为差分计算的起点
@@ -146,7 +162,22 @@ class SewNeedleEnv(GuidedVisionEnv):
         # ==========================================
         # 阶段流转奖励逻辑 (稀疏事件奖励保留)
         # ==========================================
-        reward = -1.0 # 存活的时间惩罚，逼迫其快速完成任务
+        reward = -0.8 # 存活的时间惩罚，逼迫其快速完成任务
+        needle_is_grasped = touch_left_gripper or touch_right_gripper
+        if needle_is_grasped:
+            self.needle_was_grasped = True
+
+        # 如果针曾经被抓起过，但当前左右臂都没抓住且针明显掉到洞口下方，则判定掉落失败。
+        if (
+            self.needle_was_grasped
+            and not needle_is_grasped
+            and curr_dists['needle_z'] < (curr_dists['hole_z'] - 0.03)
+        ):
+            reward -= 100.0
+            self.is_success = False
+            self.terminated = True
+            self._prev_dists = curr_dists
+            return float(reward)
 
         # 触发 1：针头到达入口 (进洞)
         if (
@@ -187,7 +218,7 @@ class SewNeedleEnv(GuidedVisionEnv):
             and curr_dists['dist_tail_to_exit'] < 0.03                  # 针尾部与出口距离
         ):
             self.needle_completely_through = True
-            reward += 100.0
+            reward += 500.0  # 穿针完成是任务核心，给最高阶段奖励
 
         # ==========================================
         # 🌟 差分连续奖励 (Dense Differential Rewards)
@@ -199,11 +230,17 @@ class SewNeedleEnv(GuidedVisionEnv):
         if not self.left_has_grasped:
             # --- 前半场：右臂主导 ---
             if not touch_right_gripper:
-                # 引导右臂接近针
-                progress = self._prev_dists['dist_right_to_mark'] - curr_dists['dist_right_to_mark']
+                # 引导右臂接近整根针；同时给当前距离势能，避免慢速靠近时被时间惩罚完全盖住。
+                progress = self._prev_dists['dist_right_to_needle'] - curr_dists['dist_right_to_needle']
                 reward += diff_scale * progress
+                right_approach_radius = 0.25
+                right_near_reward = 2.0 * max(
+                    0.0,
+                    1.0 - curr_dists['dist_right_to_needle'] / right_approach_radius,
+                )
+                reward += right_near_reward
             else:
-                reward += 0.25 # 保持抓取的微弱奖励
+                reward += 0.8 # 保持抓取的微弱奖励
                 if not self.needle_start_through:
                     # 没到达洞口，引导针头到达入口
                     progress = self._prev_dists['dist_head_to_entrance'] - curr_dists['dist_head_to_entrance']
@@ -225,8 +262,11 @@ class SewNeedleEnv(GuidedVisionEnv):
 
             if not touch_left_gripper:
                 #  如果左手脱靶导致针掉落（跌落到洞口下方 3 厘米以上）
-                if curr_dists['needle_z'] < (curr_dists['hole_z'] - 0.03):
-                    reward -= 100.0
+                if (
+                    not touch_right_gripper
+                    and curr_dists['needle_z'] < (curr_dists['hole_z'] - 0.03)
+                ):
+                    reward -= 500.0
                     self.is_success = False
                     self.terminated = True # 判负，任务彻底失败，重新开局
                 else:
@@ -248,7 +288,7 @@ class SewNeedleEnv(GuidedVisionEnv):
                         progress = self._prev_dists['composite_error_dist'] - curr_dists['composite_error_dist']
                         reward += diff_scale * progress
                     else:
-                        reward += 500.0
+                        reward += 100.0  # 回归到终点只是穿针后的附属奖励
                         self.is_success = True
                         self.terminated = True
 

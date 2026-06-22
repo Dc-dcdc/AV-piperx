@@ -19,6 +19,7 @@ save_videos: true  # 是否将回放渲染出的 RGB 图像保存为每条 episo
 save_depth: false  # 是否保存 record_cameras 中每个相机的逐像素深度图，保存到 arrays.npz 的 depth__相机名
 video_queue_size: 300  # 后台视频写入队列容量，越大越不易卡顿但占用更多内存
 save_pose_action: true  # 是否额外保存 Quest 映射后的末端位姿动作
+save_reward_debug: false  # 是否单独保存 reward_debug.jsonl，用于分析奖励函数，不写入训练用 arrays.npz
 min_steps_to_save: 2     # episode 少于该步数时自动丢弃
 max_steps_per_episode: 1000    # 单条 episode 最大采集步数
 record_cameras:   # 保存到数据集中的相机，需和训练配置 input_shapes 对齐
@@ -32,8 +33,8 @@ record_cameras:   # 保存到数据集中的相机，需和训练配置 input_sh
 
 # ===== 3. 仿真与控制 =====
 env_id: guided_vision/SewNeedle-3Arms-v0  # Gymnasium 仿真环境 ID
-hand_position_scale: 1.0      # 左右手柄位移映射到左右臂末端的缩放系数
-head_position_scale: 1.0      # 头显位移映射到中间臂末端的缩放系数
+hand_position_scale: 1.2      # 左右手柄位移映射到左右臂末端的缩放系数
+head_position_scale: 3.0      # 头显位移映射到中间臂末端的缩放系数
 hand_max_delta: 1.0           # 左右臂末端相对锚点的最大位移
 head_max_delta: 1.0           # 中间臂末端相对锚点的最大位移
 head_control: true            # 是否使用头显控制中间臂

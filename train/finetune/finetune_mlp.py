@@ -34,7 +34,7 @@ if ROOT_DIR not in sys.path:
 
 import env.task.sim_envs  # noqa: F401
 from train.finetune.critic import SharedFeatureCritic
-from train.pretrain.eval import TopKCheckpointManager, custom_eval_policy
+from train.pretrain.eval_train import TopKCheckpointManager, custom_eval_policy
 
 
 def deep_update_dict(base: dict, override: dict) -> dict:
@@ -68,6 +68,72 @@ def compute_value_diagnostics(values, returns, eps: float = 1e-8):
         else float(np.corrcoef(values, returns)[0, 1])
     )
     return float(explained_variance), value_return_corr
+
+
+class RunningMeanStd:
+    """原版 DPPO 用的运行均值方差统计器。"""
+
+    def __init__(self, epsilon=1e-4, shape=()):
+        self.mean = np.zeros(shape)
+        self.var = np.ones(shape)
+        self.count = epsilon
+
+    def update(self, x):
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        self.mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta**2 * self.count * batch_count / total_count
+        self.var = m2 / (total_count - 1)
+        self.count = total_count
+
+
+def backward_discounted_sum(prevret, reward, first, gamma):
+    """按原版 DPPO 的 RunningRewardScaler 方式累计折扣回报。"""
+    assert first.ndim == 2
+    _, nstep = reward.shape
+    ret = np.zeros_like(reward)
+    for t in range(nstep):
+        prevret = ret[:, t] = reward[:, t] + (1 - first[:, t]) * gamma * prevret
+    return ret
+
+
+class RunningRewardScaler:
+    """用折扣回报的运行方差缩放 reward，保持 PPO/Critic 目标量级稳定。"""
+
+    def __init__(self, num_envs, cliprew=10.0, gamma=0.99, epsilon=1e-8, per_env=False):
+        ret_rms_shape = (num_envs,) if per_env else ()
+        self.ret_rms = RunningMeanStd(shape=ret_rms_shape)
+        self.cliprew = cliprew
+        self.ret = np.zeros(num_envs)
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.per_env = per_env
+
+    def __call__(self, reward, first):
+        rets = backward_discounted_sum(
+            prevret=self.ret,
+            reward=reward,
+            first=first,
+            gamma=self.gamma,
+        )
+        self.ret = rets[:, -1]
+        self.ret_rms.update(rets if self.per_env else rets.reshape(-1))
+        return self.transform(reward)
+
+    def transform(self, reward):
+        return np.clip(
+            reward / np.sqrt(self.ret_rms.var + self.epsilon),
+            -self.cliprew,
+            self.cliprew,
+        )
 
 
 def log_box(title: str, rows: list[tuple[str, object]], width: int = 78):
@@ -189,7 +255,7 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         residual_scale: float = 1.0,
         init_std: float = 0.02,
         learn_std: bool = True,
-        logprob_reduction: str = "sum",
+        logprob_reduction: str = "mean",
     ):
         super().__init__()
         self.base_policy = base_policy
@@ -708,7 +774,7 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
             )
         ),
         learn_std=bool(getattr(cfg.training, "action_mlp_learn_std", True)),
-        logprob_reduction=str(getattr(cfg.training, "logprob_reduction", "sum")),
+        logprob_reduction=str(getattr(cfg.training, "logprob_reduction", "mean")),
     ).to(device)
     policy.freeze_base_policy()
 
@@ -746,7 +812,11 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
     bc_coef = float(getattr(cfg.training, "bc_loss_coef", 0.0))
     gamma = float(getattr(cfg.training, "gamma", 0.99))
     gae_lambda = float(getattr(cfg.training, "gae_lambda", 0.95))
-    reward_ema_alpha = float(getattr(cfg.training, "reward_ema_alpha", 0.05))
+    reward_scale_running = bool(getattr(cfg.training, "reward_scale_running", True))
+    reward_scale_const = float(getattr(cfg.training, "reward_scale_const", 1.0))
+    norm_adv = bool(getattr(cfg.training, "norm_adv", True))
+    adv_lower_q = float(getattr(cfg.training, "clip_advantage_lower_quantile", 0.05))
+    adv_upper_q = float(getattr(cfg.training, "clip_advantage_upper_quantile", 0.95))
     use_disk_cache = bool(getattr(cfg.training, "use_disk_cache", False))
     skip_update = bool(getattr(cfg.training, "skip_update", False))
     update_actor = bool(getattr(cfg.training, "update_actor", True))
@@ -771,6 +841,8 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
             ("critic_lr", f"{float(getattr(cfg.training, 'critic_lr', 3e-4)):.3e}"),
             ("clip_ratio", clip_ratio),
             ("target_kl", target_kl),
+            ("reward_scale_running", reward_scale_running),
+            ("reward_scale_const", reward_scale_const),
             ("progress_bars", show_progress),
             ("quiet_terminal", quiet_terminal),
         ],
@@ -794,7 +866,8 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
     reset_full_obs_queue(raw_obs_queue, prev_obs, n_obs_steps)
 
     running_ep_rewards = np.zeros(n_envs, dtype=np.float32)
-    running_reward_std = 1.0
+    running_reward_scaler = RunningRewardScaler(n_envs, gamma=gamma)
+    next_chunk_firsts = np.ones(n_envs, dtype=np.float32)
     best_policy_state = snapshot_trainable_state(policy)
     best_eval_reward = float("-inf")
     best_eval_success_rate = 0.0
@@ -840,6 +913,8 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
         old_logprob_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
         reward_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
         terminated_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
+        firsts_trajs = np.zeros((n_steps + 1, n_envs), dtype=np.float32)
+        firsts_trajs[0] = next_chunk_firsts
         completed_ep_rewards = []
         completed_ep_successes = []
 
@@ -946,7 +1021,9 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
             old_logprob_trajs[step] = old_logprob_venv
             reward_trajs[step] = chunk_reward
             terminated_trajs[step] = true_term_accum
+            firsts_trajs[step + 1] = any_done_accum
 
+        next_chunk_firsts = firsts_trajs[-1].copy()
         rollout_avg_return = np.mean(completed_ep_rewards) if completed_ep_rewards else float("-inf")
         rollout_success_rate = np.mean(completed_ep_successes) if completed_ep_successes else 0.0
         logging.info(
@@ -998,23 +1075,20 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
             global_cond_last = global_cond_from_obs(policy, last_obs)
             next_values_last = critic(global_cond_last.detach()).cpu().numpy().flatten()
 
-        batch_reward_std = reward_trajs.std()
-        if batch_reward_std > 1e-8:
-            if itr == 0:
-                running_reward_std = batch_reward_std
-            else:
-                running_reward_std = (
-                    (1 - reward_ema_alpha) * running_reward_std
-                    + reward_ema_alpha * batch_reward_std
-                )
-        scaled_rewards = reward_trajs / max(running_reward_std, 1e-8)
+        if reward_scale_running:
+            scaled_rewards = running_reward_scaler(
+                reward=reward_trajs.T,
+                first=firsts_trajs[:-1].T,
+            ).T
+        else:
+            scaled_rewards = reward_trajs
 
         advantages_trajs = np.zeros_like(scaled_rewards)
         last_gae_lam = 0
         for t in reversed(range(n_steps)):
             next_val = next_values_last if t == n_steps - 1 else values_trajs[t + 1]
             nonterminal = 1.0 - terminated_trajs[t]
-            delta = scaled_rewards[t] + gamma * next_val * nonterminal - values_trajs[t]
+            delta = scaled_rewards[t] * reward_scale_const + gamma * next_val * nonterminal - values_trajs[t]
             last_gae_lam = delta + gamma * gae_lambda * nonterminal * last_gae_lam
             advantages_trajs[t] = last_gae_lam
 
@@ -1022,11 +1096,17 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
         critic_ev, critic_corr = compute_value_diagnostics(values_trajs, returns_trajs)
         returns_k = torch.from_numpy(returns_trajs.reshape(-1)).float().to(device)
         advantages_k = torch.from_numpy(advantages_trajs.reshape(-1)).float().to(device)
-        advantages_k = (advantages_k - advantages_k.mean()) / (advantages_k.std() + 1e-8)
-        adv_lower = torch.quantile(advantages_k, 0.05)
-        adv_upper = torch.quantile(advantages_k, 0.95)
-        advantages_k = torch.clamp(advantages_k, min=adv_lower, max=adv_upper)
         old_logprobs_k = torch.from_numpy(old_logprobs_flat).float().to(device)
+
+        def normalize_clip_minibatch_advantage(advantages):
+            """按原版 DPPO 口径在 minibatch 内归一化并裁剪 advantage。"""
+            if norm_adv:
+                advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+            if adv_lower_q > 0.0 or adv_upper_q < 1.0:
+                adv_lower = torch.quantile(advantages, adv_lower_q)
+                adv_upper = torch.quantile(advantages, adv_upper_q)
+                advantages = torch.clamp(advantages, min=adv_lower, max=adv_upper)
+            return advantages
 
         actor_update_enabled = bool(update_actor and itr >= critic_warmup_iters)
         policy.train()
@@ -1082,6 +1162,7 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 actions_b = torch.from_numpy(actions_flat[inds_np]).float().to(device)
                 returns_b = returns_k[inds_b]
                 advantages_b = advantages_k[inds_b]
+                advantages_b = normalize_clip_minibatch_advantage(advantages_b)
                 old_logprobs_b = old_logprobs_k[inds_b]
 
                 with torch.no_grad():

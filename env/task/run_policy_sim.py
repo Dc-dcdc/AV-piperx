@@ -530,7 +530,7 @@ def run(cfg: RunPolicySimConfig):
 if __name__ == "__main__":
     # 主要改这里：权重路径、显示相机、Mujoco 视角、ZED 深度显示范围。
     CONFIG = RunPolicySimConfig(
-        ckpt_path="outputs/1_hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion/pretrained_model",
+        ckpt_path="outputs/2_pretrain/train/2026-06-18/15-55-17_SewNeedle-3Arms-v0_pre_zed_diffusion/checkpoints/166000_loss=0.0015_sr=50.0_ar=447.24",
         display_cameras=(
             "zed_cam_left",
             "zed_cam_right",

@@ -1,8 +1,13 @@
 #!/usr/bin/env python
 # import os
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com" # 强行指向国内镜像站
+import json
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -16,11 +21,14 @@ import time
 from contextlib import nullcontext
 from pprint import pformat
 
-from train.pretrain.eval import  evaluate_and_checkpoint_if_needed,TopKCheckpointManager
+from train.pretrain.eval_train import  evaluate_and_checkpoint_if_needed,TopKCheckpointManager
 
 import hydra
+import datasets
 import torch
+import torchvision.transforms as v2
 from omegaconf import DictConfig, OmegaConf
+from safetensors.torch import load_file
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 
@@ -30,6 +38,8 @@ from torch.utils.data import DataLoader
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.transforms import get_image_transforms
+from lerobot.common.datasets.utils import hf_transform_to_torch, unflatten_dict
+from lerobot.common.datasets.video_utils import VideoFrame  # noqa: F401  注册本地 parquet 中的 VideoFrame 字段
 # 复用 LeRobot 的其他核心组件
 from lerobot.common.logger import Logger
 from lerobot.common.policies.factory import make_policy # 用于获取训练策略模型
@@ -323,6 +333,73 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
     return delta_timestamps_dict
 
 
+def clean_optional_path(value) -> str | None:
+    """把 Hydra 中的 none/null/空字符串统一转为 None。"""
+    if value is None:
+        return None
+    text = str(value).strip().strip("'\"")
+    if text.lower() in {"", "none", "null"}:
+        return None
+    return text
+
+
+def load_local_lerobot_dataset(
+    local_dir: str | Path,
+    delta_timestamps: dict,
+    video_backend: str | None,
+    image_transforms=None,
+    cache_dir: str | Path | None = None,
+) -> LeRobotDataset:
+    """从 convert_data_to_hf.py 生成的本地 LeRobot/HF 目录加载数据集。"""
+    local_dir = Path(local_dir).expanduser()
+    required_paths = [
+        local_dir / "data",
+        local_dir / "meta_data" / "info.json",
+        local_dir / "meta_data" / "stats.safetensors",
+        local_dir / "meta_data" / "episode_data_index.safetensors",
+        local_dir / "videos",
+    ]
+    missing = [path for path in required_paths if not path.exists()]
+    if missing:
+        missing_text = "\n".join(str(path) for path in missing)
+        raise FileNotFoundError(
+            f"本地数据集目录不完整: {local_dir}\n缺失:\n{missing_text}"
+        )
+
+    parquet_files = sorted((local_dir / "data").glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"本地数据集目录中没有 parquet 文件: {local_dir / 'data'}")
+
+    hf_dataset = datasets.Dataset.from_parquet(
+        [str(path) for path in parquet_files],
+        cache_dir=str(cache_dir) if cache_dir else None,
+    )
+    hf_dataset.set_transform(hf_transform_to_torch)
+
+    with open(local_dir / "meta_data" / "info.json", "r", encoding="utf-8") as f:
+        info = json.load(f)
+
+    stats = unflatten_dict(load_file(local_dir / "meta_data" / "stats.safetensors"))
+    episode_data_index = load_file(local_dir / "meta_data" / "episode_data_index.safetensors")
+
+    dataset = LeRobotDataset.from_preloaded(
+        repo_id=local_dir.name,
+        root=local_dir.parent,
+        hf_dataset=hf_dataset,
+        episode_data_index=episode_data_index,
+        stats=stats,
+        info=info,
+        videos_dir=local_dir / "videos",
+        video_backend=video_backend,
+        delta_timestamps=delta_timestamps,
+        transform=image_transforms,
+    )
+
+    # from_preloaded 不会执行 LeRobotDataset.__init__，这里补齐当前项目依赖的 resize 行为。
+    dataset.resize = v2.Resize((480, 640))
+    return dataset
+
+
 
 # ✅ 这是一个完美且内存安全的 PyTorch 无限数据生成器
 def get_infinite_dataloader(dataloader):
@@ -374,16 +451,29 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         )
     # # 解析配置文件中的时间戳
     resolved_delta_timestamps = get_resolved_delta_timestamps(cfg)
-    logging.info(f"⏱️ 解析到的动作时间轴: {resolved_delta_timestamps.get('action', [])[:5]} ...")
-    logging.info(f"⏱️ 解析到的视觉时间轴: {resolved_delta_timestamps.get('observation.state', [])}")
+    logging.info(f"解析到的动作时间轴: {resolved_delta_timestamps.get('action', [])[:5]} ...")
+    logging.info(f"解析到的视觉时间轴: {resolved_delta_timestamps.get('observation.state', [])}")
 
 
-    offline_dataset = LeRobotDataset(
-        repo_id=cfg.dataset_repo_id, #根据id下载或者加载本地数据（/home/dc/.cache/huggingface/datasets）
-        delta_timestamps=resolved_delta_timestamps,
-        video_backend=cfg.video_backend, 
-        image_transforms=image_transforms,
-    )
+    dataset_local_dir = clean_optional_path(cfg.get("dataset_local_dir", None))
+    dataset_cache_dir = clean_optional_path(cfg.get("dataset_cache_dir", None))
+    if dataset_local_dir:
+        logging.info(f"使用服务器本地数据集: {dataset_local_dir}")
+        offline_dataset = load_local_lerobot_dataset(
+            local_dir=dataset_local_dir,
+            delta_timestamps=resolved_delta_timestamps,
+            video_backend=cfg.video_backend,
+            image_transforms=image_transforms,
+            cache_dir=dataset_cache_dir,
+        )
+    else:
+        logging.info(f"使用 Hugging Face 数据集: {cfg.dataset_repo_id}")
+        offline_dataset = LeRobotDataset(
+            repo_id=cfg.dataset_repo_id, #根据id下载或者加载本地数据（/home/dc/.cache/huggingface/datasets）
+            delta_timestamps=resolved_delta_timestamps,
+            video_backend=cfg.video_backend,
+            image_transforms=image_transforms,
+        )
     # # 使用官方函数解析并挂载到 cfg，这样 make_dataset 内部才能正确读取
     # resolve_delta_timestamps(cfg)
     
@@ -602,7 +692,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
             train_loss=train_info["loss"],
             manager=manager,
         )
-    logging.info("🎉 DPPO 预训练圆满结束！你现在可以拿着这个 Checkpoint 去跑 PPO 微调了。")
+    logging.info("DPPO 预训练结束！")
 
 # ==========================================
 # 🌟 Hydra 启动入口 (保留配置功能与 Args 注入)
@@ -620,14 +710,15 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
+        "+dataset_local_dir=outputs/5_hf_datasets/quest_teleop_insert_cylinder_3arms_rgb_joint",
         "dataset_repo_id=Dc-dc/quest_teleop_sew_needle_3arms_rgb_joint",
         "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
-        "policy=pre_zed_wrist_diffusion", # 策略
+        "policy=pre_zed_diffusion", # 策略
         "resume=false",
         "resume_path='outputs/2_pretrain/train/2026-05-19/00-57-05_SewNeedle-3Arms-v0_pre_zed_static_wrist_diffusion/checkpoints/108000_loss=0.0111_sr=0.0_ar=-64.33'",
         "training.batch_size=16",
         "training.num_workers=4",
-        "wandb.enable=false", # 关闭 wandb，不需要aLse" ,
+        "wandb.enable=false",
     ]
     
     for arg in default_args:

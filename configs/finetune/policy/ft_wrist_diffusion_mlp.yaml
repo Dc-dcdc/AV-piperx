@@ -37,7 +37,11 @@ training:
   clip_ratio: 0.08
   target_kl: 0.03
   grad_accumulate: 4
-  reward_ema_alpha: 0.05
+  reward_scale_running: true
+  reward_scale_const: 1.0
+  norm_adv: true
+  clip_advantage_lower_quantile: 0.05
+  clip_advantage_upper_quantile: 0.95
 
   # Frozen Diffusion + MLP 的动作分布参数。
   # MLP 输入/输出维度均为 action_dim；residual=true 时初始输出等价于预训练 Diffusion 动作。
@@ -47,7 +51,7 @@ training:
   action_mlp_residual_scale: 1.0
   action_mlp_std: 0.02
   action_mlp_learn_std: true
-  logprob_reduction: sum
+  logprob_reduction: mean
 
   # 调试开关。
   use_disk_cache: false

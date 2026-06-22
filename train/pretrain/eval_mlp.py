@@ -35,7 +35,7 @@ if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
 import env.task.sim_envs
-from train.finetune.test_finetune import FrozenDiffusionMLPPolicy
+from train.finetune.finetune_mlp import FrozenDiffusionMLPPolicy
 
 
 @contextlib.contextmanager
@@ -555,7 +555,7 @@ def ensure_python_hash_seed(seed: int):
 
     env = os.environ.copy()
     env["PYTHONHASHSEED"] = desired
-    logging.warning(f"PYTHONHASHSEED 需要在 Python 启动前设置，正在用 PYTHONHASHSEED={desired} 自动重启 eval.py。")
+    logging.warning(f"PYTHONHASHSEED 需要在 Python 启动前设置，正在用 PYTHONHASHSEED={desired} 自动重启 eval_mlp.py。")
     os.execvpe(sys.executable, [sys.executable] + sys.argv, env)
 
 def main(eval_cfg):

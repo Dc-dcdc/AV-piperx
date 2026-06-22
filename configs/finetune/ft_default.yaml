@@ -20,8 +20,12 @@ training:
   pretrained_ckpt_path: "outputs/2_pretrain/train/.../checkpoints/050000"
   min_sampling_denoising_std: 0.02  # DDIM采样探索标准差；视觉机器人任务建议保持小而非0
   min_logprob_denoising_std: 0.02   # 与采样标准差保持一致，避免old/new logprob尺度不匹配
-  logprob_reduction: sum            # PPO使用联合动作块logprob；mean会把梯度按8*21维稀释
-  reward_ema_alpha: 0.05            # 滑动更新全局奖励方差
+  logprob_reduction: mean           # 原版DPPO口径：对动作块内logprob取均值
+  reward_scale_running: true        # 使用RunningRewardScaler按折扣回报运行方差缩放reward
+  reward_scale_const: 1.0           # reward额外常数倍率，默认不额外放大/缩小
+  norm_adv: true                    # 在每个minibatch内部归一化advantage
+  clip_advantage_lower_quantile: 0.05 # minibatch内advantage下分位裁剪
+  clip_advantage_upper_quantile: 0.95 # minibatch内advantage上分位裁剪
   target_kl: 0.03                   # PPO早停阈值；只在critic warmup之后生效
   bc_loss_coef: 0.0002               # BC 正则/teacher 约束
   lr_backbone: 1e-5
@@ -39,8 +43,6 @@ training:
   rollback_success_rate: 0.1
   rollback_reward: -100.0
   rollback_patience: 1
-  ema_alpha: 0.01  # EMA更新全局奖励方差的平滑系数
-
 eval:
   seed: 100            # 评估时的随机种子
   checkpoint_metric: "reward" # 筛选指标：可选 'loss' 或 'reward'

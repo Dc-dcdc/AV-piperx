@@ -1,5 +1,5 @@
 <mujoco model="aloha">
-  <compiler angle="radian" meshdir="meshes" autolimits="true"/>
+  <compiler angle="radian" meshdir="." autolimits="true"/>
 
   <option noslip_iterations="3" cone="elliptic" impratio="100">
   <flag multiccd="enable"/>
@@ -8,24 +8,24 @@
   <asset>
     <material name="black" rgba="0.15 0.15 0.15 1"/>
 
-    <mesh file="vx300s_1_base.stl" scale="0.001 0.001 0.001"/>
-    <mesh file="vx300s_2_shoulder.stl" scale="0.001 0.001 0.001"/>
-    <mesh file="vx300s_3_upper_arm.stl" scale="0.001 0.001 0.001"/>
-    <mesh file="vx300s_4_upper_forearm.stl" scale="0.001 0.001 0.001"/>
-    <mesh file="vx300s_5_lower_forearm.stl" scale="0.001 0.001 0.001"/>
-    <mesh file="vx300s_6_wrist.stl" scale="0.001 0.001 0.001"/>
-    <mesh file="vx300s_7_gripper_prop.stl"/>
-    <mesh file="vx300s_7_gripper_bar.stl"/>
-    <mesh file="vx300s_7_gripper_wrist_mount.stl"/>
-    <mesh file="vx300s_8_custom_finger_left.stl"/>
-    <mesh file="vx300s_8_custom_finger_right.stl"/>
-    <mesh file="d405_solid.stl"/>
+    <mesh file="meshes/aloha/vx300s_1_base.stl" scale="0.001 0.001 0.001"/>
+    <mesh file="meshes/aloha/vx300s_2_shoulder.stl" scale="0.001 0.001 0.001"/>
+    <mesh file="meshes/aloha/vx300s_3_upper_arm.stl" scale="0.001 0.001 0.001"/>
+    <mesh file="meshes/aloha/vx300s_4_upper_forearm.stl" scale="0.001 0.001 0.001"/>
+    <mesh file="meshes/aloha/vx300s_5_lower_forearm.stl" scale="0.001 0.001 0.001"/>
+    <mesh file="meshes/aloha/vx300s_6_wrist.stl" scale="0.001 0.001 0.001"/>
+    <mesh file="meshes/aloha/vx300s_7_gripper_prop.stl"/>
+    <mesh file="meshes/aloha/vx300s_7_gripper_bar.stl"/>
+    <mesh file="meshes/aloha/vx300s_7_gripper_wrist_mount.stl"/>
+    <mesh file="meshes/aloha/vx300s_8_custom_finger_left.stl"/>
+    <mesh file="meshes/aloha/vx300s_8_custom_finger_right.stl"/>
+    <mesh file="meshes/aloha/d405_solid.stl"/>
 
     <!-- middle 7dof assets -->
-    <mesh name="vx300s_7dof_wrist_1" file="vx300s_7dof_wrist_1.stl" scale="0.001 0.001 0.001"/>
-    <mesh name="vx300s_7dof_wrist_2" file="vx300s_7dof_wrist_2.stl" scale="0.001 0.001 0.001"/>
-    <mesh name="vx300s_7dof_wrist_3" file="vx300s_7dof_wrist_3.stl" scale="0.001 0.001 0.001"/>
-    <mesh name="zedm" file="zedm.stl"/>
+    <mesh name="vx300s_7dof_wrist_1" file="meshes/aloha/vx300s_7dof_wrist_1.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="vx300s_7dof_wrist_2" file="meshes/aloha/vx300s_7dof_wrist_2.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="vx300s_7dof_wrist_3" file="meshes/aloha/vx300s_7dof_wrist_3.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="zedm" file="meshes/aloha/zedm.stl"/>
   </asset>
 
   <default>

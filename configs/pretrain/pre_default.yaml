@@ -32,11 +32,12 @@ seed: ???
 # keys common between the datasets are kept. Each dataset gets and additional transform that inserts the
 # "dataset_index" into the returned item. The index mapping is made according to the order in which the
 # datsets are provided.
+dataset_local_dir: null   # 可以从本地数据集加载
 dataset_repo_id: lerobot/pusht
 video_backend: pyav # 视频解码引擎，读取视频文件转化为图像张量
 
 eval:
-  checkpoint_metric: "loss" # 筛选指标：可选 'loss' 或 'reward'
+  checkpoint_metric: "reward" # 筛选指标：可选 'loss' 或 'reward'
   max_checkpoints: 15     # 最多保存loss最小的几个模型快照
   n_episodes: 10              # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 1    # 最多保存前几个 episode 的录像视频
