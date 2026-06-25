@@ -10,8 +10,8 @@ eval:
 env:
   name: guided_vision
   task: InsertCylinder-3Arms-v0
-  state_dim: 21
-  action_dim: 21
+  state_dim: 20
+  action_dim: 20
   fps: ${fps}
   episode_length: 400
 

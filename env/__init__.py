@@ -1,6 +1,6 @@
 from gymnasium.envs.registration import register
 
-from env.constants import ALOHA_INIT_CONFIGS
+from env.constants import ROBOT_INIT_CONFIGS
 
 # ==========================================
 # 🌟 环境配置字典
@@ -16,7 +16,7 @@ ENVS = {
         "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
         "observation_height": 480,
         "observation_width": 640,
-        "aloha_init": "sew_needle",
+        "init_config": "sew_needle",
     },
     # 穿针任务 (2臂)
     "guided_vision/SewNeedle-2Arms-v0": {
@@ -26,7 +26,7 @@ ENVS = {
         "cameras": ["overhead_cam", "worms_eye_cam", "wrist_cam_left", "wrist_cam_right"],
         "observation_height": 480,
         "observation_width": 640,
-        "aloha_init": "sew_needle",
+        "init_config": "sew_needle",
     },
 
 
@@ -40,10 +40,10 @@ ENVS = {
         "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
         "observation_height": 480,
         "observation_width": 640,
-        "aloha_init": "slot_insertion",
+        "init_config": "slot_insertion",
     },
     # ==========================================
-    #  挡板遮挡圆柱插入容器任务 (3臂)
+    #  松灵 Piper 挡板遮挡圆柱插入容器任务 (3臂主入口)
     # ==========================================
     "guided_vision/InsertCylinder-3Arms-v0": {
         "entry_point": "env.task.insert_cylinder_env:InsertCylinderEnv",
@@ -52,7 +52,19 @@ ENVS = {
         "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
         "observation_height": 480,
         "observation_width": 640,
-        "aloha_init": "insert_cylinder",
+        "init_config": "insert_cylinder",
+    },
+    # ==========================================
+    #  兼容旧命令的 Piper 圆柱插入别名，配置同 InsertCylinder-3Arms-v0
+    # ==========================================
+    "guided_vision/InsertCylinder-Piper3Arms-v0": {
+        "entry_point": "env.task.insert_cylinder_env:InsertCylinderEnv",
+        "num_arms": 3,
+        "episode_length": 400,
+        "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
+        "observation_height": 480,
+        "observation_width": 640,
+        "init_config": "insert_cylinder",
     },
     # 💡 如果你有其他的任务（比如插孔），可以继续在这里添加：
     # "guided_vision/InsertPeg-3Arms-v0": {
@@ -68,8 +80,8 @@ ENVS = {
 # 🚀 批量注册环境
 # ==========================================
 for env_id, env_kwargs in ENVS.items():
-    aloha_init_name = env_kwargs.get("aloha_init", "default")
-    aloha_init = ALOHA_INIT_CONFIGS[aloha_init_name]
+    init_config_name = env_kwargs.get("init_config", "default")
+    init_config = ROBOT_INIT_CONFIGS[init_config_name]
     kwargs = {
         "num_arms": env_kwargs["num_arms"],
         "cameras": env_kwargs["cameras"],
@@ -77,7 +89,7 @@ for env_id, env_kwargs in ENVS.items():
         "observation_height": env_kwargs["observation_height"],
         "observation_width": env_kwargs["observation_width"],
     }
-    kwargs.update(aloha_init)
+    kwargs.update(init_config)
     for key in (
         "left_arm_pose",
         "right_arm_pose",

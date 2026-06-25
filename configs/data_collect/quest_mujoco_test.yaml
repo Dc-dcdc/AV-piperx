@@ -10,14 +10,14 @@ port: 5005  # Quest3 数据接收端口
 timeout: 0.05  # socket 超时阈值（秒）
 
 # ===== 2. 仿真与控制 =====
-env_id: guided_vision/SewNeedle-3Arms-v0  # 仿真环境名称
+env_id: guided_vision/InsertCylinder-3Arms-v0  # 仿真环境名称
 hand_position_scale: 1.0      # 手部位置缩放系数
 head_position_scale: 1.2      # 头部位置缩放系数
 hand_max_delta: 1.0           # 左右臂末端相对锚点的最大位移
 head_max_delta: 1.0           # 中间臂末端相对锚点的最大位移
 head_control: true            # 是否使用头显控制中间臂
 individual_hand_anchors: true  # 左右臂是否分别使用各自手柄锚点
-lock_roll: true               # 是否锁定中间臂 roll 角
+lock_roll: true               # 是否锁定中间臂 link6 转轴对应的 roll
 episode_length: 100000        # 任务最大步数
 workspace_low: null           # 末端目标工作空间下界，格式 [x, y, z]
 workspace_high: null          # 末端目标工作空间上界，格式 [x, y, z]

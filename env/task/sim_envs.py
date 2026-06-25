@@ -14,7 +14,8 @@ from env.constants import (
     LEFT_JOINT_NAMES, RIGHT_JOINT_NAMES, MIDDLE_JOINT_NAMES,
     LEFT_ACTUATOR_NAMES, RIGHT_ACTUATOR_NAMES, MIDDLE_ACTUATOR_NAMES,
     LEFT_EEF_SITE, RIGHT_EEF_SITE, MIDDLE_EEF_SITE, MIDDLE_BASE_LINK,
-    LEFT_GRIPPER_JOINT_NAMES, RIGHT_GRIPPER_JOINT_NAMES
+    LEFT_GRIPPER_JOINT_NAMES, RIGHT_GRIPPER_JOINT_NAMES,
+    TWO_ARM_ACTION_DIM, THREE_ARM_ACTION_DIM, MIDDLE_ARM_ACTION_START,
 )
 
 CAMERAS = ['zed_cam_left', 'zed_cam_right', 'wrist_cam_left', 'wrist_cam_right', 'overhead_cam', 'worms_eye_cam']
@@ -72,9 +73,9 @@ class GuidedVisionEnv(gym.Env):
 
         if self.num_arms == 2:
             self.hide_middle_arm() # HACK, 隐藏中央机械臂
-            self.num_joints = 14
+            self.num_joints = TWO_ARM_ACTION_DIM
         elif self.num_arms == 3:
-            self.num_joints = 21
+            self.num_joints = THREE_ARM_ACTION_DIM
         # ==========================================
         # 🌟 2. 构建观察空间 (Observation Space)
         # ==========================================
@@ -158,7 +159,7 @@ class GuidedVisionEnv(gym.Env):
             agent_pos = np.concatenate([left_qpos, right_qpos]).astype(np.float64)
         elif self.num_arms == 3:
             agent_pos = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float64)
-        # state_21d = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float32)
+        # 三臂状态维度由常量推导：left/right 各 7 维，中间臂当前为 6 轴。
 
         return {
             'pixels': {
@@ -229,7 +230,7 @@ class GuidedVisionEnv(gym.Env):
         # right_gripper = action[13]
         right_gripper = np.clip(action[13], 0.0, 1.0)
         if self.num_arms == 3:
-            middle_joints = action[14:21]
+            middle_joints = action[MIDDLE_ARM_ACTION_START:self.num_joints]
             self._physics.bind(self._middle_actuators).ctrl = middle_joints
 
         # 3. 映射到物理引擎执行器

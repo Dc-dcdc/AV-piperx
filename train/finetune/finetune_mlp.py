@@ -1,6 +1,8 @@
 import os
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
 
 import copy
 import json
@@ -38,6 +40,7 @@ from train.pretrain.eval_train import TopKCheckpointManager, custom_eval_policy
 
 
 def deep_update_dict(base: dict, override: dict) -> dict:
+    """递归合并配置字典。"""
     merged = dict(base or {})
     for key, value in (override or {}).items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
@@ -48,6 +51,7 @@ def deep_update_dict(base: dict, override: dict) -> dict:
 
 
 def compute_value_diagnostics(values, returns, eps: float = 1e-8):
+    """计算 Critic 的解释方差和相关性。"""
     values = np.asarray(values, dtype=np.float64).reshape(-1)
     returns = np.asarray(returns, dtype=np.float64).reshape(-1)
     if values.size == 0 or returns.size == 0:
@@ -74,17 +78,20 @@ class RunningMeanStd:
     """原版 DPPO 用的运行均值方差统计器。"""
 
     def __init__(self, epsilon=1e-4, shape=()):
+        """初始化运行均值方差。"""
         self.mean = np.zeros(shape)
         self.var = np.ones(shape)
         self.count = epsilon
 
     def update(self, x):
+        """用一个 batch 更新统计量。"""
         batch_mean = np.mean(x, axis=0)
         batch_var = np.var(x, axis=0)
         batch_count = x.shape[0]
         self.update_from_moments(batch_mean, batch_var, batch_count)
 
     def update_from_moments(self, batch_mean, batch_var, batch_count):
+        """用外部均值方差矩更新统计量。"""
         delta = batch_mean - self.mean
         total_count = self.count + batch_count
         self.mean = self.mean + delta * batch_count / total_count
@@ -109,6 +116,7 @@ class RunningRewardScaler:
     """用折扣回报的运行方差缩放 reward，保持 PPO/Critic 目标量级稳定。"""
 
     def __init__(self, num_envs, cliprew=10.0, gamma=0.99, epsilon=1e-8, per_env=False):
+        """初始化奖励缩放器。"""
         ret_rms_shape = (num_envs,) if per_env else ()
         self.ret_rms = RunningMeanStd(shape=ret_rms_shape)
         self.cliprew = cliprew
@@ -118,6 +126,7 @@ class RunningRewardScaler:
         self.per_env = per_env
 
     def __call__(self, reward, first):
+        """更新折扣回报统计并返回缩放奖励。"""
         rets = backward_discounted_sum(
             prevret=self.ret,
             reward=reward,
@@ -129,6 +138,7 @@ class RunningRewardScaler:
         return self.transform(reward)
 
     def transform(self, reward):
+        """按运行方差缩放并裁剪奖励。"""
         return np.clip(
             reward / np.sqrt(self.ret_rms.var + self.epsilon),
             -self.cliprew,
@@ -137,6 +147,7 @@ class RunningRewardScaler:
 
 
 def log_box(title: str, rows: list[tuple[str, object]], width: int = 78):
+    """用统一盒状格式写日志。"""
     key_width = max([len(str(key)) for key, _ in rows] + [0])
     line = "-" * width
     header = "=" * width
@@ -148,10 +159,12 @@ def log_box(title: str, rows: list[tuple[str, object]], width: int = 78):
 
 
 def fmt_pct(value: float) -> str:
+    """把比例格式化成百分比字符串。"""
     return f"{value * 100:.1f}%"
 
 
 def fmt_float(value: float, digits: int = 4) -> str:
+    """安全格式化浮点数。"""
     if not np.isfinite(value):
         return str(value)
     return f"{value:.{digits}f}"
@@ -159,6 +172,7 @@ def fmt_float(value: float, digits: int = 4) -> str:
 
 @contextmanager
 def maybe_suppress_stdout(enabled: bool):
+    """按开关临时屏蔽 stdout。"""
     if not enabled:
         yield
         return
@@ -170,6 +184,7 @@ def maybe_suppress_stdout(enabled: bool):
 
 @contextmanager
 def maybe_quiet_eval_progress(enabled: bool):
+    """按开关关闭评估进度条。"""
     if not enabled:
         yield
         return
@@ -183,20 +198,21 @@ def maybe_quiet_eval_progress(enabled: bool):
             custom_eval_policy.__globals__["tqdm"] = original_tqdm
 
 
-class ActionMLP(nn.Module):
-    """Post-process one action vector while preserving input/output action_dim."""
+class ResidualActionMLP(nn.Module):
+    """针对一个动作切片预测残差。"""
 
     def __init__(
         self,
         action_dim: int,
         hidden_dim: int = 256,
         depth: int = 2,
-        residual: bool = True,
-        residual_scale: float = 1.0,
     ):
+        """构建零初始化输出层的残差 MLP。"""
         super().__init__()
+        if action_dim <= 0:
+            raise ValueError("ResidualActionMLP action_dim must be > 0")
         if depth < 1:
-            raise ValueError("ActionMLP depth must be >= 1")
+            raise ValueError("ResidualActionMLP depth must be >= 1")
 
         layers: list[nn.Module] = []
         in_dim = action_dim
@@ -211,11 +227,10 @@ class ActionMLP(nn.Module):
             in_dim = hidden_dim
         layers.append(nn.Linear(hidden_dim, action_dim))
         self.net = nn.Sequential(*layers)
-        self.residual = residual
-        self.residual_scale = residual_scale
         self._init_weights()
 
     def _init_weights(self):
+        """初始化隐藏层并让初始残差为 0。"""
         for module in self.net.modules():
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
@@ -226,21 +241,18 @@ class ActionMLP(nn.Module):
         nn.init.zeros_(last_linear.bias)
 
     def forward(self, actions: torch.Tensor) -> torch.Tensor:
+        """按最后一维动作切片输出同形状残差。"""
         orig_shape = actions.shape
         flat_actions = actions.reshape(-1, orig_shape[-1])
-        delta_or_action = self.net(flat_actions).reshape(orig_shape)
-        if self.residual:
-            return actions + self.residual_scale * delta_or_action
-        return delta_or_action
+        return self.net(flat_actions).reshape(orig_shape)
 
 
 class FrozenDiffusionMLPPolicy(nn.Module):
     """
-    Frozen pretrained diffusion policy plus a trainable MLP action head.
+    冻结预训练 Diffusion，并用两个 residual MLP 调整动作切片。
 
-    The diffusion model produces the full final action horizon. The MLP is applied
-    to each action vector, so its input and output dimension are both action_dim.
-    PPO log-probabilities are computed only on the executed action chunk.
+    Diffusion 先输出完整动作块，MLP_arm 调整左右双臂动作，
+    MLP_cam 调整主动视觉臂动作；PPO 只更新这两个 MLP 和动作方差。
     """
 
     def __init__(
@@ -251,12 +263,19 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         action_end: int,
         hidden_dim: int = 256,
         depth: int = 2,
-        residual: bool = True,
-        residual_scale: float = 1.0,
         init_std: float = 0.02,
         learn_std: bool = True,
         logprob_reduction: str = "mean",
+        arm_indices: list[int] | None = None,
+        cam_indices: list[int] | None = None,
+        lambda_arm: float = 1.0,
+        lambda_cam: float = 1.0,
+        arm_hidden_dim: int | None = None,
+        cam_hidden_dim: int | None = None,
+        arm_depth: int | None = None,
+        cam_depth: int | None = None,
     ):
+        """初始化冻结 DP 和两个可训练 residual MLP。"""
         super().__init__()
         self.base_policy = base_policy
         self.config = base_policy.config
@@ -265,17 +284,60 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         self.action_end = action_end
         self.logprob_reduction = logprob_reduction
         self.action_dim = action_dim
-        self.action_mlp_hidden_dim = hidden_dim
-        self.action_mlp_depth = depth
-        self.action_mlp_residual = residual
-        self.action_mlp_residual_scale = residual_scale
-        self.action_mlp_learn_std = learn_std
-        self.action_mlp = ActionMLP(
-            action_dim=action_dim,
-            hidden_dim=hidden_dim,
-            depth=depth,
-            residual=residual,
-            residual_scale=residual_scale,
+        self.residual_mlp_hidden_dim = hidden_dim
+        self.residual_mlp_depth = depth
+        self.residual_mlp_learn_std = learn_std
+
+        default_arm_indices = list(range(min(14, action_dim)))
+        default_cam_indices = list(range(14, action_dim)) if action_dim > 14 else []
+        self.arm_action_indices = self._validate_action_indices(
+            arm_indices if arm_indices is not None else default_arm_indices,
+            "arm_indices",
+            action_dim,
+        )
+        self.cam_action_indices = self._validate_action_indices(
+            cam_indices if cam_indices is not None else default_cam_indices,
+            "cam_indices",
+            action_dim,
+        )
+        self._validate_disjoint_action_indices(
+            self.arm_action_indices,
+            self.cam_action_indices,
+        )
+        self.lambda_arm = float(lambda_arm)
+        self.lambda_cam = float(lambda_cam)
+        self.arm_hidden_dim = int(arm_hidden_dim if arm_hidden_dim is not None else hidden_dim)
+        self.cam_hidden_dim = int(cam_hidden_dim if cam_hidden_dim is not None else hidden_dim)
+        self.arm_depth = int(arm_depth if arm_depth is not None else depth)
+        self.cam_depth = int(cam_depth if cam_depth is not None else depth)
+        self.mlp_arm = (
+            ResidualActionMLP(
+                action_dim=len(self.arm_action_indices),
+                hidden_dim=self.arm_hidden_dim,
+                depth=self.arm_depth,
+            )
+            if self.arm_action_indices
+            else nn.Identity()
+        )
+        self.mlp_cam = (
+            ResidualActionMLP(
+                action_dim=len(self.cam_action_indices),
+                hidden_dim=self.cam_hidden_dim,
+                depth=self.cam_depth,
+            )
+            if self.cam_action_indices
+            else nn.Identity()
+        )
+
+        self.register_buffer(
+            "_arm_action_index_tensor",
+            torch.as_tensor(self.arm_action_indices, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_cam_action_index_tensor",
+            torch.as_tensor(self.cam_action_indices, dtype=torch.long),
+            persistent=False,
         )
         init_log_std = math.log(max(float(init_std), 1e-6))
         log_std = torch.full((action_dim,), init_log_std, dtype=torch.float32)
@@ -288,17 +350,40 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         self.freeze_base_policy()
         self.reset()
 
+    @staticmethod
+    def _validate_action_indices(indices, name: str, action_dim: int) -> list[int]:
+        """检查动作索引是否唯一且在范围内。"""
+        indices = [int(idx) for idx in ([] if indices is None else list(indices))]
+        if len(indices) != len(set(indices)):
+            raise ValueError(f"{name} contains duplicate indices: {indices}")
+        invalid = [idx for idx in indices if idx < 0 or idx >= action_dim]
+        if invalid:
+            raise ValueError(
+                f"{name} has out-of-range indices {invalid}; action_dim={action_dim}"
+            )
+        return indices
+
+    @staticmethod
+    def _validate_disjoint_action_indices(arm_indices, cam_indices):
+        """检查双臂和相机臂索引没有重叠。"""
+        overlap = sorted(set(arm_indices).intersection(cam_indices))
+        if overlap:
+            raise ValueError(f"arm_indices and cam_indices overlap: {overlap}")
+
     def freeze_base_policy(self):
+        """冻结预训练 DP 参数并保持 eval 模式。"""
         self.base_policy.eval()
         for param in self.base_policy.parameters():
             param.requires_grad = False
 
     def train(self, mode: bool = True):
+        """切换训练状态，但强制 DP 仍处于 eval。"""
         super().train(mode)
         self.base_policy.eval()
         return self
 
     def reset(self):
+        """重置观测和动作队列。"""
         self._queues = {
             "observation.state": deque(maxlen=self.config.n_obs_steps),
             "action": deque(maxlen=self.config.n_action_steps),
@@ -312,12 +397,15 @@ class FrozenDiffusionMLPPolicy(nn.Module):
 
     @property
     def action_std(self) -> torch.Tensor:
+        """返回当前动作采样标准差。"""
         return self.log_std.exp().clamp(min=1e-6)
 
     def adapter_parameters(self):
+        """返回 PPO 需要更新的 residual 参数。"""
         return [p for p in self.parameters() if p.requires_grad]
 
     def normalize_history_batch(self, cond: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """按 DP 输入规范归一化历史观测。"""
         batch = self.base_policy.normalize_inputs(cond.copy())
         if len(self.expected_image_keys) > 0:
             batch = dict(batch)
@@ -333,6 +421,7 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         batch: dict[str, torch.Tensor],
         return_global_cond: bool = False,
     ):
+        """用冻结 DP 从已归一化观测采样基础动作。"""
         self.base_policy.eval()
         batch_size = next(iter(batch.values())).shape[0]
         global_cond = self.base_policy.diffusion._prepare_global_conditioning(batch)
@@ -351,6 +440,7 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         cond: dict[str, torch.Tensor],
         return_global_cond: bool = False,
     ):
+        """归一化观测后调用冻结 DP 生成动作。"""
         batch = self.normalize_history_batch(cond)
         return self.frozen_diffusion_actions_from_normalized_batch(
             batch,
@@ -358,9 +448,22 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         )
 
     def mean_actions(self, base_actions: torch.Tensor) -> torch.Tensor:
-        return self.action_mlp(base_actions)
+        """把两个 residual MLP 的输出加回 DP 动作。"""
+        mean_actions = base_actions.clone()
+        if self.arm_action_indices:
+            arm_idx = self._arm_action_index_tensor.to(base_actions.device)
+            arm_base = base_actions.index_select(-1, arm_idx)
+            delta_arm = self.mlp_arm(arm_base)
+            mean_actions[..., arm_idx] = arm_base + self.lambda_arm * delta_arm
+        if self.cam_action_indices:
+            cam_idx = self._cam_action_index_tensor.to(base_actions.device)
+            cam_base = base_actions.index_select(-1, cam_idx)
+            delta_cam = self.mlp_cam(cam_base)
+            mean_actions[..., cam_idx] = cam_base + self.lambda_cam * delta_cam
+        return mean_actions
 
     def sample_from_mean(self, mean_actions: torch.Tensor, deterministic: bool):
+        """从 residual 后的动作均值采样 PPO 动作。"""
         if deterministic:
             actions = mean_actions
         else:
@@ -376,6 +479,7 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         action_start: int | None = None,
         action_end: int | None = None,
     ) -> torch.Tensor:
+        """计算执行动作块在当前高斯策略下的 log_prob。"""
         start = self.action_start if action_start is None else action_start
         end = self.action_end if action_end is None else action_end
         mean_chunk = mean_actions[:, start:end]
@@ -397,6 +501,7 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         base_actions: torch.Tensor,
         executed_actions: torch.Tensor,
     ) -> torch.Tensor:
+        """从 DP 基础动作重算 residual 均值并求 log_prob。"""
         mean_actions = self.mean_actions(base_actions)
         return self.log_prob_from_mean(mean_actions, executed_actions)
 
@@ -406,6 +511,7 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         deterministic: bool = False,
         return_global_cond: bool = False,
     ):
+        """完整前向：冻结 DP 生成动作，residual MLP 修正并采样。"""
         base_actions, global_cond = self.frozen_diffusion_actions(cond, return_global_cond=True)
         mean_actions = self.mean_actions(base_actions)
         actions, log_probs = self.sample_from_mean(mean_actions, deterministic=deterministic)
@@ -421,6 +527,7 @@ class FrozenDiffusionMLPPolicy(nn.Module):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """评估时按 LeRobot 队列接口逐步取动作。"""
         batch = self.base_policy.normalize_inputs(batch)
         if len(self.expected_image_keys) > 0:
             batch = dict(batch)
@@ -444,51 +551,61 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         return self._queues["action"].popleft()
 
     def save_pretrained(self, save_directory: str | Path):
+        """保存冻结 DP 权重引用和 residual MLP 状态。"""
         save_directory = Path(save_directory)
         save_directory.mkdir(parents=True, exist_ok=True)
         self.base_policy.save_pretrained(save_directory)
-        torch.save(
-            {
-                "action_mlp": self.action_mlp.state_dict(),
-                "log_std": self.log_std.detach().cpu(),
-                "action_start": self.action_start,
-                "action_end": self.action_end,
-                "logprob_reduction": self.logprob_reduction,
-                "action_dim": self.action_dim,
-                "hidden_dim": self.action_mlp_hidden_dim,
-                "depth": self.action_mlp_depth,
-                "residual": self.action_mlp_residual,
-                "residual_scale": self.action_mlp_residual_scale,
-                "learn_std": self.action_mlp_learn_std,
-            },
-            save_directory / "action_mlp.pt",
-        )
-        with open(save_directory / "action_mlp_config.json", "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "wrapper": "FrozenDiffusionMLPPolicy",
-                    "action_start": self.action_start,
-                    "action_end": self.action_end,
-                    "logprob_reduction": self.logprob_reduction,
-                    "action_dim": self.action_dim,
-                    "hidden_dim": self.action_mlp_hidden_dim,
-                    "depth": self.action_mlp_depth,
-                    "residual": self.action_mlp_residual,
-                    "residual_scale": self.action_mlp_residual_scale,
-                    "learn_std": self.action_mlp_learn_std,
-                },
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
+        adapter_state = {
+            "log_std": self.log_std.detach().cpu(),
+            "action_start": self.action_start,
+            "action_end": self.action_end,
+            "logprob_reduction": self.logprob_reduction,
+            "action_dim": self.action_dim,
+            "hidden_dim": self.residual_mlp_hidden_dim,
+            "depth": self.residual_mlp_depth,
+            "learn_std": self.residual_mlp_learn_std,
+            "mlp_arm": self.mlp_arm.state_dict(),
+            "mlp_cam": self.mlp_cam.state_dict(),
+            "arm_action_indices": self.arm_action_indices,
+            "cam_action_indices": self.cam_action_indices,
+            "lambda_arm": self.lambda_arm,
+            "lambda_cam": self.lambda_cam,
+            "arm_hidden_dim": self.arm_hidden_dim,
+            "cam_hidden_dim": self.cam_hidden_dim,
+            "arm_depth": self.arm_depth,
+            "cam_depth": self.cam_depth,
+        }
+        torch.save(adapter_state, save_directory / "residual_mlp.pt")
+        adapter_config = {
+            "wrapper": "FrozenDiffusionMLPPolicy",
+            "action_start": self.action_start,
+            "action_end": self.action_end,
+            "logprob_reduction": self.logprob_reduction,
+            "action_dim": self.action_dim,
+            "hidden_dim": self.residual_mlp_hidden_dim,
+            "depth": self.residual_mlp_depth,
+            "learn_std": self.residual_mlp_learn_std,
+            "arm_action_indices": self.arm_action_indices,
+            "cam_action_indices": self.cam_action_indices,
+            "lambda_arm": self.lambda_arm,
+            "lambda_cam": self.lambda_cam,
+            "arm_hidden_dim": self.arm_hidden_dim,
+            "cam_hidden_dim": self.cam_hidden_dim,
+            "arm_depth": self.arm_depth,
+            "cam_depth": self.cam_depth,
+        }
+        with open(save_directory / "residual_mlp_config.json", "w", encoding="utf-8") as f:
+            json.dump(adapter_config, f, indent=2, ensure_ascii=False)
 
 
 def freeze_batch_norm(module: nn.Module):
+    """冻结 BatchNorm 的运行状态。"""
     if "BatchNorm" in module.__class__.__name__:
         module.eval()
 
 
 def flatten_lerobot_obs(obs_dict):
+    """把环境观测展开成 LeRobot policy 使用的键。"""
     flat_obs = {}
     if "pixels" in obs_dict:
         for cam_name, img_array in obs_dict["pixels"].items():
@@ -502,12 +619,14 @@ def flatten_lerobot_obs(obs_dict):
 
 
 def clone_obs_value(value):
+    """复制观测值以避免队列中引用被复用。"""
     if hasattr(value, "copy"):
         return value.copy()
     return value
 
 
 def reset_full_obs_queue(queue, obs, n_obs_steps):
+    """用当前观测填满历史队列。"""
     for key, value in obs.items():
         if key not in queue:
             queue[key] = deque(maxlen=n_obs_steps)
@@ -517,6 +636,7 @@ def reset_full_obs_queue(queue, obs, n_obs_steps):
 
 
 def append_obs_queue(queue, obs, n_obs_steps):
+    """向历史观测队列追加一帧。"""
     for key, value in obs.items():
         if key not in queue:
             queue[key] = deque(maxlen=n_obs_steps)
@@ -526,6 +646,7 @@ def append_obs_queue(queue, obs, n_obs_steps):
 
 
 def reset_done_envs_in_obs_queue(queue, obs, done_mask, n_envs, n_obs_steps):
+    """对已结束环境重置其历史观测。"""
     done_mask = np.asarray(done_mask, dtype=bool)
     if not done_mask.any():
         return
@@ -543,6 +664,7 @@ def reset_done_envs_in_obs_queue(queue, obs, done_mask, n_envs, n_obs_steps):
 
 
 def stack_obs_queue(queue, n_envs, n_obs_steps):
+    """把历史观测队列堆成 batch。"""
     stacked_obs = {}
     for key, frames in queue.items():
         if len(frames) != n_obs_steps:
@@ -555,10 +677,12 @@ def stack_obs_queue(queue, n_envs, n_obs_steps):
 
 
 def info_success_mask(info, done_mask, n_envs):
+    """从 Gym info 中提取每个环境的成功标记。"""
     done_mask = np.asarray(done_mask, dtype=bool)
     success = np.zeros(n_envs, dtype=bool)
 
     def fill_success(raw_success, raw_mask):
+        """把不同形状的 success 字段写入统一数组。"""
         raw_success = np.asarray(raw_success)
         raw_mask = np.asarray(raw_mask, dtype=bool)
         if raw_success.shape == ():
@@ -591,6 +715,7 @@ def info_success_mask(info, done_mask, n_envs):
 
 
 def build_history_batch(stacked_raw_obs, policy, device):
+    """把 numpy 历史观测转为 policy 输入 tensor。"""
     batch_obs = {}
     for key, value in stacked_raw_obs.items():
         if key not in policy.config.input_shapes:
@@ -603,6 +728,7 @@ def build_history_batch(stacked_raw_obs, policy, device):
 
 
 def global_cond_from_obs(policy, obs_batch):
+    """从观测 batch 提取 DP 的全局条件特征。"""
     obs_norm = policy.base_policy.normalize_inputs(obs_batch.copy())
     if len(policy.expected_image_keys) > 0:
         obs_norm = dict(obs_norm)
@@ -614,6 +740,7 @@ def global_cond_from_obs(policy, obs_batch):
 
 
 def load_frozen_base_policy(cfg: DictConfig, device):
+    """加载并冻结预训练 Diffusion policy。"""
     ckpt_path = cfg.training.pretrained_ckpt_path
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Cannot find pretrained checkpoint: {ckpt_path}")
@@ -654,6 +781,7 @@ def load_frozen_base_policy(cfg: DictConfig, device):
 
 
 def infer_global_cond_dim(base_policy, device):
+    """用 dummy 输入推断 Critic 需要的全局条件维度。"""
     n_obs_steps = int(getattr(base_policy.config, "n_obs_steps", 2))
     dummy_batch = {
         key: torch.zeros((1, n_obs_steps, *shape), device=device)
@@ -670,20 +798,26 @@ def infer_global_cond_dim(base_policy, device):
 
 
 def snapshot_trainable_state(policy: FrozenDiffusionMLPPolicy):
-    return {
-        "action_mlp": copy.deepcopy(policy.action_mlp.state_dict()),
+    """拷贝 residual MLP 和动作方差状态。"""
+    state = {
         "log_std": policy.log_std.detach().cpu().clone(),
+        "mlp_arm": copy.deepcopy(policy.mlp_arm.state_dict()),
+        "mlp_cam": copy.deepcopy(policy.mlp_cam.state_dict()),
     }
+    return state
 
 
 def restore_trainable_state(policy: FrozenDiffusionMLPPolicy, state, device):
-    policy.action_mlp.load_state_dict(state["action_mlp"], strict=True)
+    """恢复 residual MLP 和动作方差状态。"""
+    policy.mlp_arm.load_state_dict(state["mlp_arm"], strict=True)
+    policy.mlp_cam.load_state_dict(state["mlp_cam"], strict=True)
     with torch.no_grad():
         policy.log_std.copy_(state["log_std"].to(device))
     policy.to(device)
 
 
 def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
+    """运行冻结 DP + residual MLP 的 PPO 微调。"""
     init_logging()
     log_box(
         "DP+MLP Finetune",
@@ -714,6 +848,52 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
             f"Action slice is out of horizon: n_obs_steps={n_obs_steps}, "
             f"act_steps={act_steps}, horizon={horizon_steps}"
         )
+
+    def cfg_int_list(key: str, default: list[int]) -> list[int]:
+        """从配置读取整数列表。"""
+        value = getattr(cfg.training, key, default)
+        if value is None:
+            return []
+        return [int(item) for item in list(value)]
+
+    default_arm_indices = list(range(min(14, action_dim)))
+    default_cam_indices = list(range(14, action_dim)) if action_dim > 14 else []
+    arm_action_indices = cfg_int_list("arm_action_indices", default_arm_indices)
+    cam_action_indices = cfg_int_list("cam_action_indices", default_cam_indices)
+    residual_hidden_dim = int(
+        getattr(
+            cfg.training,
+            "residual_mlp_hidden_dim",
+            256,
+        )
+    )
+    residual_depth = int(
+        getattr(
+            cfg.training,
+            "residual_mlp_depth",
+            2,
+        )
+    )
+    residual_std = float(
+        getattr(
+            cfg.training,
+            "residual_mlp_std",
+            getattr(cfg.training, "min_sampling_denoising_std", 0.02),
+        )
+    )
+    residual_learn_std = bool(
+        getattr(
+            cfg.training,
+            "residual_mlp_learn_std",
+            True,
+        )
+    )
+    lambda_arm = float(getattr(cfg.training, "lambda_arm", 1.0))
+    lambda_cam = float(getattr(cfg.training, "lambda_cam", 1.0))
+    arm_hidden_dim = int(getattr(cfg.training, "residual_mlp_arm_hidden_dim", residual_hidden_dim))
+    cam_hidden_dim = int(getattr(cfg.training, "residual_mlp_cam_hidden_dim", residual_hidden_dim))
+    arm_depth = int(getattr(cfg.training, "residual_mlp_arm_depth", residual_depth))
+    cam_depth = int(getattr(cfg.training, "residual_mlp_cam_depth", residual_depth))
 
     ref_cams = [
         key.replace("observation.images.", "")
@@ -762,19 +942,19 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
         action_dim=action_dim,
         action_start=action_start,
         action_end=action_end,
-        hidden_dim=int(getattr(cfg.training, "action_mlp_hidden_dim", 256)),
-        depth=int(getattr(cfg.training, "action_mlp_depth", 2)),
-        residual=bool(getattr(cfg.training, "action_mlp_residual", True)),
-        residual_scale=float(getattr(cfg.training, "action_mlp_residual_scale", 1.0)),
-        init_std=float(
-            getattr(
-                cfg.training,
-                "action_mlp_std",
-                getattr(cfg.training, "min_sampling_denoising_std", 0.02),
-            )
-        ),
-        learn_std=bool(getattr(cfg.training, "action_mlp_learn_std", True)),
+        hidden_dim=residual_hidden_dim,
+        depth=residual_depth,
+        init_std=residual_std,
+        learn_std=residual_learn_std,
         logprob_reduction=str(getattr(cfg.training, "logprob_reduction", "mean")),
+        arm_indices=arm_action_indices,
+        cam_indices=cam_action_indices,
+        lambda_arm=lambda_arm,
+        lambda_cam=lambda_cam,
+        arm_hidden_dim=arm_hidden_dim,
+        cam_hidden_dim=cam_hidden_dim,
+        arm_depth=arm_depth,
+        cam_depth=cam_depth,
     ).to(device)
     policy.freeze_base_policy()
 
@@ -832,6 +1012,9 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
             ("action_dim", action_dim),
             ("horizon", horizon_steps),
             ("action_slice", f"[{action_start}:{action_end}]"),
+            ("arm_indices", arm_action_indices),
+            ("cam_indices", cam_action_indices),
+            ("lambda_arm/cam", f"{lambda_arm:.3f} / {lambda_cam:.3f}"),
             ("n_envs", n_envs),
             ("rollout_steps", n_steps),
             ("batch_size", batch_size),
@@ -851,11 +1034,10 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
         "Model Params",
         [
             ("frozen_diffusion", f"{sum(p.numel() for p in base_policy.parameters()) / 1e6:.2f}M"),
-            ("trainable_mlp", f"{sum(p.numel() for p in policy.adapter_parameters()) / 1e6:.2f}M"),
+            ("trainable_residual_mlp", f"{sum(p.numel() for p in policy.adapter_parameters()) / 1e6:.2f}M"),
             ("critic", f"{sum(p.numel() for p in critic.parameters()) / 1e6:.2f}M"),
-            ("mlp_hidden", getattr(cfg.training, "action_mlp_hidden_dim", 256)),
-            ("mlp_depth", getattr(cfg.training, "action_mlp_depth", 2)),
-            ("mlp_residual", getattr(cfg.training, "action_mlp_residual", True)),
+            ("arm_mlp", f"dim={len(policy.arm_action_indices)}, hidden={policy.arm_hidden_dim}, depth={policy.arm_depth}"),
+            ("cam_mlp", f"dim={len(policy.cam_action_indices)}, hidden={policy.cam_hidden_dim}, depth={policy.cam_depth}"),
             ("action_std", f"{float(policy.action_std.mean().detach().cpu().item()):.5f}"),
         ],
     )
@@ -1383,14 +1565,18 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                     "wrapper": "FrozenDiffusionMLPPolicy",
                     "action_start": int(action_start),
                     "action_end": int(action_end),
-                    "action_mlp_checkpoint": "action_mlp.pt",
-                    "action_mlp_hidden_dim": int(getattr(cfg.training, "action_mlp_hidden_dim", 256)),
-                    "action_mlp_depth": int(getattr(cfg.training, "action_mlp_depth", 2)),
-                    "action_mlp_residual": bool(getattr(cfg.training, "action_mlp_residual", True)),
-                    "action_mlp_residual_scale": float(
-                        getattr(cfg.training, "action_mlp_residual_scale", 1.0)
-                    ),
-                    "action_mlp_learn_std": bool(getattr(cfg.training, "action_mlp_learn_std", True)),
+                    "residual_mlp_checkpoint": "residual_mlp.pt",
+                    "residual_mlp_hidden_dim": int(residual_hidden_dim),
+                    "residual_mlp_depth": int(residual_depth),
+                    "residual_mlp_learn_std": bool(residual_learn_std),
+                    "arm_action_indices": list(policy.arm_action_indices),
+                    "cam_action_indices": list(policy.cam_action_indices),
+                    "lambda_arm": float(policy.lambda_arm),
+                    "lambda_cam": float(policy.lambda_cam),
+                    "arm_hidden_dim": int(policy.arm_hidden_dim),
+                    "cam_hidden_dim": int(policy.cam_hidden_dim),
+                    "arm_depth": int(policy.arm_depth),
+                    "cam_depth": int(policy.cam_depth),
                 },
             )
             final_config_dict["policy"] = final_policy
@@ -1422,6 +1608,7 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
 
 @hydra.main(version_base="1.2", config_name="ft_default", config_path="../../configs/finetune")
 def train_cli(cfg: DictConfig):
+    """Hydra 命令行入口。"""
     train_mlp_finetune(
         cfg,
         out_dir=hydra.core.hydra_config.HydraConfig.get().run.dir,
@@ -1432,7 +1619,7 @@ def train_cli(cfg: DictConfig):
 if __name__ == "__main__":
     default_args = [
         "policy=ft_wrist_diffusion_mlp",
-        "training.pretrained_ckpt_path='outputs/1_hugging_model/pre_sim_sew_needle_2arms_wrist_diffusion'",
+        "training.pretrained_ckpt_path='outputs/1_hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion'",
         "env.n_envs=1",
         "training.rollout_steps=400",
         "training.batch_size=16",

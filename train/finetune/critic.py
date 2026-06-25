@@ -6,7 +6,7 @@ import numpy as np
 
 # 从新开始训练resnet参数
 class ImageCritic(nn.Module):
-    def __init__(self, camera_names, state_dim=21, hidden_dim=256):
+    def __init__(self, camera_names, state_dim=20, hidden_dim=256):
         super().__init__()
         self.camera_names = camera_names
         

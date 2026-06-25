@@ -3,65 +3,8 @@ import pathlib
 import os
 # task parameters
 #获取当前运行文件所在文件夹的绝对路径
-XML_PATH = os.path.join(pathlib.Path(__file__).parent.resolve(), 'assets', 'aloha.xml') #/脚本所在目录/assets/aloha.xml
+XML_PATH = os.path.join(pathlib.Path(__file__).parent.resolve(), 'assets', 'task_insert_cylinder_piper.xml') #/脚本所在目录/assets/task_insert_cylinder_piper.xml
 XML_DIR = str(pathlib.Path(__file__).parent.resolve()) + '/assets' #/脚本所在目录/assets
-DATA_DIR = str(pathlib.Path(__file__).parent.resolve()) + '/data'  #/脚本所在目录/data
-
-TASK_CONFIGS = {
-    #遮挡插入任务
-    'occluded_insertion': {
-        'dataset_dir': DATA_DIR + '/occluded_insertion',
-        'num_episodes': 50,
-        'episode_len': 600,
-        'camera_names': [
-            "zed_cam_left",   # zed相机左视角
-            "zed_cam_right",  # zed相机右视角
-            "wrist_cam_left", # 左腕相机
-            "wrist_cam_right",# 右腕相机
-            "overhead_cam",   # 顶视相机
-            "worms_eye_cam",  # 底部仰视相机
-        ]
-    },
-}
-#仿真字典配置，每个任务包含数据集目录、轨迹数量、轨迹长度和相机名称列表等信息
-SIM_TASK_CONFIGS = {
-    'sim_insert_peg': {
-        'dataset_dir': DATA_DIR + '/sim_insert_peg/3arms',  #数据集目录
-        'num_episodes': 50, #轨迹数量
-        'episode_len': 400, #轨迹长度
-        'camera_names': ['zed_cam'], #相机名称列表
-    },
-    '2arms_sim_insert_peg': {
-        'dataset_dir': DATA_DIR + '/sim_insert_peg/2arms',
-        'num_episodes': 50,
-        'episode_len': 400,
-        'camera_names': ['cam_left_wrist', 'cam_right_wrist', 'cam_high', 'cam_low'],
-    },
-    'sim_slot_insertion': {
-        'dataset_dir': DATA_DIR + '/sim_slot_insertion',
-        'num_episodes': 50,
-        'episode_len': 300,
-        'camera_names': ['zed_cam_left', 'zed_cam_right', 'cam_left_wrist', 'cam_right_wrist', 'cam_high', 'cam_low'],
-    },
-    'sim_sew_needle': {
-        'dataset_dir': DATA_DIR + '/sim_sew_needle',
-        'num_episodes': 50,
-        'episode_len': 300,
-        'camera_names': ['zed_cam', 'cam_left_wrist', 'cam_right_wrist', 'cam_high', 'cam_low'],
-    },
-    'sim_tube_transfer': {
-        'dataset_dir': DATA_DIR + '/sim_tube_transfer',
-        'num_episodes': 50,
-        'episode_len': 350,
-        'camera_names': ['zed_cam', 'cam_left_wrist', 'cam_right_wrist', 'cam_high', 'cam_low'],
-    },
-    'sim_hook_package': {
-        'dataset_dir': DATA_DIR + '/sim_hook_package',
-        'num_episodes': 50,
-        'episode_len': 300,
-        'camera_names': ['zed_cam', 'cam_left_wrist', 'cam_right_wrist', 'cam_high', 'cam_low'],
-    },
-}
 
 """
 MuJoCo内部物理频率: 500 Hz
@@ -79,16 +22,16 @@ SIM_DT = 0.04  #读取操作员动捕设备或模型推理动作的频率：25HZ
 SIM_PHYSICS_ENV_STEP_RATIO = int(SIM_DT/SIM_PHYSICS_DT) #AI 每输出一个动作，仿真器会在底层保持这个动作不变，连续运行 20 次物理演算（每次 0.002 秒），然后再把第 20 次演算后的最新状态返回给 AI。
 SIM_DT = SIM_PHYSICS_DT * SIM_PHYSICS_ENV_STEP_RATIO # 强制确保最终的 SIM_DT 绝对是底层物理步长的整数倍，这样可以保证仿真器的稳定性
 
-# robot parameters
-LEFT_ARM_POSE = [0, -0.082, 1.06, 0, -0.953, 0, 0.02239] #左臂默认初始姿态
-RIGHT_ARM_POSE = [0, -0.082, 1.06, 0, -0.953, 0, 0.02239] #右臂默认初始姿态
-MIDDLE_ARM_POSE = [0, -0.8, 0.8, 0, 0.5, 0, 0] #中臂初始姿态
-LEFT_BASE_POS = [-0.469, 0.032, 0.02] #左臂默认底座位置
-RIGHT_BASE_POS = [0.469, 0.032, 0.02] #右臂默认底座位置
-MIDDLE_BASE_POS = [0.0, -0.513, 0.02] #中臂默认底座位置
+# Piper robot parameters
+LEFT_ARM_POSE = [0.0, 1.60, -0.30, -1.16, 0, 0.0, 0.027] # 左臂默认初始姿态
+RIGHT_ARM_POSE = [0.0, 1.60, -0.30, -1.16, 0, 0.0, 0.027] # 右臂默认初始姿态
+MIDDLE_ARM_POSE = [0.0, 0.5, -0.85, 0.7, 0.0, 0.0] # 中臂初始姿态，6 轴
+LEFT_BASE_POS = [-0.55, 0.15, 0.0] # 左臂默认底座位置
+RIGHT_BASE_POS = [0.55, 0.15, 0.0] # 右臂默认底座位置
+MIDDLE_BASE_POS = [0.0, -0.45, 0.0] # 中臂默认底座位置
 
-# 按任务管理 ALOHA 初始配置；env/__init__.py 会读取并传入对应环境。
-ALOHA_INIT_CONFIGS = {
+# 按任务管理机器人初始配置；env/__init__.py 会读取并传入对应环境。
+ROBOT_INIT_CONFIGS = {
     "default": {
         "left_arm_pose": LEFT_ARM_POSE,
         "right_arm_pose": RIGHT_ARM_POSE,
@@ -114,12 +57,12 @@ ALOHA_INIT_CONFIGS = {
         "middle_base_pos": MIDDLE_BASE_POS,
     },
     "insert_cylinder": {
-        "left_arm_pose": [0, -0.00767, 0.99939, 0, -0.98589, 0, 0.02239,],
-        "right_arm_pose": [0, -0.00767, 0.99939, 0, -0.98589, 0, 0.02239,],
-        "middle_arm_pose": [0, -0.3, 0.3, 0, 0.6, 0, 0],
-        "left_base_pos": [-0.6, 0.15, 0.02],
-        "right_base_pos": [0.6, 0.15, 0.02],
-        "middle_base_pos": [0.0, -0.7, 0.02],
+        "left_arm_pose": LEFT_ARM_POSE,
+        "right_arm_pose": RIGHT_ARM_POSE,
+        "middle_arm_pose": MIDDLE_ARM_POSE,
+        "left_base_pos": LEFT_BASE_POS,
+        "right_base_pos": RIGHT_BASE_POS,
+        "middle_base_pos": MIDDLE_BASE_POS,
     },
 }
 LEFT_JOINT_NAMES = [
@@ -147,7 +90,6 @@ MIDDLE_JOINT_NAMES = [
     "middle_forearm_roll",
     "middle_wrist_1_joint",
     "middle_wrist_2_joint",
-    "middle_wrist_3_joint",
 ]
 LEFT_ACTUATOR_NAMES = [
     "left_waist",
@@ -174,8 +116,13 @@ MIDDLE_ACTUATOR_NAMES = [
     "middle_forearm_roll",
     "middle_wrist_1_joint",
     "middle_wrist_2_joint",
-    "middle_wrist_3_joint",
 ]
+LEFT_ARM_ACTION_DIM = len(LEFT_JOINT_NAMES)
+RIGHT_ARM_ACTION_DIM = len(RIGHT_JOINT_NAMES)
+MIDDLE_ARM_ACTION_DIM = len(MIDDLE_JOINT_NAMES)
+TWO_ARM_ACTION_DIM = LEFT_ARM_ACTION_DIM + RIGHT_ARM_ACTION_DIM
+THREE_ARM_ACTION_DIM = TWO_ARM_ACTION_DIM + MIDDLE_ARM_ACTION_DIM
+MIDDLE_ARM_ACTION_START = TWO_ARM_ACTION_DIM
 LEFT_EEF_SITE = "left_gripper_control"
 RIGHT_EEF_SITE = "right_gripper_control"
 MIDDLE_EEF_SITE = "middle_zed_camera_center"

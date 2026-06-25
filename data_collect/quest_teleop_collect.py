@@ -690,7 +690,10 @@ def run(cfg: DictConfig) -> None:
         "observation_height": cfg.render_height,
         "observation_width": cfg.render_width,
     }
-    if "InsertCylinder" in str(cfg.env_id):
+    if str(cfg.env_id) in {
+        "guided_vision/InsertCylinder-3Arms-v0",
+        "guided_vision/InsertCylinder-Piper3Arms-v0",
+    }:
         env_make_kwargs["enable_reward_debug"] = bool(cfg.get("save_reward_debug", False))
 
     env_obj = gym.make(cfg.env_id, **env_make_kwargs)
@@ -1261,16 +1264,16 @@ def quest_teleop_collect_cli(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     default_args = [
-        "env_id=guided_vision/InsertCylinder-3Arms-v0 ",
-        "max_steps_per_episode=400",                  # 最大步长
+        "env_id=guided_vision/InsertCylinder-3Arms-v0",
+        "max_steps_per_episode=4000",                  # 最大步长
         "head_control=true",                          # 是否使用头显控制中间臂
         "lock_pitch=False",                            # 是否锁定中间臂 pitch 角，true 时禁用抬头低头
-        "lock_roll=true",                             # 是否锁定中间臂 roll 角，true 时保持头部水平
+        "lock_roll=False",                             # 是否锁定中间臂 link6 转轴对应的 roll
         "save_pose_action=true",                      # 是否额外保存 Quest 映射后的末端位姿动作
         "save_rgb=true",                              # 是否在 A+X 确认后回放轨迹并保存 RGB 视频
         "save_depth=false",                           # 是否保存 record_cameras 中每个相机的逐像素深度图
         "depth_window=false",                         # 是否打开本地 OpenCV 深度图窗口
-        "camera_window=false",                        # 是否打开本地 OpenCV RGB 窗口，关闭可减少一次额外渲染
+        "camera_window=true",                        # 是否打开本地 OpenCV RGB 窗口，关闭可减少一次额外渲染
         "unity_image_source=rgb",                     # 默认发送 RGB 图到 Quest
         "unity_image_stereo=true",                    # 是否按左右眼 side-by-side 发送到 Quest
         # 不在这里设置 env_id；任务场景只通过 yaml 或命令行 env_id 切换。

@@ -22,18 +22,17 @@
     <position class="forearm_roll" name="middle_forearm_roll" joint="middle_forearm_roll"/>
     <position class="wrist_1_joint" name="middle_wrist_1_joint" joint="middle_wrist_1_joint"/>
     <position class="wrist_2_joint" name="middle_wrist_2_joint" joint="middle_wrist_2_joint"/>
-    <position class="wrist_3_joint" name="middle_wrist_3_joint" joint="middle_wrist_3_joint"/>
   </actuator>
 
   <keyframe>
     <key name="neutral_pose" qpos="
     0 -0.96 1.16 0 -0.3 0 0.0084 0.0084
     0 -0.96 1.16 0 -0.3 0 0.0084 0.0084
-    0 -0.96 1.16 0 -0.3 0 0"
+    0 -0.96 1.16 0 -0.3 0"
       ctrl="
     0 -0.96 1.16 0 -0.3 0 0.0084
     0 -0.96 1.16 0 -0.3 0 0.0084
-    0 -0.96 1.16 0 -0.3 0 0"
+    0 -0.96 1.16 0 -0.3 0"
     />
   </keyframe>
 </mujoco>

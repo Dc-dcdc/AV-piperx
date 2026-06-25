@@ -6,6 +6,7 @@ from numba import jit, prange
 
 # 基于PoE的正运动学，比自带的mujoco.mj_kinematics更快，且可以直接输出位姿矩阵，方便后续计算雅可比矩阵和差分逆运动学
 def create_fk_fn(physics, joints, eef_site):
+    qpos_before = physics.data.qpos.copy()
     physics.bind(joints).qpos = np.zeros(len(joints)) # 将关节位置设置为零，以计算初始位姿
     mujoco.mj_kinematics(physics.model.ptr, physics.data.ptr) # 调用Mujoco的正运动学函数，计算末端执行器的位姿
     w0 = physics.bind(joints).xaxis.copy() # 获取每个关节的旋转轴向量
@@ -14,6 +15,8 @@ def create_fk_fn(physics, joints, eef_site):
     site0 = np.eye(4) # 4×4 的单位矩阵（对角线为 1，其余全 0），用于存储末端执行器的初始位姿（旋转矩阵和平移向量）
     site0[:3, :3] = physics.bind(eef_site).xmat.reshape(3,3).copy() # 提取末端执行器的旋转矩阵
     site0[:3, 3] = physics.bind(eef_site).xpos.copy() # 提取末端执行器的位置
+    physics.data.qpos[:] = qpos_before
+    mujoco.mj_kinematics(physics.model.ptr, physics.data.ptr)
     '''
     带有 @jit 的函数第一次被调用时，Numba 会启动编译器，把这段 Python 代码翻译成底层的 C/机器码，
     之后的调用会直接使用编译好的机器码，极大提高运行速度
@@ -29,20 +32,50 @@ def create_fk_fn(physics, joints, eef_site):
     
     return forward_kinematics #返回编译的机器码函数，可以直接调用，速度非常快，输入关节角度，输出末端执行器的位姿矩阵
 # 雅可比矩阵的计算，基于PoE的正运动学实现，可以直接输出末端执行器在关节空间中的雅可比矩阵，方便后续计算差分逆运动学
-def create_jac_fn(physics, joints):
+def create_jac_fn(physics, joints, eef_site=None):
+    qpos_before = physics.data.qpos.copy()
     physics.bind(joints).qpos = np.zeros(len(joints)) #设置关节角度为初始位置
     mujoco.mj_kinematics(physics.model.ptr, physics.data.ptr) #计算此时末端执行器位姿
     w0 = physics.bind(joints).xaxis.copy() # 各关节的旋转轴向量
     p0 = physics.bind(joints).xanchor.copy() # 各关节的锚点位置（关节在世界坐标系里的物理中心点）
     v0 = -np.cross(w0, p0) # 各关节的线速度分量
+    S = np.ascontiguousarray(np.hstack((w0, v0)))
+    site0 = np.eye(4)
+    if eef_site is not None:
+        site0[:3, :3] = physics.bind(eef_site).xmat.reshape(3, 3).copy()
+        site0[:3, 3] = physics.bind(eef_site).xpos.copy()
+    physics.data.qpos[:] = qpos_before
+    mujoco.mj_kinematics(physics.model.ptr, physics.data.ptr)
     '''
     带有 @jit 的函数第一次被调用时，Numba 会启动编译器，把这段 Python 代码翻译成底层的 C/机器码，
     之后的调用会直接使用编译好的机器码，极大提高运行速度
     '''
-    @jit(nopython=True, fastmath=True, cache=False) 
-    def jacobian(theta): # 输入关节角度，输出末端执行器在关节空间中的雅可比矩阵
+    if eef_site is not None:
+        @jit(nopython=True, fastmath=True, cache=False)
+        def site_jacobian(theta): # 输入关节角度，输出末端 site 在关节空间中的雅可比矩阵
+            J_twist = np.zeros((6, len(theta)))
+            Ts = np.eye(4)
+
+            for i in range(len(theta)):
+                J_twist[:, i] = adjoint(Ts) @ S[i, :]
+                Ts = np.dot(Ts, exp2mat(w0[i], v0[i], theta[i]))
+
+            site_pose = np.dot(Ts, site0)
+            site_pos = site_pose[:3, 3]
+            J = np.zeros((6, len(theta)))
+            for i in range(len(theta)):
+                w = J_twist[:3, i]
+                v = J_twist[3:, i]
+                J[:3, i] = v + np.cross(w, site_pos)
+                J[3:, i] = w
+
+            return J
+
+        return site_jacobian
+
+    @jit(nopython=True, fastmath=True, cache=False)
+    def jacobian(theta): # 输入关节角度，输出空间 twist 雅可比矩阵
         # screw axis at rest place
-        S = np.hstack((w0, v0)) # 每一行是一个关节的螺旋轴表示，前3列是旋转轴向量，后3列是线速度分量
         J = np.zeros((6, len(theta))) # 6行，len(theta)列的零矩阵，用于存储雅可比矩阵，前3行对应位置雅可比，后3行对应旋转雅可比
         Ts = np.eye(4) # 4×4 的单位矩阵，用于存储当前的变换矩阵
 

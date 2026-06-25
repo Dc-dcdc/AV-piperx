@@ -41,7 +41,8 @@ class DiffIK():
         k_pos = self.k_pos
         k_ori = self.k_ori
         fk_fn = create_fk_fn(self.physics, self.joints, self.eef_site) # 返回正向运动学计算函数，可以输入关节角度，输出末端执行器的位姿矩阵
-        jac_fn = create_jac_fn(self.physics, self.joints) # 返回雅可比计算函数，可以输入关节角度，输出末端执行器在关节空间中的雅可比矩阵
+        self.fk_fn = fk_fn
+        jac_fn = create_jac_fn(self.physics, self.joints, self.eef_site) # 返回末端 site 在关节空间中的雅可比矩阵
         diag = np.ascontiguousarray(self.damping * np.eye(6)) # 阻尼矩阵，6×6 的对角矩阵，阻尼系数乘以单位矩阵，用于阻尼最小二乘法计算关节速度时增加数值稳定性
         eye = np.ascontiguousarray(np.eye(len(self.joints))) # 单位矩阵，大小为关节数量×关节数量，用于计算冗余度控制的投影矩阵
         k_null = self.k_null
@@ -141,14 +142,14 @@ if __name__ == '__main__':
     # set up controllers
     left_controller = DiffIK(
         physics=physics, # mujoco引擎实例，包含机器人真实状态信息
-        joints = left_joints[:7], # 机器人关节列表
-        actuators=left_actuators[:7], # 机器人执行器列表，对应于关节的控制输入
+        joints = left_joints, # 机器人关节列表
+        actuators=left_actuators, # 机器人执行器列表，对应于关节的控制输入
         eef_site=left_eef_site, # 末端执行器位姿
         k_pos=0.3, # 位置控制增益
         k_ori=0.3, # 方向控制增益
         damping=1.0e-4, # 阻尼系数
-        k_null=np.array([20.0, 10.0, 10.0, 10.0, 5.0, 5.0, 5.0]), # 虚拟关节控制增益
-        q0=np.array(MIDDLE_ARM_POSE[:7]), # 关节初始位置
+        k_null=np.array([20.0, 10.0, 10.0, 10.0, 5.0, 5.0]), # 虚拟关节控制增益
+        q0=np.array(MIDDLE_ARM_POSE), # 关节初始位置
         max_angvel=3.14, # 最大关节速度
         integration_dt=DT, # 积分时间步长
         iterations=10 # 迭代次数，用于提高控制精度

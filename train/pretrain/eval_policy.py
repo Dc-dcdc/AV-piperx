@@ -982,7 +982,7 @@ if __name__ == "__main__":
     eval_cfg = SimpleNamespace(
         seed=100,
         # 可以指向单个 checkpoint，也可以指向整次训练 run 目录或 run/checkpoints 目录。
-        ckpt_path="outputs/2_pretrain/train/2026-06-19/13-38-41_SewNeedle-3Arms-v0_pre_wrist_diffusion",
+        ckpt_path="outputs/2_pretrain/train/2026-06-23/12-54-48_InsertCylinder-3Arms-v0_pre_wrist_diffusion",
         checkpoint_source="all",  # all: 读取目录下 checkpoint全部文件；   top_k/latest: 读取 checkpoints/top_k_records.json中记录的模型
         max_checkpoints=None,     # 调试时可设为 1/2，正式评估保持 None
         eval_output_dir=None,     # None 时自动保存到 run_dir/policy_eval/固定配置名，方便断点续评

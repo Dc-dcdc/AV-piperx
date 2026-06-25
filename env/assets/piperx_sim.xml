@@ -1,0 +1,356 @@
+<mujoco model="piperx_sim">
+  <compiler angle="radian" meshdir="." autolimits="true"/>
+
+  <option integrator="implicitfast" noslip_iterations="3" cone="elliptic" impratio="100">
+    <flag multiccd="enable"/>
+  </option>
+
+  <asset>
+    <material name="piperx_gray" rgba="0.59 0.59 0.59 1"/>
+    <material name="piperx_dark" rgba="0.15 0.15 0.15 1"/>
+
+    <mesh name="piperx_base_link" file="meshes/piperx/base_link.stl"/>
+    <mesh name="piperx_link1" file="meshes/piperx/link1.stl"/>
+    <mesh name="piperx_link2" file="meshes/piperx/link2.stl"/>
+    <mesh name="piperx_link3" file="meshes/piperx/link3.stl"/>
+    <mesh name="piperx_link4" file="meshes/piperx/link4.stl"/>
+    <mesh name="piperx_link5" file="meshes/piperx/link5.stl"/>
+    <mesh name="piperx_link6" file="meshes/piperx/link6.stl"/>
+    <mesh name="piper_link6_stand_camera" file="meshes/piperx/link6_stand_camera.stl"/>
+    <mesh name="piper_link6_stand_zed" file="meshes/piperx/link6_stand_zed.stl"/>
+    <mesh name="piperx_flange" file="meshes/piperx/flange.stl"/>
+    <mesh name="piperx_gripper_base" file="meshes/piperx/gripper_base.stl"/>
+    <mesh name="piperx_gripper_link1" file="meshes/piperx/gripper_link1.stl"/>
+    <mesh name="piperx_gripper_link2" file="meshes/piperx/gripper_link2.stl"/>
+  </asset>
+
+  <default>
+    <default class="piperx_visual">
+      <geom type="mesh" group="2" contype="0" conaffinity="0" density="0" material="piperx_dark"/>
+    </default>
+    <default class="piperx_collision">
+      <geom type="mesh" group="3" condim="6" friction="1 0.005 0.0005" solref="0.01 1"/>
+    </default>
+    <default class="piperx_finger_collision">
+      <geom type="mesh" group="3" condim="6" friction="2 0.01 0.001" solref="0.005 1"/>
+    </default>
+    <default class="piperx_joint">
+      <joint frictionloss="0.3" armature="0.005"/>
+    </default>
+    <default class="piperx_site">
+      <site group="5" size="0.01"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <body name="left_base_link" pos="-0.50 -0.45 0.0" gravcomp="1">
+      <site name="left_base" class="piperx_site"/>
+      <inertial pos="-0.00473641164191482 2.56829134630247e-05 0.041451518036016"
+                mass="1.02"
+                fullinertia="0.00267433 0.00282612 0.00089624 -0.00000073 -0.00017389 0.0000004"/>
+      <geom mesh="piperx_base_link" class="piperx_visual"/>
+      <geom mesh="piperx_base_link" class="piperx_collision"/>
+
+      <body name="left_link1" pos="0 0 0.123" quat="2.67948966e-08 0 0 1" gravcomp="1">
+        <inertial pos="0.00053 -0.00039 -0.00315"
+                  mass="0.71"
+                  fullinertia="0.00050027 0.00040879 0.00045802 0.00000078 0.00000626 0.00000462"/>
+        <joint name="left_waist" class="piperx_joint" axis="0 0 1" range="-2.6179938 2.6179938"/>
+        <geom mesh="piperx_link1" class="piperx_visual"/>
+        <geom mesh="piperx_link1" class="piperx_collision"/>
+
+        <body name="left_link2" quat="-0.705477691 -0.705477712 0.0479709387 -0.0479709778" gravcomp="1">
+          <inertial pos="0.21856 -0.00859 0.00227"
+                    mass="1.16"
+                    fullinertia="0.00111915 0.06763251 0.067559 0.00182916 0.00019233 0.00000767"/>
+          <joint name="left_shoulder" class="piperx_joint" axis="0 0 1" range="0 3.1415926"/>
+          <geom mesh="piperx_link2" class="piperx_visual"/>
+          <geom mesh="piperx_link2" class="piperx_collision"/>
+
+          <body name="left_link3" pos="0.28503 0 0" quat="0.151174605 0 0 0.988507076" gravcomp="1">
+            <inertial pos="0.2014 -0.00418 -0.00141"
+                      mass="0.67"
+                      fullinertia="0.00033471 0.03360411 0.03356941 0.00026891 0.00013918 0.00000052"/>
+            <joint name="left_elbow" class="piperx_joint" axis="0 0 1" range="-2.9670597 0"/>
+            <geom mesh="piperx_link3" class="piperx_visual"/>
+            <geom mesh="piperx_link3" class="piperx_collision"/>
+
+            <body name="left_link4" pos="0.27364 0 0" quat="0.999187376 0 0 0.0403061785" gravcomp="1">
+              <inertial pos="0.059 -0.05831 0.002"
+                        mass="0.39"
+                        fullinertia="0.00120173 0.00209324 0.00307814 0.00138165 0.00001187 0.00000217"/>
+              <joint name="left_forearm_roll" class="piperx_joint" axis="0 0 1" range="-1.553343 1.553343"/>
+              <geom mesh="piperx_link4" class="piperx_visual"/>
+              <geom mesh="piperx_link4" class="piperx_collision"/>
+
+              <body name="left_link5" pos="0.07466 0 0" quat="0.500000013 -0.5 0.5 0.499999987" gravcomp="1">
+                <inertial pos="0.00005 -0.01282 -0.00429"
+                          mass="0.35"
+                          fullinertia="0.00022660 0.00017740 0.00019425 0.00000019 0.00000005 0.00000085"/>
+                <joint name="left_wrist_angle" class="piperx_joint" axis="0 0 1" range="-1.553343 1.553343"/>
+                <geom mesh="piperx_link5" class="piperx_visual"/>
+                <geom mesh="piperx_link5" class="piperx_collision"/>
+
+                <body name="left_link6" pos="0 -0.035 0" quat="0.707106791 0.707106772 0 0" gravcomp="1">
+                  <inertial pos="0 0 -0.0035"
+                            mass="0.007"
+                            fullinertia="0.00152112 0.00138626 0.00031152 0.00000202 0.00000261 0.00000002"/>
+                  <joint name="left_wrist_rotate" class="piperx_joint" axis="0 0 1" range="-2.0943951 2.0943951"/>
+                  <geom mesh="piper_link6_stand_camera" quat="0 0 0 1" class="piperx_visual"/>
+                  <geom mesh="piper_link6_stand_camera" quat="0 0 0 1" class="piperx_collision"/>
+
+                  <body name="left_flange_link" gravcomp="1">
+                    <inertial pos="0.001151691 0.000782428 0.004798051"
+                              mass="0.04"
+                              fullinertia="0.000009935389 0.000010508003 0.000019652873 0 0 0"/>
+                    <geom mesh="piperx_flange" class="piperx_visual"/>
+                    <geom mesh="piperx_flange" class="piperx_collision"/>
+
+                    <body name="left_gripper_base" pos="0 0 0.0045" quat="0.707106791 0 0 0.707106772" gravcomp="1">
+                      <inertial pos="-0.000183807162235591 0.0000805033155577911 0.0321436689908876"
+                                mass="0.45"
+                                fullinertia="0.00092934 0.00071447 0.00039442 0.00000034 -0.00000738 0.00000005"/>
+                      <geom mesh="piperx_gripper_base" class="piperx_visual"/>
+                      <geom mesh="piperx_gripper_base" class="piperx_collision"/>
+                      <site name="left_gripper_control" class="piperx_site" pos="0 0 0.138" quat="1 0 0 0"/>
+                      <site name="left_teleop_eef" class="piperx_site" type="sphere" size="0.015" rgba="0 0.8 0 1" pos="0 0 0.138" quat="1 0 0 0"/>
+                      <camera name="wrist_cam_left" pos="-0.085 0 0.035" quat="0.182789979 0.683364062 -0.682808985 -0.182683531" fovy="58" mode="fixed"/>
+
+                      <body name="left_left_finger_link" pos="0 0 0.138" quat="0.707106791 0.707106772 0 0" gravcomp="1">
+                        <inertial pos="0.00065123185041968 -0.0491929869131989 0.00972258769184025"
+                                  mass="0.025"
+                                  fullinertia="0.00007371 0.00000781 0.0000747 -0.00000113 0.00000021 -0.00001372"/>
+                        <joint name="left_left_finger" axis="0 0 1" type="slide" range="0 0.05" armature="0.243" damping="40" frictionloss="0"/>
+                        <geom mesh="piperx_gripper_link1" class="piperx_visual"/>
+                        <geom mesh="piperx_gripper_link1" class="piperx_finger_collision"/>
+                      </body>
+
+                      <body name="left_right_finger_link" pos="0 0 0.138" quat="1.89468533e-08 1.89468528e-08 -0.707106772 -0.707106791" gravcomp="1">
+                        <inertial pos="0.00065123185041968 -0.0491929869131989 0.00972258769184025"
+                                  mass="0.025"
+                                  fullinertia="0.00007371 0.00000781 0.0000747 -0.00000113 0.00000021 -0.00001372"/>
+                        <joint name="left_right_finger" axis="0 0 1" type="slide" range="0 0.05" armature="0.243" damping="40" frictionloss="0"/>
+                        <geom mesh="piperx_gripper_link2" class="piperx_visual"/>
+                        <geom mesh="piperx_gripper_link2" class="piperx_finger_collision"/>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <body name="right_base_link" pos="0.5 -0.45 0.0" quat="0 0 0 1" gravcomp="1">
+      <site name="right_base" class="piperx_site"/>
+      <inertial pos="-0.00473641164191482 2.56829134630247e-05 0.041451518036016"
+                mass="1.02"
+                fullinertia="0.00267433 0.00282612 0.00089624 -0.00000073 -0.00017389 0.0000004"/>
+      <geom mesh="piperx_base_link" class="piperx_visual"/>
+      <geom mesh="piperx_base_link" class="piperx_collision"/>
+
+      <body name="right_link1" pos="0 0 0.123" quat="2.67948966e-08 0 0 1" gravcomp="1">
+        <inertial pos="0.00053 -0.00039 -0.00315"
+                  mass="0.71"
+                  fullinertia="0.00050027 0.00040879 0.00045802 0.00000078 0.00000626 0.00000462"/>
+        <joint name="right_waist" class="piperx_joint" axis="0 0 1" range="-2.6179938 2.6179938"/>
+        <geom mesh="piperx_link1" class="piperx_visual"/>
+        <geom mesh="piperx_link1" class="piperx_collision"/>
+
+        <body name="right_link2" quat="-0.705477691 -0.705477712 0.0479709387 -0.0479709778" gravcomp="1">
+          <inertial pos="0.21856 -0.00859 0.00227"
+                    mass="1.16"
+                    fullinertia="0.00111915 0.06763251 0.067559 0.00182916 0.00019233 0.00000767"/>
+          <joint name="right_shoulder" class="piperx_joint" axis="0 0 1" range="0 3.1415926"/>
+          <geom mesh="piperx_link2" class="piperx_visual"/>
+          <geom mesh="piperx_link2" class="piperx_collision"/>
+
+          <body name="right_link3" pos="0.28503 0 0" quat="0.151174605 0 0 0.988507076" gravcomp="1">
+            <inertial pos="0.2014 -0.00418 -0.00141"
+                      mass="0.67"
+                      fullinertia="0.00033471 0.03360411 0.03356941 0.00026891 0.00013918 0.00000052"/>
+            <joint name="right_elbow" class="piperx_joint" axis="0 0 1" range="-2.9670597 0"/>
+            <geom mesh="piperx_link3" class="piperx_visual"/>
+            <geom mesh="piperx_link3" class="piperx_collision"/>
+
+            <body name="right_link4" pos="0.27364 0 0" quat="0.999187376 0 0 0.0403061785" gravcomp="1">
+              <inertial pos="0.059 -0.05831 0.002"
+                        mass="0.39"
+                        fullinertia="0.00120173 0.00209324 0.00307814 0.00138165 0.00001187 0.00000217"/>
+              <joint name="right_forearm_roll" class="piperx_joint" axis="0 0 1" range="-1.553343 1.553343"/>
+              <geom mesh="piperx_link4" class="piperx_visual"/>
+              <geom mesh="piperx_link4" class="piperx_collision"/>
+
+              <body name="right_link5" pos="0.07466 0 0" quat="0.500000013 -0.5 0.5 0.499999987" gravcomp="1">
+                <inertial pos="0.00005 -0.01282 -0.00429"
+                          mass="0.35"
+                          fullinertia="0.00022660 0.00017740 0.00019425 0.00000019 0.00000005 0.00000085"/>
+                <joint name="right_wrist_angle" class="piperx_joint" axis="0 0 1" range="-1.553343 1.553343"/>
+                <geom mesh="piperx_link5" class="piperx_visual"/>
+                <geom mesh="piperx_link5" class="piperx_collision"/>
+
+                <body name="right_link6" pos="0 -0.035 0" quat="0.707106791 0.707106772 0 0" gravcomp="1">
+                  <inertial pos="0 0 -0.0035"
+                            mass="0.007"
+                            fullinertia="0.00152112 0.00138626 0.00031152 0.00000202 0.00000261 0.00000002"/>
+                  <joint name="right_wrist_rotate" class="piperx_joint" axis="0 0 1" range="-2.0943951 2.0943951"/>
+                  <geom mesh="piper_link6_stand_camera" quat="0 0 0 1" class="piperx_visual"/>
+                  <geom mesh="piper_link6_stand_camera" quat="0 0 0 1" class="piperx_collision"/>
+                  <body name="right_flange_link" gravcomp="1">
+                    <inertial pos="0.001151691 0.000782428 0.004798051"
+                              mass="0.04"
+                              fullinertia="0.000009935389 0.000010508003 0.000019652873 0 0 0"/>
+                    <geom mesh="piperx_flange" class="piperx_visual"/>
+                    <geom mesh="piperx_flange" class="piperx_collision"/>
+
+                    <body name="right_gripper_base" pos="0 0 0.0045" quat="0.707106791 0 0 0.707106772" gravcomp="1">
+                      <inertial pos="-0.000183807162235591 0.0000805033155577911 0.0321436689908876"
+                                mass="0.45"
+                                fullinertia="0.00092934 0.00071447 0.00039442 0.00000034 -0.00000738 0.00000005"/>
+                      <geom mesh="piperx_gripper_base" class="piperx_visual"/>
+                      <geom mesh="piperx_gripper_base" class="piperx_collision"/>
+                      <site name="right_gripper_control" class="piperx_site" pos="0 0 0.138" quat="1 0 0 0"/>
+                      <site name="right_teleop_eef" class="piperx_site" type="sphere" size="0.015" rgba="0 0.8 0 1" pos="0 0 0.138" quat="1 0 0 0"/>
+                      <camera name="wrist_cam_right" pos="-0.085 0 0.035" quat="0.182789979 0.683364062 -0.682808985 -0.182683531" fovy="58" mode="fixed"/>
+
+                      <body name="right_right_finger_link" pos="0 0 0.138" quat="0.707106791 0.707106772 0 0" gravcomp="1">
+                        <inertial pos="0.00065123185041968 -0.0491929869131989 0.00972258769184025"
+                                  mass="0.025"
+                                  fullinertia="0.00007371 0.00000781 0.0000747 -0.00000113 0.00000021 -0.00001372"/>
+                        <joint name="right_right_finger" axis="0 0 1" type="slide" range="0 0.05" armature="0.243" damping="40" frictionloss="0"/>
+                        <geom mesh="piperx_gripper_link1" class="piperx_visual"/>
+                        <geom mesh="piperx_gripper_link1" class="piperx_finger_collision"/>
+                      </body>
+
+                      <body name="right_left_finger_link" pos="0 0 0.138" quat="1.89468533e-08 1.89468528e-08 -0.707106772 -0.707106791" gravcomp="1">
+                        <inertial pos="0.00065123185041968 -0.0491929869131989 0.00972258769184025"
+                                  mass="0.025"
+                                  fullinertia="0.00007371 0.00000781 0.0000747 -0.00000113 0.00000021 -0.00001372"/>
+                        <joint name="right_left_finger" axis="0 0 1" type="slide" range="0 0.05" armature="0.243" damping="40" frictionloss="0"/>
+                        <geom mesh="piperx_gripper_link2" class="piperx_visual"/>
+                        <geom mesh="piperx_gripper_link2" class="piperx_finger_collision"/>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <body name="middle_base_link" pos="0 -0.45 0.0" quat="0.707140837 0 0 0.707072724" gravcomp="1">
+      <site name="middle_base" class="piperx_site"/>
+      <inertial pos="-0.00473641164191482 2.56829134630247e-05 0.041451518036016"
+                mass="1.02"
+                fullinertia="0.00267433 0.00282612 0.00089624 -0.00000073 -0.00017389 0.0000004"/>
+      <geom mesh="piperx_base_link" class="piperx_visual"/>
+      <geom mesh="piperx_base_link" class="piperx_collision"/>
+
+      <body name="middle_link1" pos="0 0 0.123" quat="2.67948966e-08 0 0 1" gravcomp="1">
+        <inertial pos="0.00053 -0.00039 -0.00315"
+                  mass="0.71"
+                  fullinertia="0.00050027 0.00040879 0.00045802 0.00000078 0.00000626 0.00000462"/>
+        <joint name="middle_waist" class="piperx_joint" axis="0 0 1" range="-2.6179938 2.6179938"/>
+        <geom mesh="piperx_link1" class="piperx_visual"/>
+        <geom mesh="piperx_link1" class="piperx_collision"/>
+
+        <body name="middle_link2" quat="-0.705477691 -0.705477712 0.0479709387 -0.0479709778" gravcomp="1">
+          <inertial pos="0.21856 -0.00859 0.00227"
+                    mass="1.16"
+                    fullinertia="0.00111915 0.06763251 0.067559 0.00182916 0.00019233 0.00000767"/>
+          <joint name="middle_shoulder" class="piperx_joint" axis="0 0 1" range="0 3.1415926"/>
+          <geom mesh="piperx_link2" class="piperx_visual"/>
+          <geom mesh="piperx_link2" class="piperx_collision"/>
+
+          <body name="middle_link3" pos="0.28503 0 0" quat="0.151174605 0 0 0.988507076" gravcomp="1">
+            <inertial pos="0.2014 -0.00418 -0.00141"
+                      mass="0.67"
+                      fullinertia="0.00033471 0.03360411 0.03356941 0.00026891 0.00013918 0.00000052"/>
+            <joint name="middle_elbow" class="piperx_joint" axis="0 0 1" range="-2.9670597 0"/>
+            <geom mesh="piperx_link3" class="piperx_visual"/>
+            <geom mesh="piperx_link3" class="piperx_collision"/>
+
+            <body name="middle_link4" pos="0.27364 0 0" quat="0.999187376 0 0 0.0403061785" gravcomp="1">
+              <inertial pos="0.059 -0.05831 0.002"
+                        mass="0.39"
+                        fullinertia="0.00120173 0.00209324 0.00307814 0.00138165 0.00001187 0.00000217"/>
+              <joint name="middle_forearm_roll" class="piperx_joint" axis="0 0 1" range="-1.553343 1.553343"/>
+              <geom mesh="piperx_link4" class="piperx_visual"/>
+              <geom mesh="piperx_link4" class="piperx_collision"/>
+
+              <body name="middle_link5" pos="0.07466 0 0" quat="0.500000013 -0.5 0.5 0.499999987" gravcomp="1">
+                <inertial pos="0.00005 -0.01282 -0.00429"
+                          mass="0.35"
+                          fullinertia="0.00022660 0.00017740 0.00019425 0.00000019 0.00000005 0.00000085"/>
+                <joint name="middle_wrist_1_joint" class="piperx_joint" axis="0 0 1" range="-1.553343 1.553343"/>
+                <geom mesh="piperx_link5" class="piperx_visual"/>
+                <geom mesh="piperx_link5" class="piperx_collision"/>
+
+                <body name="middle_link6" pos="0 -0.035 0" quat="0.707106791 0.707106772 0 0" gravcomp="1">
+                  <inertial pos="0 0 -0.0035"
+                            mass="0.007"
+                            fullinertia="0.00152112 0.00138626 0.00031152 0.00000202 0.00000261 0.00000002"/>
+                  <joint name="middle_wrist_2_joint" class="piperx_joint" axis="0 0 1" range="-2.0943951 2.0943951"/>
+                  <geom mesh="piper_link6_stand_zed" quat="0 0 0 1" class="piperx_visual"/>
+                  <geom mesh="piper_link6_stand_zed" quat="0.707105 0 0 0.707108" class="piperx_collision"/>
+
+                  <body name="middle_flange_link"  quat="0.707108 0 0 0.707105" gravcomp="1">
+                    <inertial pos="0.001151691 0.000782428 0.004798051"
+                              mass="0.04"
+                              fullinertia="0.000009935389 0.000010508003 0.000019652873 0 0 0"/>
+                    <geom mesh="piperx_flange" class="piperx_visual"/>
+                    <geom mesh="piperx_flange" class="piperx_collision"/>
+                    <camera name="zed_cam_left" pos="-0.068054 0.03 0.044182" quat="0.116707 0.697411 -0.697408 -0.116706" fovy="66.21" mode="fixed"/>
+                    <camera name="zed_cam_right" pos="-0.068054 -0.03 0.044182" quat="0.116707 0.697411 -0.697408 -0.116706" fovy="66.21" mode="fixed"/>
+                    <site name="middle_zed_camera_center" class="piperx_site" pos="-0.068054 0.03 0.044182" quat="0.116707 0.697411 -0.697408 -0.116706"/>
+                    <site name="middle_teleop_eef" class="piperx_site" type="sphere" size="0.015" rgba="0 0.8 0 1" pos="-0.068054 0.03 0.044182" quat="0.116707 0.697411 -0.697408 -0.116706"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <contact>
+    <exclude body1="left_base_link" body2="left_link1"/>
+    <exclude body1="right_base_link" body2="right_link1"/>
+    <exclude body1="middle_base_link" body2="middle_link1"/>
+  </contact>
+
+  <equality>
+    <joint name="left_gripper_mimic" joint1="left_right_finger" joint2="left_left_finger" polycoef="0 1 0 0 0"/>
+    <joint name="right_gripper_mimic" joint1="right_left_finger" joint2="right_right_finger" polycoef="0 1 0 0 0"/>
+  </equality>
+
+  <actuator>
+    <position name="left_waist" joint="left_waist" ctrllimited="true" ctrlrange="-2.6179938 2.6179938" kp="80" kv="5" forcerange="-100 100"/>
+    <position name="left_shoulder" joint="left_shoulder" ctrllimited="true" ctrlrange="0 3.1415926" kp="80" kv="5" forcerange="-100 100"/>
+    <position name="left_elbow" joint="left_elbow" ctrllimited="true" ctrlrange="-2.9670597 0" kp="80" kv="5" forcerange="-100 100"/>
+    <position name="left_forearm_roll" joint="left_forearm_roll" ctrllimited="true" ctrlrange="-1.553343 1.553343" kp="40" kv="5" forcerange="-100 100"/>
+    <position name="left_wrist_angle" joint="left_wrist_angle" ctrllimited="true" ctrlrange="-1.553343 1.553343" kp="10" kv="1.5" forcerange="-100 100"/>
+    <position name="left_wrist_rotate" joint="left_wrist_rotate" ctrllimited="true" ctrlrange="-2.0943951 2.0943951" kp="10" kv="1.5" forcerange="-100 100"/>
+    <position name="left_gripper" joint="left_left_finger" ctrllimited="true" ctrlrange="0 0.05" kp="2000" kv="124" forcerange="-35 35"/>
+
+    <position name="right_waist" joint="right_waist" ctrllimited="true" ctrlrange="-2.6179938 2.6179938" kp="80" kv="5" forcerange="-100 100"/>
+    <position name="right_shoulder" joint="right_shoulder" ctrllimited="true" ctrlrange="0 3.1415926" kp="80" kv="5" forcerange="-100 100"/>
+    <position name="right_elbow" joint="right_elbow" ctrllimited="true" ctrlrange="-2.9670597 0" kp="80" kv="5" forcerange="-100 100"/>
+    <position name="right_forearm_roll" joint="right_forearm_roll" ctrllimited="true" ctrlrange="-1.553343 1.553343" kp="40" kv="5" forcerange="-100 100"/>
+    <position name="right_wrist_angle" joint="right_wrist_angle" ctrllimited="true" ctrlrange="-1.553343 1.553343" kp="10" kv="1.5" forcerange="-100 100"/>
+    <position name="right_wrist_rotate" joint="right_wrist_rotate" ctrllimited="true" ctrlrange="-2.0943951 2.0943951" kp="10" kv="1.5" forcerange="-100 100"/>
+    <position name="right_gripper" joint="right_right_finger" ctrllimited="true" ctrlrange="0 0.05" kp="2000" kv="124" forcerange="-35 35"/>
+
+    <position name="middle_waist" joint="middle_waist" ctrllimited="true" ctrlrange="-2.6179938 2.6179938" kp="80" kv="5" forcerange="-100 100"/>
+    <position name="middle_shoulder" joint="middle_shoulder" ctrllimited="true" ctrlrange="0 3.1415926" kp="80" kv="5" forcerange="-100 100"/>
+    <position name="middle_elbow" joint="middle_elbow" ctrllimited="true" ctrlrange="-2.9670597 0" kp="80" kv="5" forcerange="-100 100"/>
+    <position name="middle_forearm_roll" joint="middle_forearm_roll" ctrllimited="true" ctrlrange="-1.553343 1.553343" kp="40" kv="5" forcerange="-100 100"/>
+    <position name="middle_wrist_1_joint" joint="middle_wrist_1_joint" ctrllimited="true" ctrlrange="-1.553343 1.553343" kp="10" kv="1.5" forcerange="-100 100"/>
+    <position name="middle_wrist_2_joint" joint="middle_wrist_2_joint" ctrllimited="true" ctrlrange="-2.0943951 2.0943951" kp="10" kv="1.5" forcerange="-100 100"/>
+  </actuator>
+</mujoco>

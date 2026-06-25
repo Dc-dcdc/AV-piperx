@@ -710,9 +710,9 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
-        "+dataset_local_dir=outputs/5_hf_datasets/quest_teleop_insert_cylinder_3arms_rgb_joint",
-        "dataset_repo_id=Dc-dc/quest_teleop_sew_needle_3arms_rgb_joint",
-        "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
+        "dataset_local_dir=outputs/5_hf_datasets/quest_teleop_insert_cylinder_3arms_rgb_joint",
+        "dataset_repo_id=Dc-dc/quest_teleop_insert_cylinder_3arms_rgb_joint",
+        "env=sim_insert_cylinder_3arms", # 环境，这俩定义在default文件中
         "policy=pre_zed_diffusion", # 策略
         "resume=false",
         "resume_path='outputs/2_pretrain/train/2026-05-19/00-57-05_SewNeedle-3Arms-v0_pre_zed_static_wrist_diffusion/checkpoints/108000_loss=0.0111_sr=0.0_ar=-64.33'",

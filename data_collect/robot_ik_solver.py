@@ -1,6 +1,6 @@
 """QuestControl 位姿动作到 MuJoCo 关节动作的 IK 求解器。
 
-左右臂使用 GradIK，中间臂使用 DiffIK。外部主要调用
+左右臂和中间臂均使用 DiffIK。外部主要调用
 ``PoseActionIKSolver.pose2joint()``，将 ``QuestControl.run()`` 返回的
 23 维位姿动作转换为 ``env.step()`` 需要的关节动作。
 """
@@ -27,9 +27,17 @@ for path in (ROOT_DIR, CURRENT_DIR, ENV_DIR):
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/dppo_numba_cache")
 
 from headset_utils import HeadsetData
-from env.constants import LEFT_EEF_SITE, MIDDLE_ARM_POSE, MIDDLE_EEF_SITE, RIGHT_EEF_SITE, SIM_DT
+from env.constants import (
+    LEFT_ARM_POSE,
+    LEFT_EEF_SITE,
+    MIDDLE_ARM_POSE,
+    MIDDLE_ARM_ACTION_START,
+    MIDDLE_EEF_SITE,
+    RIGHT_ARM_POSE,
+    RIGHT_EEF_SITE,
+    SIM_DT,
+)
 from env.diff_ik import DiffIK
-from env.grad_ik import GradIK
 from transform_utils import mat2quat, xyzw_to_wxyz
 
 
@@ -38,7 +46,7 @@ class ArmIKState:
     name: str
     joints: list
     eef_site: object
-    ik: DiffIK | GradIK
+    ik: DiffIK
     action_slice: slice
     position_scale: float
     max_delta: float
@@ -62,12 +70,12 @@ class PoseActionIKSolver:
         "middle": (slice(16, 19), slice(19, 23), None),
     }
     QUEST_SOURCE_BY_ARM = {"left": "left", "right": "right", "middle": "head"}
-    HAND_IK_POSITION_WEIGHT = 500.0
-    HAND_IK_ROTATION_WEIGHT = 100.0
-    HAND_IK_JOINT_DISPLACEMENT_WEIGHT = 50.0
-    HAND_IK_MAX_ROT_DIFF = 0.8
-    HAND_IK_JOINT_P = 0.9
-    HAND_IK_MAX_ITERATIONS = 100
+    DIFF_IK_K_POS = 0.30
+    DIFF_IK_K_ORI = 0.30
+    DIFF_IK_DAMPING = 1.0e-4
+    DIFF_IK_MAX_ANGVEL = 3.14
+    DIFF_IK_ITERATIONS = 10
+    DIFF_IK_NULL_GAIN = np.array([20.0, 10.0, 10.0, 10.0, 5.0, 5.0], dtype=np.float64)
 
     # 初始化 IK 求解器、末端 site 和各臂控制器。
     def __init__(
@@ -100,68 +108,31 @@ class PoseActionIKSolver:
         self._left_eef_site = self._find_site(LEFT_EEF_SITE)
         self._right_eef_site = self._find_site(RIGHT_EEF_SITE)
         self._middle_eef_site = self._find_site(MIDDLE_EEF_SITE)
+        self._middle_roll_joint = self.sim_env._mjcf_root.find("joint", "middle_wrist_2_joint")
+        if self._middle_roll_joint is None and getattr(sim_env, "_middle_joints", None):
+            self._middle_roll_joint = sim_env._middle_joints[-1]
 
-        self._left_controller = GradIK(
-            physics=self.physics,
+        self._left_controller = self._make_diff_ik(
             joints=sim_env._left_joints[:6],
             actuators=sim_env._left_actuators[:6],
             eef_site=self._left_eef_site,
-            step_size=0.0001,
-            min_cost_delta=1.0e-12,
-            max_iterations=self.HAND_IK_MAX_ITERATIONS,
-            position_weight=self.HAND_IK_POSITION_WEIGHT,
-            rotation_weight=self.HAND_IK_ROTATION_WEIGHT,
-            joint_center_weight=np.array([10.0, 10.0, 1.0, 50.0, 1.0, 1.0], dtype=np.float64),
-            joint_displacement_weight=np.array(6 * [self.HAND_IK_JOINT_DISPLACEMENT_WEIGHT], dtype=np.float64),
-            position_threshold=0.001,
-            rotation_threshold=0.001,
-            max_pos_diff=0.1,
-            max_rot_diff=self.HAND_IK_MAX_ROT_DIFF,
-            joint_p=self.HAND_IK_JOINT_P,
+            q0=np.asarray(LEFT_ARM_POSE[:6], dtype=np.float64),
         )
-        self._right_controller = GradIK(
-            physics=self.physics,
+        self._right_controller = self._make_diff_ik(
             joints=sim_env._right_joints[:6],
             actuators=sim_env._right_actuators[:6],
             eef_site=self._right_eef_site,
-            step_size=0.0001,
-            min_cost_delta=1.0e-12,
-            max_iterations=self.HAND_IK_MAX_ITERATIONS,
-            position_weight=self.HAND_IK_POSITION_WEIGHT,
-            rotation_weight=self.HAND_IK_ROTATION_WEIGHT,
-            joint_center_weight=np.array([10.0, 10.0, 1.0, 50.0, 1.0, 1.0], dtype=np.float64),
-            joint_displacement_weight=np.array(6 * [self.HAND_IK_JOINT_DISPLACEMENT_WEIGHT], dtype=np.float64),
-            position_threshold=0.001,
-            rotation_threshold=0.001,
-            max_pos_diff=0.1,
-            max_rot_diff=self.HAND_IK_MAX_ROT_DIFF,
-            joint_p=self.HAND_IK_JOINT_P,
+            q0=np.asarray(RIGHT_ARM_POSE[:6], dtype=np.float64),
         )
 
         self._middle_controller = None
         if self.head_control:
-            middle_joints = sim_env._middle_joints[:7]
-            middle_q0 = np.asarray(MIDDLE_ARM_POSE[:7], dtype=np.float64)
-            if middle_q0.shape != (len(middle_joints),):
-                raise ValueError(f"Middle IK q0 length mismatch: got {middle_q0.shape[0]}, expected {len(middle_joints)}")
-
-            k_null_template = np.asarray([20.0, 10.0, 10.0, 10.0, 5.0, 5.0, 5.0], dtype=np.float64)
-            if len(middle_joints) > k_null_template.shape[0]:
-                raise ValueError(f"Middle IK null gain supports {k_null_template.shape[0]} DoF, got {len(middle_joints)}")
-
-            self._middle_controller = DiffIK(
-                physics=self.physics,
+            middle_joints = list(sim_env._middle_joints)
+            self._middle_controller = self._make_diff_ik(
                 joints=middle_joints,
-                actuators=sim_env._middle_actuators[:7],
+                actuators=sim_env._middle_actuators,
                 eef_site=self._middle_eef_site,
-                k_pos=0.30,
-                k_ori=0.20,
-                damping=1.0e-4,
-                k_null=k_null_template[: len(middle_joints)].copy(),
-                q0=middle_q0,
-                max_angvel=3.14,
-                integration_dt=SIM_DT,
-                iterations=10,
+                q0=np.asarray(MIDDLE_ARM_POSE, dtype=np.float64),
             )
 
         self.states = self._make_arm_states()
@@ -171,6 +142,31 @@ class PoseActionIKSolver:
             "middle": self._middle_eef_site,
         }
         self.reset(active=active_on_reset)
+
+    # 创建差分 IK 控制器；当前项目三条 Piper/PiperX 机械臂均为 6 轴 IK。
+    def _make_diff_ik(self, *, joints: list, actuators: list, eef_site: object, q0: np.ndarray) -> DiffIK:
+        joints = list(joints)
+        actuators = list(actuators)
+        q0 = np.asarray(q0, dtype=np.float64).reshape(-1)
+        if len(joints) != q0.shape[0]:
+            raise ValueError(f"DiffIK q0 length mismatch: got {q0.shape[0]} values for {len(joints)} joints")
+        if len(joints) > self.DIFF_IK_NULL_GAIN.shape[0]:
+            raise ValueError(f"DiffIK null gain supports {self.DIFF_IK_NULL_GAIN.shape[0]} DoF, got {len(joints)}")
+
+        return DiffIK(
+            physics=self.physics,
+            joints=joints,
+            actuators=actuators,
+            eef_site=eef_site,
+            k_pos=self.DIFF_IK_K_POS,
+            k_ori=self.DIFF_IK_K_ORI,
+            damping=self.DIFF_IK_DAMPING,
+            k_null=self.DIFF_IK_NULL_GAIN[: len(joints)].copy(),
+            q0=q0.copy(),
+            max_angvel=self.DIFF_IK_MAX_ANGVEL,
+            integration_dt=SIM_DT,
+            iterations=self.DIFF_IK_ITERATIONS,
+        )
 
     # 查找 MuJoCo 模型中的指定末端 site，用来读取末端位姿
     def _find_site(self, site_name: str):
@@ -195,7 +191,7 @@ class PoseActionIKSolver:
                 name="left",  
                 joints=self.sim_env._left_joints[:6],   # 左臂参与 IK 的 6 个关节。
                 eef_site=self._left_eef_site,           # 末端 site。
-                ik=self._left_controller,               # 使用的 GradIK 求解器。
+                ik=self._left_controller,               # 使用的 DiffIK 求解器。
                 action_slice=slice(0, 6),               # 关节结果写入 action 的范围。
                 position_scale=self.hand_position_scale,# 位移缩放系数。
                 max_delta=self.hand_max_delta,          # 相对锚点的最大位移。
@@ -226,10 +222,10 @@ class PoseActionIKSolver:
             states.append(
                 ArmIKState(
                     name="middle",
-                    joints=self.sim_env._middle_joints[:7],
+                    joints=self.sim_env._middle_joints,
                     eef_site=self._middle_eef_site,
                     ik=self._middle_controller,
-                    action_slice=slice(14, 21),
+                    action_slice=slice(MIDDLE_ARM_ACTION_START, MIDDLE_ARM_ACTION_START + len(self.sim_env._middle_joints)),
                     position_scale=self.head_position_scale,
                     max_delta=self.head_max_delta,
                     eef_anchor_pos=middle_pos.copy(),
@@ -465,9 +461,43 @@ class PoseActionIKSolver:
         anchor_rot = R.from_quat(
             np.array([anchor_quat_wxyz[1], anchor_quat_wxyz[2], anchor_quat_wxyz[3], anchor_quat_wxyz[0]], dtype=np.float64)
         )
-        yaw, pitch, roll = (anchor_rot.inv() * target_rot).as_euler("zyx", degrees=False)
-        if self.lock_pitch:
-            pitch = 0.0
+        relative_rot = anchor_rot.inv() * target_rot
         if self.lock_roll:
-            roll = 0.0
-        return xyzw_to_wxyz((anchor_rot * R.from_euler("zyx", [yaw, pitch, roll], degrees=False)).as_quat().astype(np.float64))
+            relative_rot = self._remove_twist_about_axis(relative_rot, self._middle_roll_axis_in_eef_frame())
+
+        if self.lock_pitch:
+            yaw, _pitch, roll = relative_rot.as_euler("zyx", degrees=False)
+            pitch = 0.0
+            relative_rot = R.from_euler("zyx", [yaw, pitch, roll], degrees=False)
+        return xyzw_to_wxyz((anchor_rot * relative_rot).as_quat().astype(np.float64))
+
+    # 返回 middle_wrist_2_joint 转轴在中间臂末端 site 坐标系下的方向。
+    def _middle_roll_axis_in_eef_frame(self) -> np.ndarray:
+        if self._middle_roll_joint is None:
+            return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        joint_axis_world = self.physics.bind(self._middle_roll_joint).xaxis.copy().astype(np.float64)
+        site_xmat = self.physics.bind(self._middle_eef_site).xmat.reshape(3, 3).copy().astype(np.float64)
+        axis = site_xmat.T @ joint_axis_world
+        norm = float(np.linalg.norm(axis))
+        if norm < 1e-8:
+            return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        return axis / norm
+
+    # 从相对旋转中移除绕指定轴的 twist 分量，保留其它方向的摆动。
+    @staticmethod
+    def _remove_twist_about_axis(rotation: R, axis: np.ndarray) -> R:
+        axis = np.asarray(axis, dtype=np.float64).reshape(3)
+        axis_norm = float(np.linalg.norm(axis))
+        if axis_norm < 1e-8:
+            return rotation
+        axis = axis / axis_norm
+
+        quat_xyzw = rotation.as_quat().astype(np.float64)
+        twist_vec = axis * float(np.dot(quat_xyzw[:3], axis))
+        twist_quat = np.array([twist_vec[0], twist_vec[1], twist_vec[2], quat_xyzw[3]], dtype=np.float64)
+        twist_norm = float(np.linalg.norm(twist_quat))
+        if twist_norm < 1e-8:
+            return rotation
+        twist_rot = R.from_quat(twist_quat / twist_norm)
+        return rotation * twist_rot.inv()

@@ -32,14 +32,14 @@ record_cameras:   # 保存到数据集中的相机，需和训练配置 input_sh
 
 
 # ===== 3. 仿真与控制 =====
-env_id: guided_vision/SewNeedle-3Arms-v0  # Gymnasium 仿真环境 ID
-hand_position_scale: 1.2      # 左右手柄位移映射到左右臂末端的缩放系数
-head_position_scale: 3.0      # 头显位移映射到中间臂末端的缩放系数
+env_id: guided_vision/InsertCylinder-3Arms-v0  # Gymnasium 仿真环境 ID
+hand_position_scale: 1      # 左右手柄位移映射到左右臂末端的缩放系数
+head_position_scale: 2.0      # 头显位移映射到中间臂末端的缩放系数
 hand_max_delta: 1.0           # 左右臂末端相对锚点的最大位移
 head_max_delta: 1.0           # 中间臂末端相对锚点的最大位移
 head_control: true            # 是否使用头显控制中间臂
 individual_hand_anchors: true  # 左右臂是否分别使用各自手柄锚点
-lock_roll: true               # 是否锁定中间臂 roll 角
+lock_roll: true               # 是否锁定中间臂 link6 转轴对应的 roll
 lock_pitch: false             # 是否锁定中间臂 pitch 角，true 时禁用抬头低头
 episode_length: 100000        # 环境内部最大 episode 长度
 workspace_low: null           # 末端目标工作空间下界，格式 [x, y, z]

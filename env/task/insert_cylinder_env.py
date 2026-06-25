@@ -7,7 +7,7 @@ from env.task.sim_envs import GuidedVisionEnv
 
 
 class InsertCylinderEnv(GuidedVisionEnv):
-    """挡板遮挡下的圆柱放入容器任务环境。"""
+    """Piper 挡板遮挡下的圆柱放入容器任务环境。"""
 
     def __init__(self, **kwargs):
         self.success_xy_threshold = float(kwargs.pop("success_xy_threshold", 0.012))
@@ -15,11 +15,21 @@ class InsertCylinderEnv(GuidedVisionEnv):
         self.cylinder_target_z = float(kwargs.pop("cylinder_target_z", 0.04))
         self.enable_reward_debug = bool(kwargs.pop("enable_reward_debug", False))
 
-        xml_path = os.path.join(XML_DIR, "task_insert_cylinder.xml")
+        xml_path = kwargs.pop("xml_path", os.path.join(XML_DIR, "task_insert_cylinder_piper.xml"))
         super().__init__(xml_path, **kwargs)
 
         self._cylinder_joint = self._mjcf_root.find("joint", "insert_cylinder_joint")
         self._container_body = self._mjcf_root.find("body", "cylinder_container")
+        self._left_gripper_site = self._mjcf_root.find("site", "left_gripper_control")
+        self._right_gripper_site = self._mjcf_root.find("site", "right_gripper_control")
+        for name, element in (
+            ("insert_cylinder_joint", self._cylinder_joint),
+            ("cylinder_container", self._container_body),
+            ("left_gripper_control", self._left_gripper_site),
+            ("right_gripper_control", self._right_gripper_site),
+        ):
+            if element is None:
+                raise ValueError(f"Piper insert cylinder XML 缺少必要元素: {name}")
         self._prev_metrics = {}
         self.right_has_grasped = False
         self.left_has_received = False
@@ -27,6 +37,28 @@ class InsertCylinderEnv(GuidedVisionEnv):
         self.cylinder_was_grasped = False
         self.placement_checked = False
         self.reward_debug = None
+
+    def _geom_or_body_name(self, geom_id: int) -> str:
+        geom_name = self._physics.model.id2name(geom_id, "geom")
+        if geom_name and not geom_name.startswith("//unnamed_geom_"):
+            return geom_name
+        body_id = int(self._physics.model.geom_bodyid[geom_id])
+        body_name = self._physics.model.id2name(body_id, "body")
+        return body_name or ""
+
+    @staticmethod
+    def _contact_role(name: str) -> str | None:
+        if name.startswith("left_left"):
+            return "left_left"
+        if name.startswith("left_right"):
+            return "left_right"
+        if name.startswith("right_left"):
+            return "right_left"
+        if name.startswith("right_right"):
+            return "right_right"
+        if name.startswith("container_"):
+            return "container"
+        return None
 
     def _get_contact_flags(self):
         """读取圆柱是否被左右夹爪稳定夹住。"""
@@ -39,8 +71,8 @@ class InsertCylinderEnv(GuidedVisionEnv):
         for i_contact in range(self._physics.data.ncon):
             geom_id_1 = self._physics.data.contact[i_contact].geom1
             geom_id_2 = self._physics.data.contact[i_contact].geom2
-            geom1 = self._physics.model.id2name(geom_id_1, "geom")
-            geom2 = self._physics.model.id2name(geom_id_2, "geom")
+            geom1 = self._geom_or_body_name(geom_id_1)
+            geom2 = self._geom_or_body_name(geom_id_2)
             if not geom1 or not geom2:
                 continue
 
@@ -49,15 +81,16 @@ class InsertCylinderEnv(GuidedVisionEnv):
                 continue
 
             other = geom2 if geom1 == "insert_cylinder_geom" else geom1
-            if other.startswith("left_left"):
+            role = self._contact_role(other)
+            if role == "left_left":
                 touch_left_left = True
-            elif other.startswith("left_right"):
+            elif role == "left_right":
                 touch_left_right = True
-            elif other.startswith("right_left"):
+            elif role == "right_left":
                 touch_right_left = True
-            elif other.startswith("right_right"):
+            elif role == "right_right":
                 touch_right_right = True
-            elif other.startswith("container_"):
+            elif role == "container":
                 touch_container = True
 
         touch_left_gripper = touch_left_left and touch_left_right
@@ -70,13 +103,8 @@ class InsertCylinderEnv(GuidedVisionEnv):
         target_pos = self._physics.named.data.xpos["cylinder_container"].copy()
         target_pos[2] = self.cylinder_target_z
 
-        left_left_finger = self._physics.named.data.geom_xpos["left_left_g2"]
-        left_right_finger = self._physics.named.data.geom_xpos["left_right_g2"]
-        right_left_finger = self._physics.named.data.geom_xpos["right_left_g2"]
-        right_right_finger = self._physics.named.data.geom_xpos["right_right_g2"]
-
-        left_gripper_center = (left_left_finger + left_right_finger) / 2.0
-        right_gripper_center = (right_left_finger + right_right_finger) / 2.0
+        left_gripper_center = self._physics.bind(self._left_gripper_site).xpos.copy()
+        right_gripper_center = self._physics.bind(self._right_gripper_site).xpos.copy()
 
         left_dist = np.linalg.norm(left_gripper_center - cylinder_pos)
         right_dist = np.linalg.norm(right_gripper_center - cylinder_pos)
@@ -302,6 +330,7 @@ class InsertCylinderEnv(GuidedVisionEnv):
                     # 放置合格给额外阶段奖励。
                     if placed_now:
                         add_reward("place_success", 200.0)
+
             # 阶段 5：放置检查后，等待左臂松手并抬到柜子高度以上。
             else:
                 stage = 5

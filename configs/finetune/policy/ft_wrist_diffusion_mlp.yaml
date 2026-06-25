@@ -1,5 +1,5 @@
 # @package _global_
-# 冻结预训练 Diffusion，只训练最终动作后处理 MLP 的调试配置。
+# 冻结预训练 Diffusion，只训练 20 维动作上的双 residual MLP。
 # 可用命令查看最终合并结果:
 # python train/finetune/test_finetune.py --cfg job
 
@@ -8,13 +8,13 @@ dataset_repo_id: "dppo_online_rollout"
 
 env:
   name: guided_vision
-  task: SewNeedle-2Arms-v0
+  task: SewNeedle-3Arms-v0
   # 调试建议先用单环境，确认 MLP/PPO 链路无误后再改成 5。
   n_envs: 1
 
 training:
   # 预训练 Diffusion 权重目录；运行前按你的真实路径修改。
-  pretrained_ckpt_path: "outputs/1_hugging_model/pre_sim_sew_needle_2arms_wrist_diffusion"
+  pretrained_ckpt_path: "outputs/1_hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion"
 
   # Critic 预热期间只训练 Critic，不更新后置 MLP。
   n_critic_warmup_itr: 5
@@ -43,14 +43,17 @@ training:
   clip_advantage_lower_quantile: 0.05
   clip_advantage_upper_quantile: 0.95
 
-  # Frozen Diffusion + MLP 的动作分布参数。
-  # MLP 输入/输出维度均为 action_dim；residual=true 时初始输出等价于预训练 Diffusion 动作。
-  action_mlp_hidden_dim: 512
-  action_mlp_depth: 2
-  action_mlp_residual: true
-  action_mlp_residual_scale: 1.0
-  action_mlp_std: 0.02
-  action_mlp_learn_std: true
+  # Frozen Diffusion + 双 residual MLP。
+  # 20 维动作顺序: left[0:7], right[7:14], middle/cam[14:20]。
+  # 初始最后一层为 0，因此 mean action 初始等价于预训练 Diffusion 输出。
+  arm_action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+  cam_action_indices: [14, 15, 16, 17, 18, 19]
+  residual_mlp_hidden_dim: 512
+  residual_mlp_depth: 2
+  lambda_arm: 1.0
+  lambda_cam: 1.0
+  residual_mlp_std: 0.02
+  residual_mlp_learn_std: true
   logprob_reduction: mean
 
   # 调试开关。

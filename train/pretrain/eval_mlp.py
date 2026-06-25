@@ -50,18 +50,24 @@ def maybe_suppress_stdout(enabled: bool):
 
 
 def load_frozen_diffusion_mlp_policy(base_policy, load_dir: str | Path, device):
-    """Load the action MLP adapter saved by train/finetune/test_finetune.py."""
+    """加载 residual MLP 微调权重。"""
     load_dir = Path(load_dir)
-    mlp_ckpt_path = load_dir / "action_mlp.pt"
-    mlp_config_path = load_dir / "action_mlp_config.json"
+    mlp_ckpt_path = load_dir / "residual_mlp.pt"
+    mlp_config_path = load_dir / "residual_mlp_config.json"
+    if not mlp_ckpt_path.exists():
+        mlp_ckpt_path = load_dir / "action_mlp.pt"
+        mlp_config_path = load_dir / "action_mlp_config.json"
 
     if not mlp_ckpt_path.exists():
         raise FileNotFoundError(
-            f"找不到 action_mlp.pt: {mlp_ckpt_path}\n"
-            "请确认 ckpt_path 指向 DP+MLP 微调保存的 checkpoint 或其 pretrained_model 子目录。"
+            f"找不到 residual_mlp.pt 或 action_mlp.pt: {load_dir}\n"
+            "请确认 ckpt_path 指向 residual MLP 微调保存的 checkpoint 或其 pretrained_model 子目录。"
         )
 
-    mlp_ckpt = torch.load(mlp_ckpt_path, map_location=device)
+    try:
+        mlp_ckpt = torch.load(mlp_ckpt_path, map_location=device, weights_only=True)
+    except TypeError:
+        mlp_ckpt = torch.load(mlp_ckpt_path, map_location=device)
     mlp_json = {}
     if mlp_config_path.exists():
         with open(mlp_config_path, "r", encoding="utf-8") as f:
@@ -72,6 +78,12 @@ def load_frozen_diffusion_mlp_policy(base_policy, load_dir: str | Path, device):
             return mlp_ckpt[key]
         return mlp_json.get(key, default)
 
+    def pick_list(key, default):
+        value = pick(key, default)
+        if value is None:
+            return []
+        return [int(item) for item in list(value)]
+
     action_dim = int(pick("action_dim", base_policy.config.output_shapes["action"][0]))
     action_start = int(pick("action_start", getattr(base_policy.config, "n_obs_steps", 2) - 1))
     action_end = int(
@@ -80,15 +92,27 @@ def load_frozen_diffusion_mlp_policy(base_policy, load_dir: str | Path, device):
             action_start + getattr(base_policy.config, "n_action_steps", base_policy.config.n_action_steps),
         )
     )
-    hidden_dim = int(pick("hidden_dim", 256))
-    depth = int(pick("depth", 2))
-    residual = bool(pick("residual", True))
-    residual_scale = float(pick("residual_scale", 1.0))
-    learn_std = bool(pick("learn_std", True))
-    logprob_reduction = str(pick("logprob_reduction", "sum"))
+    hidden_dim = int(pick("hidden_dim", pick("residual_mlp_hidden_dim", 256)))
+    depth = int(pick("depth", pick("residual_mlp_depth", 2)))
+    learn_std = bool(pick("learn_std", pick("residual_mlp_learn_std", True)))
+    logprob_reduction = str(pick("logprob_reduction", "mean"))
+    default_arm_indices = list(range(min(14, action_dim)))
+    default_cam_indices = list(range(14, action_dim)) if action_dim > 14 else []
+    arm_action_indices = pick_list("arm_action_indices", default_arm_indices)
+    cam_action_indices = pick_list("cam_action_indices", default_cam_indices)
+    lambda_arm = float(pick("lambda_arm", 1.0))
+    lambda_cam = float(pick("lambda_cam", 1.0))
+    arm_hidden_dim = int(pick("arm_hidden_dim", hidden_dim))
+    cam_hidden_dim = int(pick("cam_hidden_dim", hidden_dim))
+    arm_depth = int(pick("arm_depth", depth))
+    cam_depth = int(pick("cam_depth", depth))
 
     log_std = mlp_ckpt.get("log_std", torch.full((action_dim,), np.log(0.02), dtype=torch.float32))
     init_std = float(log_std.float().exp().mean().item())
+    if "mlp_arm" not in mlp_ckpt or "mlp_cam" not in mlp_ckpt:
+        raise ValueError(
+            f"{mlp_ckpt_path} 不是当前 residual MLP 权重格式，缺少 mlp_arm/mlp_cam。"
+        )
 
     policy = FrozenDiffusionMLPPolicy(
         base_policy=base_policy,
@@ -97,20 +121,30 @@ def load_frozen_diffusion_mlp_policy(base_policy, load_dir: str | Path, device):
         action_end=action_end,
         hidden_dim=hidden_dim,
         depth=depth,
-        residual=residual,
-        residual_scale=residual_scale,
         init_std=init_std,
         learn_std=learn_std,
         logprob_reduction=logprob_reduction,
+        arm_indices=arm_action_indices,
+        cam_indices=cam_action_indices,
+        lambda_arm=lambda_arm,
+        lambda_cam=lambda_cam,
+        arm_hidden_dim=arm_hidden_dim,
+        cam_hidden_dim=cam_hidden_dim,
+        arm_depth=arm_depth,
+        cam_depth=cam_depth,
     ).to(device)
-    policy.action_mlp.load_state_dict(mlp_ckpt["action_mlp"], strict=True) # 严格加载，确保权重完全匹配
+    if policy.arm_action_indices:
+        policy.mlp_arm.load_state_dict(mlp_ckpt["mlp_arm"], strict=True)
+    if policy.cam_action_indices:
+        policy.mlp_cam.load_state_dict(mlp_ckpt["mlp_cam"], strict=True)
     with torch.no_grad():
         policy.log_std.copy_(log_std.to(device))
     policy.eval()
 
     logging.info(
-        f"已加载 DP+MLP 微调模型: action_dim={action_dim}, action_slice=[{action_start}:{action_end}], "
-        f"hidden_dim={hidden_dim}, depth={depth}, residual={residual}, "
+        f"已加载 DP+ResidualMLP 微调模型: action_dim={action_dim}, action_slice=[{action_start}:{action_end}], "
+        f"arm_indices={policy.arm_action_indices}, cam_indices={policy.cam_action_indices}, "
+        f"lambda_arm={policy.lambda_arm:.3f}, lambda_cam={policy.lambda_cam:.3f}, "
         f"mean_action_std={float(policy.action_std.mean().detach().cpu().item()):.5f}"
     )
     return policy
@@ -730,7 +764,7 @@ if __name__ == "__main__":
     # ==========================================
     eval_cfg = SimpleNamespace(
         seed=100,
-        # 📂 模型路径设置：指向 checkpoint 文件夹即可，代码会自动寻找 pretrained_model/action_mlp.pt。
+        # 📂 模型路径设置：指向 checkpoint 文件夹即可，代码会自动寻找 residual_mlp.pt。
         ckpt_path="outputs/3_finetune/train/2026-06-02/00-06-22_SewNeedle-2Arms-v0_ft_wrist_diffusion_mlp/checkpoints/000014_sr=0.75_reward=488.13_MLPloss=0.1031_Vloss=1.6439/pretrained_model",
         # ⚙️ 评估参数设置
         n_episodes=100,             # 评估多少个任务                 
