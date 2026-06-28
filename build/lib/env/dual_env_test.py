@@ -1,6 +1,6 @@
 from dm_control import mjcf
 from constants import (
-    XML_DIR,  #src/av-aloha/data_collection_scripts/assets
+    XML_DIR,  
     SIM_DT, SIM_PHYSICS_DT, SIM_PHYSICS_ENV_STEP_RATIO,
     LEFT_ARM_POSE, RIGHT_ARM_POSE, MIDDLE_ARM_POSE,
     LEFT_JOINT_NAMES, RIGHT_JOINT_NAMES, MIDDLE_JOINT_NAMES,

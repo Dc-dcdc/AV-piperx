@@ -342,7 +342,7 @@ def quest_mujoco_cli(cfg: DictConfig) -> None:
 if __name__ == "__main__":
     # 命令行参数注入
     default_args = [
-        "env_id=guided_vision/SewNeedle-3Arms-v0",
+        "env_id=guided_vision/InsertCylinder-3Arms-v0",
         "display_camera=zed_cam_left",
         "lock_roll=True",                            # 是否锁定中间臂 roll 角
         "render_width=640",                          # 渲染图像宽度

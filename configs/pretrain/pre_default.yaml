@@ -8,7 +8,6 @@ hydra:
   run:
     dir: outputs/2_pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
     # ${hydra.runtime.choices.policy}就是对应的policy名称，如果直接写${policy}会把文件里的参数都放进去
-    # dir: src/av-aloha/DPPO/outputs/pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.name}_${policy.name}_${hydra.job.name}
   job:
     name: ${env.task}_${hydra.runtime.choices.policy}_${now:%Y-%m-%d}_${now:%H-%M-%S}
   

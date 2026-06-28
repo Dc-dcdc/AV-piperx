@@ -250,6 +250,17 @@ class PoseActionIKSolver:
             state.last_q_target = None
             state.last_q_error = None
 
+    # 首次 DiffIK 调用会触发 Numba 编译，提前预热可避免按下 A 后卡顿导致锚点过期。
+    def warmup(self) -> None:
+        for state in self.states:
+            q_current = self.physics.bind(state.joints).qpos.copy().astype(np.float64)
+            target_pos, target_quat = self._read_eef_pose(state.eef_site)
+            state.ik.run(
+                q_current,
+                target_pos.astype(np.float64),
+                target_quat.astype(np.float64),
+            )
+
     # 判断当前 Quest 数据是否足够用于开始锚定。
     def can_anchor_from_data(self, data: HeadsetData, *, allow_partial: bool = False) -> bool:
         readiness = [self._quest_source_ready(data, self.QUEST_SOURCE_BY_ARM[state.name]) for state in self.states]

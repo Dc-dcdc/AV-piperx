@@ -8,7 +8,7 @@
 | 类型 | Gym 环境 ID | 主要 XML/入口 | 说明 |
 |---|---|---|---|
 | ALOHA 穿针 | `guided_vision/SewNeedle-3Arms-v0` / `guided_vision/SewNeedle-2Arms-v0` | `env/assets/task_sew_needle.xml` -> `scene.xml` -> `aloha_sim.xml` | 原始 ALOHA 任务 |
-| PiperX 圆柱插入 | `guided_vision/InsertCylinder-3Arms-v0` | `env/assets/task_insert_cylinder_piper.xml` -> `scene_piper.xml` -> `piperx_sim.xml` | 当前主入口 |
+| PiperX 圆柱插入 | `guided_vision/InsertCylinder-3Arms-v0` | `env/assets/task_insert_cylinder_piper.xml` -> `piperx_scene.xml` -> `piperx_sim.xml` | 当前主入口 |
 | ALOHA 插槽 | `guided_vision/SlotInsertion-3Arms-v0` | `env/assets/task_slot_insertion.xml` | 插槽任务 |
 
 
@@ -49,7 +49,7 @@
 1. 添加了模型推理部分，可以添加训练好的模型进行在线仿真推理，可以修改display_cameras参数获取要单独渲染的相机视角，一行两个进行排布。此外还可以通过修改代码中SIM_DT为具体值，从而实现慢速的观测效果。
 
 ## ✨ PiperX/松灵兼容层 
-1. PiperX 仿真 XML 位于 `env/assets/piperx_sim.xml`，场景文件为 `env/assets/scene_piper.xml`，圆柱任务入口为 `env/assets/task_insert_cylinder_piper.xml`。
+1. PiperX 仿真 XML 位于 `env/assets/piperx_sim.xml`，场景文件为 `env/assets/piperx_scene.xml`，圆柱任务入口为 `env/assets/task_insert_cylinder_piper.xml`。
 2. 当前 PiperX 主入口使用 `guided_vision/InsertCylinder-3Arms-v0`，兼容别名为 `guided_vision/InsertCylinder-Piper3Arms-v0`。接口保持 ALOHA 风格：左臂 7 维、右臂 7 维、中间臂 6 轴，总动作维度 `20`，动作切片为 `left[0:7] + right[7:14] + middle[14:20]`。
 3. 关节、执行器和末端 site 名称需要继续和 `env/constants.py` 对齐，例如 `left_gripper_control`、`right_gripper_control`、`middle_zed_camera_center`。
 4. Piper 圆柱入口使用 `InsertCylinderEnv`，默认加载 `task_insert_cylinder_piper.xml`，并支持 `enable_reward_debug`；正式训练或采集前应先用 `data_collect/quest_mujoco_test.py` 做 Quest 映射和 IK 小步测试。

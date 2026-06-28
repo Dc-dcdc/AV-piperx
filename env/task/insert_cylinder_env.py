@@ -184,7 +184,7 @@ class InsertCylinderEnv(GuidedVisionEnv):
         rng = self.np_random
 
         x_range = [0.045, 0.045]
-        y_range = [0.10, 0.30]
+        y_range = [0.05, 0.25]
         z_range = [0.0, 0.0]
         ranges = np.vstack([x_range, y_range, z_range])
         cylinder_position = rng.uniform(ranges[:, 0], ranges[:, 1])
@@ -195,7 +195,7 @@ class InsertCylinderEnv(GuidedVisionEnv):
 
         container_position = np.array([
             rng.uniform(-0.045, -0.045),
-            rng.uniform(0.10, 0.30),
+            rng.uniform(0.05, 0.25),
             0.0,
         ], dtype=np.float64)
         self._physics.bind(self._container_body).pos = container_position

@@ -25,10 +25,10 @@ SIM_DT = SIM_PHYSICS_DT * SIM_PHYSICS_ENV_STEP_RATIO # 强制确保最终的 SIM
 # Piper robot parameters
 LEFT_ARM_POSE = [0.0, 1.60, -0.30, -1.16, 0, 0.0, 0.027] # 左臂默认初始姿态
 RIGHT_ARM_POSE = [0.0, 1.60, -0.30, -1.16, 0, 0.0, 0.027] # 右臂默认初始姿态
-MIDDLE_ARM_POSE = [0.0, 0.5, -0.85, 0.7, 0.0, 0.0] # 中臂初始姿态，6 轴
+MIDDLE_ARM_POSE = [0.0, 1.1, -1.1, 0.37, 0.0, 0.0] # 中臂初始姿态，6 轴
 LEFT_BASE_POS = [-0.55, 0.15, 0.0] # 左臂默认底座位置
 RIGHT_BASE_POS = [0.55, 0.15, 0.0] # 右臂默认底座位置
-MIDDLE_BASE_POS = [0.0, -0.45, 0.0] # 中臂默认底座位置
+MIDDLE_BASE_POS = [0.0, -0.65, 0.0] # 中臂默认底座位置
 
 # 按任务管理机器人初始配置；env/__init__.py 会读取并传入对应环境。
 ROBOT_INIT_CONFIGS = {

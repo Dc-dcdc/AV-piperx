@@ -1,5 +1,5 @@
 <mujoco model="insert_cylinder_piper">
-    <include file="scene_piper.xml"/>
+    <include file="piperx_scene.xml"/>
 
     <asset>
         <material name="baffle_mat" rgba="0.20 0.22 0.24 1"/>

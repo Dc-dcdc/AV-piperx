@@ -695,12 +695,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--raw-dir",
-        default="outputs/4_data_collect/quest_teleop/quest_teleop_SewNeedle-3Arms-v0",
+        default="outputs/4_data_collect/quest_teleop/",
         help="采集数据目录；也可以填父目录，脚本会自动选择最新的 collect_* 或 quest_teleop_* 目录。",
     )
     parser.add_argument(
         "--output-dir",
-        default="outputs/5_hf_datasets/quest_teleop_sew_needle_3arms",
+        default="outputs/5_hf_datasets/",
         help="本地生成的 HF 数据集目录。",
     )
     parser.add_argument(

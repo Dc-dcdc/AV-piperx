@@ -630,6 +630,21 @@ def _print_header(cfg: DictConfig, run_dir: Path, record_cameras: list[str]) -> 
     print("-" * 78)
 
 
+# 非阻塞丢弃 UDP 队列中的旧包，返回当前可读到的最新 Quest 数据。
+def _refresh_latest_quest_data(receiver: QuestReceive, fallback: HeadsetData | None) -> HeadsetData | None:
+    latest = fallback
+    old_timeout = receiver.sock.gettimeout()
+    receiver.sock.settimeout(0.0)
+    try:
+        while True:
+            latest = receiver.receive_data()
+    except (BlockingIOError, socket.timeout):
+        pass
+    finally:
+        receiver.sock.settimeout(old_timeout)
+    return latest
+
+
 # 运行 Quest 遥操采集主循环。
 def run(cfg: DictConfig) -> None:
     if float(cfg.fps) <= 0:
@@ -734,6 +749,10 @@ def run(cfg: DictConfig) -> None:
         use_head_control=cfg.head_control,
         use_individual_hand_anchors=cfg.individual_hand_anchors,
     )
+    print("Warming up IK before waiting for Quest anchor...")
+    warmup_t0 = time.perf_counter()
+    ik_solver.warmup()
+    print(f"IK warmup done in {(time.perf_counter() - warmup_t0):.2f}s.")
 
     command = {"anchor": False, "reset": False, "quit": False, "save_success": False}
 
@@ -909,6 +928,14 @@ def run(cfg: DictConfig) -> None:
                     elif latest_data is None:
                         print("Cannot anchor yet: no Quest data.")
                     else:
+                        try:
+                            latest_data = _refresh_latest_quest_data(receiver, latest_data)
+                        except json.JSONDecodeError as exc:
+                            print(f"Invalid Quest JSON packet while anchoring: {exc}")
+                        if latest_data is None:
+                            print("Cannot anchor yet: no Quest data.")
+                            command["anchor"] = False
+                            continue
                         active_count = ik_solver.activate_from_data(
                             latest_data,
                             require_all=not cfg.allow_partial_anchor,
@@ -1265,17 +1292,17 @@ def quest_teleop_collect_cli(cfg: DictConfig) -> None:
 if __name__ == "__main__":
     default_args = [
         "env_id=guided_vision/InsertCylinder-3Arms-v0",
-        "max_steps_per_episode=4000",                  # 最大步长
+        "max_steps_per_episode=400",                  # 最大步长
         "head_control=true",                          # 是否使用头显控制中间臂
         "lock_pitch=False",                            # 是否锁定中间臂 pitch 角，true 时禁用抬头低头
-        "lock_roll=False",                             # 是否锁定中间臂 link6 转轴对应的 roll
+        "lock_roll=true",                             # 是否锁定中间臂 link6 转轴对应的 roll
         "save_pose_action=true",                      # 是否额外保存 Quest 映射后的末端位姿动作
         "save_rgb=true",                              # 是否在 A+X 确认后回放轨迹并保存 RGB 视频
         "save_depth=false",                           # 是否保存 record_cameras 中每个相机的逐像素深度图
         "depth_window=false",                         # 是否打开本地 OpenCV 深度图窗口
-        "camera_window=true",                        # 是否打开本地 OpenCV RGB 窗口，关闭可减少一次额外渲染
+        "camera_window=false",                       # 是否打开本地 OpenCV RGB 窗口，关闭可减少一次额外渲染
         "unity_image_source=rgb",                     # 默认发送 RGB 图到 Quest
-        "unity_image_stereo=true",                    # 是否按左右眼 side-by-side 发送到 Quest
+        "unity_image_stereo=true",                   # 是否按左右眼 side-by-side 发送到 Quest
         # 不在这里设置 env_id；任务场景只通过 yaml 或命令行 env_id 切换。
         # "unity_image_stream=false",
     ]
