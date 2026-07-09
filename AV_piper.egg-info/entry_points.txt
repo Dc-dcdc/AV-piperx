@@ -1,0 +1,2 @@
+[mjlab.tasks]
+av_piper = env.mjlab

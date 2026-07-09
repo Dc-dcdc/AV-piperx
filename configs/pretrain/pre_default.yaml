@@ -1,7 +1,7 @@
 defaults:
   - _self_
   # 默认加载的环境和策略
-  - env: sim_sew_needle_3arms
+  - env: sim_insert_cylinder_3arms
   - policy: pre_zed_diffusion
 
 hydra:
@@ -38,16 +38,16 @@ video_backend: pyav # 视频解码引擎，读取视频文件转化为图像张�
 eval:
   checkpoint_metric: "reward" # 筛选指标：可选 'loss' 或 'reward'
   max_checkpoints: 15     # 最多保存loss最小的几个模型快照
-  n_episodes: 10              # 每次评估跑多少个完整的 episode
+  n_episodes: 100              # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 1    # 最多保存前几个 episode 的录像视频
   # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
-  batch_size: 1
-  # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
-  use_async_envs: true
+  batch_size: 15              # 每次并行评估环境数量
+  max_steps: 400             # 环境的单局最大步数截断
+  use_async_envs: true       # 是否使用异步环境并行评估，true时每个环境独立运行，false时所有环境同步运行
   records_resume: true  # 是否读取top-k的快照和视频列表 即top_k_records.json
   fps: 25               # 录制的 MP4 视频帧率
   seed: 100            # 评估时的随机种子
-  render_camera : ['overhead_cam']                           # 评估时保存的video视角相机
+  render_camera : ['zed_cam_left']                           # 评估时保存的video视角相机
 
 
 training:
@@ -96,6 +96,8 @@ policy:
 
 wandb:
   enable: true
+  disable_system_stats: true  # 不采集或上传CPU、GPU、内存等周期性System指标
+  disable_machine_info: true  # 不上传主机与硬件信息
   # Set to true to disable saving an artifact despite save_checkpoint == True
   disable_artifact: true # 不保存artifact，即不上传权重模型
   project: ${env.task}_finetune #项目名称

@@ -185,7 +185,7 @@ class InsertCylinderEnv(GuidedVisionEnv):
 
         x_range = [0.045, 0.045]
         y_range = [0.05, 0.25]
-        z_range = [0.0, 0.0]
+        z_range = [0.01, 0.01]
         ranges = np.vstack([x_range, y_range, z_range])
         cylinder_position = rng.uniform(ranges[:, 0], ranges[:, 1])
         cylinder_quat = np.array([1, 0, 0, 0])

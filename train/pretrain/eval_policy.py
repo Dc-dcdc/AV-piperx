@@ -23,6 +23,7 @@ import re
 import shutil
 from pathlib import Path
 from contextlib import nullcontext
+from functools import partial
 import gymnasium as gym
 import yaml
 from tqdm import tqdm
@@ -86,16 +87,24 @@ def configure_torch_runtime(deterministic: bool):
 
 
 def prepare_policy_observation(raw_obs: dict, expected_keys: set[str], device) -> dict[str, torch.Tensor]:
-    """只转换 policy 真正需要的观测键，避免把录像相机也送进预处理。"""
+    """只转换 policy 真正需要的观测键；兼容单环境和 gym.vector 的 batch 观测。"""
     batch = {}
 
     if "observation.state" in expected_keys:
         state = np.asarray(raw_obs["agent_pos"], dtype=np.float32)
-        batch["observation.state"] = torch.from_numpy(state).unsqueeze(0).to(device, non_blocking=True)
+        if state.ndim == 1:
+            state = state[None, :]
+        if not state.flags.c_contiguous:
+            state = np.ascontiguousarray(state)
+        batch["observation.state"] = torch.from_numpy(state).to(device, non_blocking=True)
 
     if "observation.environment_state" in expected_keys and "environment_state" in raw_obs:
         env_state = np.asarray(raw_obs["environment_state"], dtype=np.float32)
-        batch["observation.environment_state"] = torch.from_numpy(env_state).unsqueeze(0).to(device, non_blocking=True)
+        if env_state.ndim == 1:
+            env_state = env_state[None, :]
+        if not env_state.flags.c_contiguous:
+            env_state = np.ascontiguousarray(env_state)
+        batch["observation.environment_state"] = torch.from_numpy(env_state).to(device, non_blocking=True)
 
     pixels = raw_obs.get("pixels", {})
     for key in expected_keys:
@@ -105,14 +114,122 @@ def prepare_policy_observation(raw_obs: dict, expected_keys: set[str], device) -
         if camera not in pixels:
             raise KeyError(f"环境观测中缺少策略需要的相机: {camera}")
 
-        image = pixels[camera]
+        image = np.asarray(pixels[camera])
+        if image.ndim == 3:
+            image = image[None, ...]
+        if image.ndim != 4:
+            raise ValueError(f"相机 {camera} 的观测维度异常: {image.shape}")
         if not image.flags.c_contiguous:
             image = np.ascontiguousarray(image)
         image_tensor = torch.from_numpy(image).to(device, non_blocking=True)
-        image_tensor = image_tensor.permute(2, 0, 1).contiguous().unsqueeze(0)
+        image_tensor = image_tensor.permute(0, 3, 1, 2).contiguous()
         batch[key] = image_tensor.to(dtype=torch.float32).div_(255.0)
 
     return batch
+
+
+def is_vector_env(env) -> bool:
+    return int(getattr(env, "num_envs", 1)) > 1
+
+
+def make_single_eval_env(env_id: str, cameras: list[str], episode_length: int):
+    import env as _registered_env  # noqa: F401 - 子进程里触发 Gym 注册
+
+    env_obj = gym.make(
+        id=env_id,
+        cameras=cameras,
+        episode_length=episode_length,
+    )
+    return env_obj.unwrapped
+
+
+def make_eval_env(env_id: str, cameras: list[str], eval_cfg):
+    batch_size = int(getattr(eval_cfg, "batch_size", getattr(eval_cfg, "num_envs", 1)))
+    n_episodes = int(getattr(eval_cfg, "n_episodes", 1))
+    batch_size = max(1, min(batch_size, max(1, n_episodes)))
+    episode_length = int(getattr(eval_cfg, "max_steps", 300))
+
+    if batch_size <= 1:
+        logging.info("评估使用单环境模式。")
+        return make_single_eval_env(env_id, cameras, episode_length)
+
+    env_fns = [partial(make_single_eval_env, env_id, cameras, episode_length) for _ in range(batch_size)]
+    use_async_envs = bool(getattr(eval_cfg, "use_async_envs", True))
+    vector_cls = gym.vector.AsyncVectorEnv if use_async_envs else gym.vector.SyncVectorEnv
+    vector_kwargs = {}
+    if use_async_envs:
+        vector_kwargs.update(shared_memory=True, context="spawn")
+
+    try:
+        eval_env = vector_cls(env_fns, **vector_kwargs)
+    except TypeError:
+        # 兼容较旧 gymnasium：部分版本不支持 context/shared_memory 参数。
+        eval_env = vector_cls(env_fns)
+
+    mode_name = "AsyncVectorEnv" if use_async_envs else "SyncVectorEnv"
+    logging.info(f"评估使用多环境模式: {mode_name}, num_envs={batch_size}")
+    return eval_env
+
+
+def describe_eval_env(env_id: str, eval_env) -> str:
+    if is_vector_env(eval_env):
+        return (
+            f"{env_id} -> {eval_env.__class__.__module__}.{eval_env.__class__.__name__}"
+            f"[num_envs={int(eval_env.num_envs)}]"
+        )
+    return f"{env_id} -> {eval_env.unwrapped.__class__.__module__}.{eval_env.unwrapped.__class__.__name__}"
+
+
+def _as_bool_array(value, n_envs: int, default: bool = False) -> np.ndarray:
+    if value is None:
+        return np.full(n_envs, default, dtype=bool)
+    arr = np.asarray(value)
+    if arr.shape == ():
+        return np.full(n_envs, bool(arr), dtype=bool)
+    arr = arr.astype(bool).reshape(-1)
+    if arr.shape[0] < n_envs:
+        padded = np.full(n_envs, default, dtype=bool)
+        padded[: arr.shape[0]] = arr
+        return padded
+    return arr[:n_envs]
+
+
+def _as_float_array(value, n_envs: int, default: float = 0.0) -> np.ndarray:
+    if value is None:
+        return np.full(n_envs, default, dtype=np.float32)
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.shape == ():
+        return np.full(n_envs, float(arr), dtype=np.float32)
+    arr = arr.reshape(-1)
+    if arr.shape[0] < n_envs:
+        padded = np.full(n_envs, default, dtype=np.float32)
+        padded[: arr.shape[0]] = arr
+        return padded
+    return arr[:n_envs]
+
+
+def _extract_info_bool(info, key: str, n_envs: int, default: bool = False) -> np.ndarray:
+    values = np.full(n_envs, default, dtype=bool)
+    if not isinstance(info, dict):
+        return values
+
+    if key in info:
+        values = _as_bool_array(info.get(key), n_envs, default=default)
+
+    final_infos = info.get("final_info", None)
+    if final_infos is not None:
+        for idx, final_info in enumerate(list(final_infos)[:n_envs]):
+            if isinstance(final_info, dict) and key in final_info:
+                values[idx] = bool(final_info[key])
+
+    return values
+
+
+def _render_vector_frames(env, camera: str, n_envs: int):
+    if hasattr(env, "call"):
+        frames = env.call("render", [camera])
+        return list(frames)
+    return [env.envs[idx].unwrapped.render([camera]) for idx in range(n_envs)]
 
 
 def patch_act_position_embedding_for_determinism():
@@ -151,11 +268,193 @@ def patch_act_position_embedding_for_determinism():
     ACTSinusoidalPositionEmbedding2d._dppo_deterministic_patch = True
     logging.info("已启用 ACT 评估确定性补丁: positional embedding 使用 arange 替代 CUDA cumsum")
 
+
+def custom_eval_policy_vectorized(env, policy, cfg_eval, videos_dir, device):
+    """用 gym.vector 并行评估多个 episode；policy action chunk 队列按 batch 同步推进。"""
+    policy.eval()
+    n_envs = int(env.num_envs)
+    successes = []
+    rewards = []
+    episode_records = []
+    saved_video_paths = []
+
+    videos_dir = Path(videos_dir)
+    videos_dir.mkdir(parents=True, exist_ok=True)
+
+    n_episodes = int(getattr(cfg_eval, "n_episodes", 10))
+    max_rendered = int(getattr(cfg_eval, "max_episodes_rendered", 4))
+    fps = int(getattr(cfg_eval, "fps", 25))
+    max_steps = int(getattr(cfg_eval, "max_steps", 300))
+    raw_camera = getattr(cfg_eval, "render_camera", "overhead_cam")
+    render_cameras = [raw_camera] if isinstance(raw_camera, str) else list(raw_camera)
+    expected_keys = set(policy.config.input_shapes)
+    base_seed = int(getattr(cfg_eval, "seed", 1000))
+    global_real_inference_times = []
+
+    episode_cursor = 0
+    progress = tqdm(total=n_episodes, leave=False)
+    while episode_cursor < n_episodes:
+        active_count = min(n_envs, n_episodes - episode_cursor)
+        episode_ids = np.arange(episode_cursor, episode_cursor + active_count, dtype=np.int64)
+        active = np.zeros(n_envs, dtype=bool)
+        active[:active_count] = True
+        seeds = [
+            base_seed + int(episode_ids[idx]) if idx < active_count else base_seed + n_episodes + idx
+            for idx in range(n_envs)
+        ]
+
+        seed_runtime(int(seeds[0]))
+        try:
+            obs, _ = env.reset(seed=seeds)
+        except TypeError:
+            logging.warning("当前 VectorEnv 不支持列表 seed，回退为无 seed reset。")
+            obs, _ = env.reset()
+
+        policy.reset()
+        seed_runtime(int(seeds[0]))
+
+        done = np.zeros(n_envs, dtype=bool)
+        episode_success = np.zeros(n_envs, dtype=bool)
+        episode_rewards = np.zeros(n_envs, dtype=np.float32)
+        steps_taken = np.zeros(n_envs, dtype=np.int32)
+        frames_by_env = {
+            idx: {camera: [] for camera in render_cameras}
+            for idx in range(active_count)
+            if int(episode_ids[idx]) < max_rendered
+        }
+        render_failed_cameras = set()
+        batch_inference_times = []
+
+        for step in range(max_steps):
+            step_active = active & ~done
+            if not step_active.any():
+                break
+
+            if frames_by_env:
+                render_indices = [idx for idx in frames_by_env if step_active[idx]]
+                if render_indices:
+                    for camera in render_cameras:
+                        if camera in render_failed_cameras:
+                            continue
+                        try:
+                            frames = _render_vector_frames(env, camera, n_envs)
+                        except Exception as exc:
+                            render_failed_cameras.add(camera)
+                            logging.warning(f"VectorEnv 渲染相机 {camera} 失败，本批次跳过该视角录像: {exc}")
+                            continue
+                        for env_idx in render_indices:
+                            frames_by_env[env_idx][camera].append(frames[env_idx])
+
+            batch_obs = prepare_policy_observation(obs, expected_keys, device)
+            start_time = time.perf_counter()
+            with torch.inference_mode():
+                action = policy.select_action(batch_obs)
+            action_np = action.detach().cpu().numpy().copy()
+            if action_np.ndim == 1:
+                action_np = action_np[None, :]
+            if action_np.shape[0] != n_envs:
+                raise ValueError(f"策略输出 batch={action_np.shape[0]}，但评估环境 num_envs={n_envs}")
+            action_np[~step_active] = 0.0
+
+            inference_time_ms = (time.perf_counter() - start_time) * 1000
+            batch_inference_times.append(inference_time_ms)
+            steps_taken[step_active] = step + 1
+
+            try:
+                obs, reward, terminated, truncated, info = env.step(action_np)
+            except Exception as exc:
+                logging.exception(f"VectorEnv 物理引擎崩溃 (Step {step})，本批未完成 episode 记为失败: {exc}")
+                unfinished = active & ~done
+                episode_rewards[unfinished] = -1000.0
+                episode_success[unfinished] = False
+                done[unfinished] = True
+                break
+
+            reward_arr = _as_float_array(reward, n_envs)
+            terminated_arr = _as_bool_array(terminated, n_envs)
+            truncated_arr = _as_bool_array(truncated, n_envs)
+            step_done = terminated_arr | truncated_arr | (step + 1 >= max_steps)
+            success_arr = _extract_info_bool(info, "is_success", n_envs, default=False)
+
+            episode_rewards[step_active] += reward_arr[step_active]
+            newly_done = step_active & step_done
+            episode_success[newly_done] = success_arr[newly_done]
+            done[newly_done] = True
+
+        unfinished = active & ~done
+        if unfinished.any():
+            steps_taken[unfinished] = np.maximum(steps_taken[unfinished], max_steps)
+            episode_success[unfinished] = False
+            done[unfinished] = True
+
+        for local_idx in range(active_count):
+            ep = int(episode_ids[local_idx])
+            success = bool(episode_success[local_idx])
+            ep_reward = float(episode_rewards[local_idx])
+            successes.append(success)
+            rewards.append(ep_reward)
+            episode_records.append(
+                {
+                    "episode": ep,
+                    "seed": base_seed + ep,
+                    "success": success,
+                    "reward": ep_reward,
+                    "steps": int(steps_taken[local_idx]),
+                }
+            )
+
+            if local_idx in frames_by_env:
+                status = "Success" if success else "Fail"
+                for camera, frames in frames_by_env[local_idx].items():
+                    if len(frames) == 0:
+                        continue
+                    video_name = f"{camera}_ep_{ep}_reward={ep_reward:.1f}_{status}.mp4"
+                    video_path = videos_dir / video_name
+                    imageio.mimsave(str(video_path), frames, fps=fps)
+                    saved_video_paths.append(str(video_path))
+
+        real_inferences = [t for t in batch_inference_times if t > 5.0]
+        if real_inferences:
+            global_real_inference_times.extend(real_inferences)
+
+        episode_cursor += active_count
+        progress.update(active_count)
+
+    progress.close()
+
+    if len(global_real_inference_times) > 0:
+        warmup_steps = 3
+        stable_times = (
+            global_real_inference_times[warmup_steps:]
+            if len(global_real_inference_times) > warmup_steps
+            else global_real_inference_times
+        )
+        max_time = max(stable_times)
+        avg_real_time = sum(stable_times) / len(stable_times)
+    else:
+        avg_real_time = 0.0
+        max_time = 0.0
+
+    return {
+        "aggregated": {
+            "success_rate": float(np.mean(successes)),
+            "average_reward": float(np.mean(rewards)),
+            "avg_inference_ms": float(avg_real_time),
+            "max_inference_ms": float(max_time),
+        },
+        "video_paths": saved_video_paths,
+        "episodes": episode_records,
+    }
+
+
 def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     """
     完全自主实现的评估代码。没有任何黑盒。
     接收标准 Gym 环境，处理图像归一化，跑策略推理，保存视频。
     """
+    if is_vector_env(env):
+        return custom_eval_policy_vectorized(env, policy, cfg_eval, videos_dir, device)
+
     policy.eval() # 必须开启评估模式
     successes = []
     rewards = []
@@ -570,6 +869,7 @@ def write_eval_summary(summary_dir: Path, rows: list[dict], eval_cfg, source_pat
         "mode": getattr(eval_cfg, "mode", "fast_repro"),
         "seed": eval_cfg.seed,
         "n_episodes": eval_cfg.n_episodes,
+        "eval_batch_size": int(getattr(eval_cfg, "batch_size", getattr(eval_cfg, "num_envs", 1))),
         "max_steps": eval_cfg.max_steps,
         "total_records": len(rows),
         "latest_checkpoint_records": len(latest_rows),
@@ -594,6 +894,7 @@ def write_eval_summary(summary_dir: Path, rows: list[dict], eval_cfg, source_pat
         "avg_inference_ms",
         "max_inference_ms",
         "n_episodes",
+        "eval_batch_size",
         "max_steps",
         "seed",
         "mode",
@@ -775,21 +1076,17 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
 
                 env_cfg = full_cfg.get("env", {})
                 env_name = env_cfg.get("name", getattr(env_cfg, "name", "guided_vision"))
-                env_task = env_cfg.get("task", getattr(env_cfg, "task", "SewNeedle-3Arms-v0"))
+                env_task = env_cfg.get("task", getattr(env_cfg, "task", "InsertCylinder-3Arms-v0"))
                 logging.info(f"成功从预训练文件夹读取完整环境配置: {env_name}/{env_task}")
         else:
             env_name = getattr(eval_cfg, "name", "guided_vision")
-            env_task = getattr(eval_cfg, "task", "SewNeedle-3Arms-v0")
+            env_task = getattr(eval_cfg, "task", "InsertCylinder-3Arms-v0")
             logging.warning(f"  未找到 config.yaml，使用本地设定的后备环境: {env_name}/{env_task}")
 
         env_id = f"{env_name}/{env_task}"
         logging.info(f"正在通过 Gym 注册表构建环境: {env_id}")
-        eval_env = gym.make(
-            id=env_id,
-            cameras=obs_cameras,
-            episode_length=eval_cfg.max_steps
-        )
-        env_desc = f"{env_id} -> {eval_env.unwrapped.__class__.__module__}.{eval_env.unwrapped.__class__.__name__}"
+        eval_env = make_eval_env(env_id, obs_cameras, eval_cfg)
+        env_desc = describe_eval_env(env_id, eval_env)
         logging.info(f"当前评估环境: {env_desc}")
         logging.info(f"环境加载成功！最终挂载的相机: {obs_cameras}")
 
@@ -844,6 +1141,7 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
             "mode": eval_mode,
             "seed": eval_cfg.seed,
             "n_episodes": eval_cfg.n_episodes,
+            "eval_batch_size": int(getattr(eval_env, "num_envs", 1)),
             "max_steps": eval_cfg.max_steps,
             "success_rate": float(sr),
             "success_rate_percent": float(sr * 100.0),
@@ -943,6 +1241,7 @@ def main(eval_cfg):
                 "mode": eval_mode,
                 "seed": eval_cfg.seed,
                 "n_episodes": eval_cfg.n_episodes,
+                "eval_batch_size": int(getattr(eval_cfg, "batch_size", getattr(eval_cfg, "num_envs", 1))),
                 "max_steps": eval_cfg.max_steps,
                 "error": repr(exc),
             }
@@ -982,7 +1281,7 @@ if __name__ == "__main__":
     eval_cfg = SimpleNamespace(
         seed=100,
         # 可以指向单个 checkpoint，也可以指向整次训练 run 目录或 run/checkpoints 目录。
-        ckpt_path="outputs/2_pretrain/train/2026-06-26/11-40-10_InsertCylinder-3Arms-v0_pre_zed_diffusion",
+        ckpt_path="outputs/3_finetune/train/2026-07-09/13-18-11_InsertCylinder-3Arms-v0_ft_zed_diffusion/checkpoints/000004_sr=0.00_reward=327.67_Ploss=-0.0029_Vloss=0.0053",
         checkpoint_source="all",  # all: 读取目录下 checkpoint全部文件；   top_k/latest: 读取 checkpoints/top_k_records.json中记录的模型
         max_checkpoints=None,     # 调试时可设为 1/2，正式评估保持 None
         eval_output_dir=None,     # None 时自动保存到 run_dir/policy_eval/固定配置名，方便断点续评
@@ -998,6 +1297,8 @@ if __name__ == "__main__":
         max_episodes_rendered=0,    # 全量评估建议 0；需要视频时再改为 1/2
         fps=25,                     # 视频帧率，和环境控制频率对齐
         max_steps=400,              # 每个任务的最大步数
+        batch_size=10,               # 并行评估环境数量；设为 1 即回到单环境评估
+        use_async_envs=True,        # True 使用多进程 AsyncVectorEnv，False 使用单进程 SyncVectorEnv
         device="cuda",              # 如需完全规避 CUDA 非确定算子，可临时改成 "cpu"
         deterministic=False,        # 通常不用手动改；strict 模式会自动开启
         

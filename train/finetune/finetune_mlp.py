@@ -146,6 +146,330 @@ class RunningRewardScaler:
         )
 
 
+class SVMDiscriminator(nn.Module):
+    """用成功/失败访问样本训练的 SVM 过程奖励判别器。"""
+
+    def __init__(self, input_dim: int, hidden_dim: int = 256, depth: int = 3):
+        """构建二分类 MLP，输出成功访问的 logit。"""
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError("SVMDiscriminator input_dim must be > 0")
+        if depth < 1:
+            raise ValueError("SVMDiscriminator depth must be >= 1")
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+
+        layers: list[nn.Module] = []
+        in_dim = self.input_dim
+        for _ in range(self.depth):
+            layers.extend(
+                [
+                    nn.Linear(in_dim, self.hidden_dim),
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.ReLU(),
+                ]
+            )
+            in_dim = self.hidden_dim
+        layers.append(nn.Linear(in_dim, 1))
+        self.net = nn.Sequential(*layers)
+        self._init_weights()
+
+    def _init_weights(self):
+        """让初始 logit 接近 0，避免一开始过程奖励过大。"""
+        linear_layers = [module for module in self.net.modules() if isinstance(module, nn.Linear)]
+        for module in linear_layers[:-1]:
+            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+            nn.init.constant_(module.bias, 0.0)
+        last_linear = linear_layers[-1]
+        nn.init.orthogonal_(last_linear.weight, gain=0.01)
+        nn.init.constant_(last_linear.bias, 0.0)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """返回每个访问特征属于成功分布的 logit。"""
+        return self.net(features).squeeze(-1)
+
+
+class SVMReplayBuffer:
+    """分别缓存成功和失败 episode 的访问特征，用于平衡采样。"""
+
+    def __init__(
+        self,
+        max_transitions: int,
+        seed: int = 0,
+        feature_dim: int | None = None,
+        storage: str = "memory",
+        storage_dir: str | Path | None = None,
+        reset: bool = True,
+    ):
+        """初始化正负样本缓存，可选使用磁盘 memmap。"""
+        if max_transitions <= 0:
+            raise ValueError("SVMReplayBuffer max_transitions must be > 0")
+        self.max_transitions = int(max_transitions)
+        self.rng = np.random.default_rng(seed)
+        storage = str(storage).lower()
+        if storage in {"memmap", "mmap"}:
+            storage = "disk"
+        if storage in {"ram", "deque"}:
+            storage = "memory"
+        if storage not in {"memory", "disk"}:
+            raise ValueError("SVMReplayBuffer storage must be 'memory' or 'disk'")
+        self.storage = storage
+        self.feature_dim = int(feature_dim) if feature_dim is not None else None
+        self.storage_dir = Path(storage_dir) if storage_dir is not None else None
+        self.metadata_path = None
+        self._pos_count = 0
+        self._neg_count = 0
+        self._pos_write_index = 0
+        self._neg_write_index = 0
+
+        if self.storage == "memory":
+            self.positive = deque(maxlen=self.max_transitions)
+            self.negative = deque(maxlen=self.max_transitions)
+            return
+
+        if self.feature_dim is None or self.feature_dim <= 0:
+            raise ValueError("feature_dim is required when SVMReplayBuffer storage='disk'")
+        if self.storage_dir is None:
+            raise ValueError("storage_dir is required when SVMReplayBuffer storage='disk'")
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self.metadata_path = self.storage_dir / "metadata.json"
+        self.positive_path = self.storage_dir / "positive.dat"
+        self.negative_path = self.storage_dir / "negative.dat"
+
+        mode = "w+"
+        if not reset and self.metadata_path.exists() and self.positive_path.exists() and self.negative_path.exists():
+            try:
+                with open(self.metadata_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+                if (
+                    int(metadata.get("feature_dim", -1)) == self.feature_dim
+                    and int(metadata.get("max_transitions", -1)) == self.max_transitions
+                ):
+                    self._pos_count = int(metadata.get("num_positive", 0))
+                    self._neg_count = int(metadata.get("num_negative", 0))
+                    self._pos_write_index = int(metadata.get("pos_write_index", 0))
+                    self._neg_write_index = int(metadata.get("neg_write_index", 0))
+                    mode = "r+"
+            except Exception:
+                mode = "w+"
+
+        self.positive = np.memmap(
+            self.positive_path,
+            dtype=np.float32,
+            mode=mode,
+            shape=(self.max_transitions, self.feature_dim),
+        )
+        self.negative = np.memmap(
+            self.negative_path,
+            dtype=np.float32,
+            mode=mode,
+            shape=(self.max_transitions, self.feature_dim),
+        )
+        if mode == "w+":
+            self._pos_count = 0
+            self._neg_count = 0
+            self._pos_write_index = 0
+            self._neg_write_index = 0
+            self._save_metadata()
+
+    @property
+    def num_positive(self) -> int:
+        """成功访问样本数。"""
+        return len(self.positive) if self.storage == "memory" else self._pos_count
+
+    @property
+    def num_negative(self) -> int:
+        """失败访问样本数。"""
+        return len(self.negative) if self.storage == "memory" else self._neg_count
+
+    def _save_metadata(self):
+        """保存磁盘缓存的计数和写入位置。"""
+        if self.storage != "disk" or self.metadata_path is None:
+            return
+        metadata = {
+            "storage": self.storage,
+            "max_transitions": self.max_transitions,
+            "feature_dim": self.feature_dim,
+            "num_positive": self._pos_count,
+            "num_negative": self._neg_count,
+            "pos_write_index": self._pos_write_index,
+            "neg_write_index": self._neg_write_index,
+        }
+        with open(self.metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+    def _append_disk(self, feature: np.ndarray, success: bool):
+        """向磁盘环形缓存写入一个访问特征。"""
+        feature = np.asarray(feature, dtype=np.float32).reshape(-1)
+        if feature.shape[0] != self.feature_dim:
+            raise ValueError(
+                f"SVM feature dim mismatch: got {feature.shape[0]}, expected {self.feature_dim}"
+            )
+        if success:
+            self.positive[self._pos_write_index] = feature
+            self._pos_write_index = (self._pos_write_index + 1) % self.max_transitions
+            self._pos_count = min(self.max_transitions, self._pos_count + 1)
+        else:
+            self.negative[self._neg_write_index] = feature
+            self._neg_write_index = (self._neg_write_index + 1) % self.max_transitions
+            self._neg_count = min(self.max_transitions, self._neg_count + 1)
+
+    def add_episode(self, features, success: bool):
+        """把一个 episode 内的访问特征按最终标签加入缓存。"""
+        if self.storage == "disk":
+            for feature in features:
+                self._append_disk(feature, bool(success))
+            if success:
+                self.positive.flush()
+            else:
+                self.negative.flush()
+            self._save_metadata()
+            return
+
+        target = self.positive if success else self.negative
+        for feature in features:
+            target.append(np.asarray(feature, dtype=np.float32).copy())
+
+    def can_train(self, min_positive: int, min_negative: int) -> bool:
+        """检查是否已有足够正负样本训练判别器。"""
+        return self.num_positive >= int(min_positive) and self.num_negative >= int(min_negative)
+
+    def sample_balanced(self, batch_size: int):
+        """正负各采一半，返回特征和二分类标签。"""
+        if self.num_positive == 0 or self.num_negative == 0:
+            raise RuntimeError("SVMReplayBuffer needs both positive and negative samples")
+        pos_count = max(1, int(batch_size) // 2)
+        neg_count = max(1, int(batch_size) - pos_count)
+        pos_indices = self.rng.integers(0, self.num_positive, size=pos_count)
+        neg_indices = self.rng.integers(0, self.num_negative, size=neg_count)
+        if self.storage == "disk":
+            pos_features = np.asarray(self.positive[pos_indices], dtype=np.float32)
+            neg_features = np.asarray(self.negative[neg_indices], dtype=np.float32)
+        else:
+            pos_features = np.stack([self.positive[int(idx)] for idx in pos_indices], axis=0)
+            neg_features = np.stack([self.negative[int(idx)] for idx in neg_indices], axis=0)
+        features = np.concatenate([pos_features, neg_features], axis=0).astype(np.float32)
+        labels = np.concatenate(
+            [
+                np.ones(pos_count, dtype=np.float32),
+                np.zeros(neg_count, dtype=np.float32),
+            ],
+            axis=0,
+        )
+        order = self.rng.permutation(features.shape[0])
+        return features[order], labels[order]
+
+
+def svm_feature_dim(global_cond_dim: int, act_steps: int, action_dim: int, feature_mode: str) -> int:
+    """按特征模式计算 SVM 判别器输入维度。"""
+    feature_mode = str(feature_mode).lower()
+    action_chunk_dim = int(act_steps) * int(action_dim)
+    if feature_mode == "global":
+        return int(global_cond_dim)
+    if feature_mode == "global_action":
+        return int(global_cond_dim) + action_chunk_dim
+    if feature_mode in {"global_base_action", "global_base_residual"}:
+        return int(global_cond_dim) + 2 * action_chunk_dim
+    raise ValueError(
+        "svm_feature_mode must be one of "
+        "['global', 'global_action', 'global_base_action', 'global_base_residual']"
+    )
+
+
+def build_svm_features(
+    global_cond: np.ndarray,
+    base_actions: np.ndarray,
+    action_chunk: np.ndarray,
+    action_start: int,
+    action_end: int,
+    feature_mode: str,
+) -> np.ndarray:
+    """把 DP 条件、基础动作和执行动作拼成 SVM 访问特征。"""
+    feature_mode = str(feature_mode).lower()
+    n_envs = int(action_chunk.shape[0])
+    global_part = np.asarray(global_cond, dtype=np.float32).reshape(n_envs, -1)
+    if feature_mode == "global":
+        return np.ascontiguousarray(global_part, dtype=np.float32)
+
+    action_part = np.asarray(action_chunk, dtype=np.float32).reshape(n_envs, -1)
+    if feature_mode == "global_action":
+        return np.ascontiguousarray(np.concatenate([global_part, action_part], axis=-1))
+
+    base_chunk = np.asarray(
+        base_actions[:, action_start:action_end],
+        dtype=np.float32,
+    )
+    base_part = base_chunk.reshape(n_envs, -1)
+    if feature_mode == "global_base_action":
+        return np.ascontiguousarray(
+            np.concatenate([global_part, base_part, action_part], axis=-1),
+            dtype=np.float32,
+        )
+    if feature_mode == "global_base_residual":
+        residual_part = (np.asarray(action_chunk, dtype=np.float32) - base_chunk).reshape(n_envs, -1)
+        return np.ascontiguousarray(
+            np.concatenate([global_part, base_part, residual_part], axis=-1),
+            dtype=np.float32,
+        )
+    raise ValueError(f"Unknown svm_feature_mode={feature_mode!r}")
+
+
+@torch.no_grad()
+def compute_svm_process_reward(
+    discriminator: SVMDiscriminator,
+    features: np.ndarray,
+    device,
+    coef: float,
+    reward_clip: float,
+) -> np.ndarray:
+    """用判别器 logit 计算 SVM 过程奖励。"""
+    feature_tensor = torch.from_numpy(np.ascontiguousarray(features)).float().to(device)
+    logits = discriminator(feature_tensor)
+    clipped_logits = torch.clamp(logits, min=-float(reward_clip), max=float(reward_clip))
+    return (float(coef) * clipped_logits).detach().cpu().numpy().astype(np.float32)
+
+
+def train_svm_discriminator(
+    discriminator: SVMDiscriminator,
+    replay_buffer: SVMReplayBuffer,
+    optimizer: torch.optim.Optimizer,
+    device,
+    batch_size: int,
+    updates: int,
+):
+    """用成功/失败访问样本训练 SVM 判别器。"""
+    if updates <= 0:
+        return {"loss": float("nan"), "acc": float("nan"), "updates": 0}
+
+    discriminator.train()
+    losses = []
+    accuracies = []
+    for _ in range(int(updates)):
+        features_np, labels_np = replay_buffer.sample_balanced(batch_size)
+        features = torch.from_numpy(features_np).float().to(device)
+        labels = torch.from_numpy(labels_np).float().to(device)
+        logits = discriminator(features)
+        loss = F.binary_cross_entropy_with_logits(logits, labels)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
+        optimizer.step()
+
+        with torch.no_grad():
+            predictions = (torch.sigmoid(logits) >= 0.5).float()
+            accuracy = (predictions == labels).float().mean()
+        losses.append(float(loss.item()))
+        accuracies.append(float(accuracy.item()))
+
+    return {
+        "loss": float(np.mean(losses)) if losses else float("nan"),
+        "acc": float(np.mean(accuracies)) if accuracies else float("nan"),
+        "updates": int(updates),
+    }
+
+
 def log_box(title: str, rows: list[tuple[str, object]], width: int = 78):
     """用统一盒状格式写日志。"""
     key_width = max([len(str(key)) for key, _ in rows] + [0])
@@ -199,13 +523,14 @@ def maybe_quiet_eval_progress(enabled: bool):
 
 
 class ResidualActionMLP(nn.Module):
-    """针对一个动作切片预测残差。"""
+    """针对一个动作切片预测残差，可选接入全局条件。"""
 
     def __init__(
         self,
         action_dim: int,
         hidden_dim: int = 256,
         depth: int = 2,
+        extra_dim: int = 0,
     ):
         """构建零初始化输出层的残差 MLP。"""
         super().__init__()
@@ -213,9 +538,13 @@ class ResidualActionMLP(nn.Module):
             raise ValueError("ResidualActionMLP action_dim must be > 0")
         if depth < 1:
             raise ValueError("ResidualActionMLP depth must be >= 1")
+        if extra_dim < 0:
+            raise ValueError("ResidualActionMLP extra_dim must be >= 0")
 
+        self.action_dim = int(action_dim)
+        self.extra_dim = int(extra_dim)
         layers: list[nn.Module] = []
-        in_dim = action_dim
+        in_dim = action_dim + self.extra_dim
         for _ in range(depth):
             layers.extend(
                 [
@@ -240,19 +569,32 @@ class ResidualActionMLP(nn.Module):
         nn.init.zeros_(last_linear.weight)
         nn.init.zeros_(last_linear.bias)
 
-    def forward(self, actions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        actions: torch.Tensor,
+        global_cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """按最后一维动作切片输出同形状残差。"""
         orig_shape = actions.shape
-        flat_actions = actions.reshape(-1, orig_shape[-1])
-        return self.net(flat_actions).reshape(orig_shape)
+        mlp_input = actions
+        if self.extra_dim > 0:
+            if global_cond is None:
+                raise ValueError("global_cond is required when ResidualActionMLP extra_dim > 0")
+            cond = global_cond
+            while cond.dim() < actions.dim():
+                cond = cond.unsqueeze(1)
+            cond = cond.expand(*orig_shape[:-1], cond.shape[-1])
+            mlp_input = torch.cat([actions, cond], dim=-1)
+        flat_input = mlp_input.reshape(-1, mlp_input.shape[-1])
+        return self.net(flat_input).reshape(*orig_shape[:-1], self.action_dim)
 
 
 class FrozenDiffusionMLPPolicy(nn.Module):
     """
-    冻结预训练 Diffusion，并用两个 residual MLP 调整动作切片。
+    冻结预训练 Diffusion，并用 residual MLP 调整动作。
 
-    Diffusion 先输出完整动作块，MLP_arm 调整左右双臂动作，
-    MLP_cam 调整主动视觉臂动作；PPO 只更新这两个 MLP 和动作方差。
+    split 模式使用 MLP_arm/MLP_cam 分别调整动作切片；joint 模式使用单个
+    20 维 MLP 同时调整完整动作。PPO 只更新 residual MLP 和动作方差。
     """
 
     def __init__(
@@ -274,8 +616,16 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         cam_hidden_dim: int | None = None,
         arm_depth: int | None = None,
         cam_depth: int | None = None,
+        max_delta: float = 0.0,
+        residual_mode: str = "split",
+        lambda_all: float = 1.0,
+        all_hidden_dim: int | None = None,
+        all_depth: int | None = None,
+        global_cond_dim: int = 0,
+        residual_condition: str = "action",
+        residual_stepwise_obs: bool = False,
     ):
-        """初始化冻结 DP 和两个可训练 residual MLP。"""
+        """初始化冻结 DP 和可训练 residual MLP。"""
         super().__init__()
         self.base_policy = base_policy
         self.config = base_policy.config
@@ -287,6 +637,30 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         self.residual_mlp_hidden_dim = hidden_dim
         self.residual_mlp_depth = depth
         self.residual_mlp_learn_std = learn_std
+        residual_mode = str(residual_mode).lower()
+        if residual_mode in {"all", "single", "joint"}:
+            residual_mode = "joint"
+        elif residual_mode in {"split", "dual", "separate"}:
+            residual_mode = "split"
+        else:
+            raise ValueError("residual_mode must be 'joint' or 'split'")
+        self.residual_mlp_mode = residual_mode
+        residual_condition = str(residual_condition).lower()
+        if residual_condition in {"none", "action", "base_action"}:
+            residual_condition = "action"
+        elif residual_condition in {"global", "global_cond", "obs", "condition"}:
+            residual_condition = "global_cond"
+        else:
+            raise ValueError("residual_condition must be 'action' or 'global_cond'")
+        self.residual_mlp_condition = residual_condition
+        self.residual_mlp_stepwise_obs = bool(residual_stepwise_obs)
+        self.residual_global_cond_dim = (
+            int(global_cond_dim) if self.residual_mlp_condition == "global_cond" else 0
+        )
+        if self.residual_global_cond_dim < 0:
+            raise ValueError("global_cond_dim must be >= 0")
+        if self.residual_mlp_condition == "global_cond" and self.residual_global_cond_dim == 0:
+            raise ValueError("global_cond_dim must be > 0 when residual_condition is 'global_cond'")
 
         default_arm_indices = list(range(min(14, action_dim)))
         default_cam_indices = list(range(14, action_dim)) if action_dim > 14 else []
@@ -306,17 +680,32 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         )
         self.lambda_arm = float(lambda_arm)
         self.lambda_cam = float(lambda_cam)
+        self.lambda_all = float(lambda_all)
+        self.all_hidden_dim = int(all_hidden_dim if all_hidden_dim is not None else hidden_dim)
+        self.all_depth = int(all_depth if all_depth is not None else depth)
         self.arm_hidden_dim = int(arm_hidden_dim if arm_hidden_dim is not None else hidden_dim)
         self.cam_hidden_dim = int(cam_hidden_dim if cam_hidden_dim is not None else hidden_dim)
         self.arm_depth = int(arm_depth if arm_depth is not None else depth)
         self.cam_depth = int(cam_depth if cam_depth is not None else depth)
+        self.residual_mlp_max_delta = float(max_delta)
+        self.mlp_all = (
+            ResidualActionMLP(
+                action_dim=action_dim,
+                hidden_dim=self.all_hidden_dim,
+                depth=self.all_depth,
+                extra_dim=self.residual_global_cond_dim,
+            )
+            if self.residual_mlp_mode == "joint"
+            else nn.Identity()
+        )
         self.mlp_arm = (
             ResidualActionMLP(
                 action_dim=len(self.arm_action_indices),
                 hidden_dim=self.arm_hidden_dim,
                 depth=self.arm_depth,
+                extra_dim=self.residual_global_cond_dim,
             )
-            if self.arm_action_indices
+            if self.residual_mlp_mode == "split" and self.arm_action_indices
             else nn.Identity()
         )
         self.mlp_cam = (
@@ -324,8 +713,9 @@ class FrozenDiffusionMLPPolicy(nn.Module):
                 action_dim=len(self.cam_action_indices),
                 hidden_dim=self.cam_hidden_dim,
                 depth=self.cam_depth,
+                extra_dim=self.residual_global_cond_dim,
             )
-            if self.cam_action_indices
+            if self.residual_mlp_mode == "split" and self.cam_action_indices
             else nn.Identity()
         )
 
@@ -447,20 +837,45 @@ class FrozenDiffusionMLPPolicy(nn.Module):
             return_global_cond=return_global_cond,
         )
 
-    def mean_actions(self, base_actions: torch.Tensor) -> torch.Tensor:
-        """把两个 residual MLP 的输出加回 DP 动作。"""
+    def mean_actions(
+        self,
+        base_actions: torch.Tensor,
+        global_cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """把 residual MLP 的输出加回 DP 动作。"""
+        if self.residual_mlp_mode == "joint":
+            delta_all = self.limit_residual_delta(
+                self.mlp_all(base_actions, global_cond=global_cond)
+            )
+            return base_actions + self.lambda_all * delta_all
+
         mean_actions = base_actions.clone()
         if self.arm_action_indices:
             arm_idx = self._arm_action_index_tensor.to(base_actions.device)
             arm_base = base_actions.index_select(-1, arm_idx)
-            delta_arm = self.mlp_arm(arm_base)
+            delta_arm = self.limit_residual_delta(
+                self.mlp_arm(arm_base, global_cond=global_cond)
+            )
             mean_actions[..., arm_idx] = arm_base + self.lambda_arm * delta_arm
         if self.cam_action_indices:
             cam_idx = self._cam_action_index_tensor.to(base_actions.device)
             cam_base = base_actions.index_select(-1, cam_idx)
-            delta_cam = self.mlp_cam(cam_base)
+            delta_cam = self.limit_residual_delta(
+                self.mlp_cam(cam_base, global_cond=global_cond)
+            )
             mean_actions[..., cam_idx] = cam_base + self.lambda_cam * delta_cam
         return mean_actions
+
+    def limit_residual_delta(self, delta: torch.Tensor) -> torch.Tensor:
+        """用平滑限幅约束 residual，防止 MLP 逐轮偏离冻结 Diffusion。"""
+        if self.residual_mlp_max_delta <= 0.0:
+            return delta
+        max_delta = torch.as_tensor(
+            self.residual_mlp_max_delta,
+            dtype=delta.dtype,
+            device=delta.device,
+        )
+        return torch.tanh(delta / max_delta) * max_delta
 
     def sample_from_mean(self, mean_actions: torch.Tensor, deterministic: bool):
         """从 residual 后的动作均值采样 PPO 动作。"""
@@ -500,9 +915,10 @@ class FrozenDiffusionMLPPolicy(nn.Module):
         self,
         base_actions: torch.Tensor,
         executed_actions: torch.Tensor,
+        global_cond: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """从 DP 基础动作重算 residual 均值并求 log_prob。"""
-        mean_actions = self.mean_actions(base_actions)
+        mean_actions = self.mean_actions(base_actions, global_cond=global_cond)
         return self.log_prob_from_mean(mean_actions, executed_actions)
 
     def forward_history(
@@ -513,7 +929,7 @@ class FrozenDiffusionMLPPolicy(nn.Module):
     ):
         """完整前向：冻结 DP 生成动作，residual MLP 修正并采样。"""
         base_actions, global_cond = self.frozen_diffusion_actions(cond, return_global_cond=True)
-        mean_actions = self.mean_actions(base_actions)
+        mean_actions = self.mean_actions(base_actions, global_cond=global_cond)
         actions, log_probs = self.sample_from_mean(mean_actions, deterministic=deterministic)
         result = {
             "base_actions": base_actions,
@@ -537,18 +953,42 @@ class FrozenDiffusionMLPPolicy(nn.Module):
             )
 
         self._queues = populate_queues(self._queues, batch)
+        latest_global_cond = None
         if len(self._queues["action"]) == 0:
             history_batch = {
                 k: torch.stack(list(self._queues[k]), dim=1)
                 for k in batch
                 if k in self._queues
             }
-            base_actions = self.frozen_diffusion_actions_from_normalized_batch(history_batch)
-            mean_actions = self.mean_actions(base_actions)
-            action_chunk = mean_actions[:, self.action_start:self.action_end]
+            base_actions, global_cond = self.frozen_diffusion_actions_from_normalized_batch(
+                history_batch,
+                return_global_cond=True,
+            )
+            if self.residual_mlp_stepwise_obs:
+                action_chunk = base_actions[:, self.action_start:self.action_end]
+                latest_global_cond = global_cond
+            else:
+                mean_actions = self.mean_actions(base_actions, global_cond=global_cond)
+                action_chunk = mean_actions[:, self.action_start:self.action_end]
             self._queues["action"].extend(action_chunk.transpose(0, 1))
 
-        return self._queues["action"].popleft()
+        queued_action = self._queues["action"].popleft()
+        if not self.residual_mlp_stepwise_obs:
+            return queued_action
+
+        if latest_global_cond is None:
+            history_batch = {
+                k: torch.stack(list(self._queues[k]), dim=1)
+                for k in batch
+                if k in self._queues
+            }
+            latest_global_cond = self.base_policy.diffusion._prepare_global_conditioning(
+                history_batch
+            )
+        return self.mean_actions(
+            queued_action.unsqueeze(1),
+            global_cond=latest_global_cond,
+        ).squeeze(1)
 
     def save_pretrained(self, save_directory: str | Path):
         """保存冻结 DP 权重引用和 residual MLP 状态。"""
@@ -564,16 +1004,25 @@ class FrozenDiffusionMLPPolicy(nn.Module):
             "hidden_dim": self.residual_mlp_hidden_dim,
             "depth": self.residual_mlp_depth,
             "learn_std": self.residual_mlp_learn_std,
+            "residual_mlp_mode": self.residual_mlp_mode,
+            "residual_mlp_condition": self.residual_mlp_condition,
+            "residual_mlp_stepwise_obs": self.residual_mlp_stepwise_obs,
+            "global_cond_dim": self.residual_global_cond_dim,
+            "mlp_all": self.mlp_all.state_dict(),
             "mlp_arm": self.mlp_arm.state_dict(),
             "mlp_cam": self.mlp_cam.state_dict(),
             "arm_action_indices": self.arm_action_indices,
             "cam_action_indices": self.cam_action_indices,
+            "lambda_all": self.lambda_all,
             "lambda_arm": self.lambda_arm,
             "lambda_cam": self.lambda_cam,
+            "all_hidden_dim": self.all_hidden_dim,
+            "all_depth": self.all_depth,
             "arm_hidden_dim": self.arm_hidden_dim,
             "cam_hidden_dim": self.cam_hidden_dim,
             "arm_depth": self.arm_depth,
             "cam_depth": self.cam_depth,
+            "max_delta": self.residual_mlp_max_delta,
         }
         torch.save(adapter_state, save_directory / "residual_mlp.pt")
         adapter_config = {
@@ -585,14 +1034,22 @@ class FrozenDiffusionMLPPolicy(nn.Module):
             "hidden_dim": self.residual_mlp_hidden_dim,
             "depth": self.residual_mlp_depth,
             "learn_std": self.residual_mlp_learn_std,
+            "residual_mlp_mode": self.residual_mlp_mode,
+            "residual_mlp_condition": self.residual_mlp_condition,
+            "residual_mlp_stepwise_obs": self.residual_mlp_stepwise_obs,
+            "global_cond_dim": self.residual_global_cond_dim,
             "arm_action_indices": self.arm_action_indices,
             "cam_action_indices": self.cam_action_indices,
+            "lambda_all": self.lambda_all,
             "lambda_arm": self.lambda_arm,
             "lambda_cam": self.lambda_cam,
+            "all_hidden_dim": self.all_hidden_dim,
+            "all_depth": self.all_depth,
             "arm_hidden_dim": self.arm_hidden_dim,
             "cam_hidden_dim": self.cam_hidden_dim,
             "arm_depth": self.arm_depth,
             "cam_depth": self.cam_depth,
+            "max_delta": self.residual_mlp_max_delta,
         }
         with open(save_directory / "residual_mlp_config.json", "w", encoding="utf-8") as f:
             json.dump(adapter_config, f, indent=2, ensure_ascii=False)
@@ -714,6 +1171,31 @@ def info_success_mask(info, done_mask, n_envs):
     return success & done_mask
 
 
+def success_label_chunk_rewards(
+    done_mask,
+    success_mask,
+    success_reward: float,
+    failure_reward: float,
+    nonterminal_reward: float,
+    success_time_bonus: float = 0.0,
+    episode_steps=None,
+    max_episode_steps: int = 0,
+):
+    """把 success/fail 标签转换成当前 action chunk 的训练 reward，可选成功时间引导。"""
+    done_mask = np.asarray(done_mask, dtype=bool)
+    success_mask = np.asarray(success_mask, dtype=bool)
+    rewards = np.full(done_mask.shape, float(nonterminal_reward), dtype=np.float32)
+    rewards[done_mask] = float(failure_reward)
+    success_done = done_mask & success_mask
+    rewards[success_done] = float(success_reward)
+    if success_time_bonus > 0.0 and max_episode_steps > 0 and episode_steps is not None:
+        elapsed = np.asarray(episode_steps, dtype=np.float32)
+        time_fraction = np.clip(elapsed / float(max_episode_steps), 0.0, 1.0)
+        bonus = float(success_time_bonus) * (1.0 - time_fraction)
+        rewards[success_done] = float(success_reward) + bonus[success_done]
+    return rewards
+
+
 def build_history_batch(stacked_raw_obs, policy, device):
     """把 numpy 历史观测转为 policy 输入 tensor。"""
     batch_obs = {}
@@ -801,16 +1283,23 @@ def snapshot_trainable_state(policy: FrozenDiffusionMLPPolicy):
     """拷贝 residual MLP 和动作方差状态。"""
     state = {
         "log_std": policy.log_std.detach().cpu().clone(),
-        "mlp_arm": copy.deepcopy(policy.mlp_arm.state_dict()),
-        "mlp_cam": copy.deepcopy(policy.mlp_cam.state_dict()),
+        "residual_mlp_mode": policy.residual_mlp_mode,
     }
+    if policy.residual_mlp_mode == "joint":
+        state["mlp_all"] = copy.deepcopy(policy.mlp_all.state_dict())
+    else:
+        state["mlp_arm"] = copy.deepcopy(policy.mlp_arm.state_dict())
+        state["mlp_cam"] = copy.deepcopy(policy.mlp_cam.state_dict())
     return state
 
 
 def restore_trainable_state(policy: FrozenDiffusionMLPPolicy, state, device):
     """恢复 residual MLP 和动作方差状态。"""
-    policy.mlp_arm.load_state_dict(state["mlp_arm"], strict=True)
-    policy.mlp_cam.load_state_dict(state["mlp_cam"], strict=True)
+    if policy.residual_mlp_mode == "joint":
+        policy.mlp_all.load_state_dict(state["mlp_all"], strict=True)
+    else:
+        policy.mlp_arm.load_state_dict(state["mlp_arm"], strict=True)
+        policy.mlp_cam.load_state_dict(state["mlp_cam"], strict=True)
     with torch.no_grad():
         policy.log_std.copy_(state["log_std"].to(device))
     policy.to(device)
@@ -890,8 +1379,27 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
     )
     lambda_arm = float(getattr(cfg.training, "lambda_arm", 1.0))
     lambda_cam = float(getattr(cfg.training, "lambda_cam", 1.0))
+    lambda_all = float(getattr(cfg.training, "lambda_all", 1.0))
+    residual_mlp_mode = str(getattr(cfg.training, "residual_mlp_mode", "split")).lower()
+    residual_mlp_condition = str(
+        getattr(cfg.training, "residual_mlp_condition", "action")
+    ).lower()
+    residual_mlp_stepwise_obs = bool(
+        getattr(cfg.training, "residual_mlp_stepwise_obs", False)
+    )
+    ppo_control_step_training = bool(
+        getattr(cfg.training, "ppo_control_step_training", residual_mlp_stepwise_obs)
+    )
+    if ppo_control_step_training and not residual_mlp_stepwise_obs:
+        raise ValueError(
+            "training.ppo_control_step_training=true requires "
+            "training.residual_mlp_stepwise_obs=true"
+        )
+    residual_max_delta = float(getattr(cfg.training, "residual_mlp_max_delta", 0.0))
+    all_hidden_dim = int(getattr(cfg.training, "residual_mlp_all_hidden_dim", residual_hidden_dim))
     arm_hidden_dim = int(getattr(cfg.training, "residual_mlp_arm_hidden_dim", residual_hidden_dim))
     cam_hidden_dim = int(getattr(cfg.training, "residual_mlp_cam_hidden_dim", residual_hidden_dim))
+    all_depth = int(getattr(cfg.training, "residual_mlp_all_depth", residual_depth))
     arm_depth = int(getattr(cfg.training, "residual_mlp_arm_depth", residual_depth))
     cam_depth = int(getattr(cfg.training, "residual_mlp_cam_depth", residual_depth))
 
@@ -920,18 +1428,19 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
         render_cams = [render_cams]
     else:
         render_cams = list(render_cams)
-    obs_cameras = list(dict.fromkeys(ref_cams + render_cams))
+    train_cameras = list(dict.fromkeys(ref_cams))
+    eval_cameras = list(dict.fromkeys(ref_cams + render_cams))
 
     if n_envs > 1:
         env = gym.vector.AsyncVectorEnv(
-            [lambda: gym.make(id=env_id, cameras=obs_cameras) for _ in range(n_envs)],
+            [lambda: gym.make(id=env_id, cameras=train_cameras) for _ in range(n_envs)],
             shared_memory=True,
             context="spawn",
             autoreset_mode="SameStep",
         )
     else:
-        env = gym.make(id=env_id, cameras=obs_cameras)
-    eval_env = gym.make(id=env_id, cameras=obs_cameras)
+        env = gym.make(id=env_id, cameras=train_cameras)
+    eval_env = gym.make(id=env_id, cameras=eval_cameras)
 
     with maybe_suppress_stdout(quiet_terminal):
         global_cond_dim = infer_global_cond_dim(base_policy, device)
@@ -955,6 +1464,14 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
         cam_hidden_dim=cam_hidden_dim,
         arm_depth=arm_depth,
         cam_depth=cam_depth,
+        max_delta=residual_max_delta,
+        residual_mode=residual_mlp_mode,
+        lambda_all=lambda_all,
+        all_hidden_dim=all_hidden_dim,
+        all_depth=all_depth,
+        global_cond_dim=global_cond_dim,
+        residual_condition=residual_mlp_condition,
+        residual_stepwise_obs=residual_mlp_stepwise_obs,
     ).to(device)
     policy.freeze_base_policy()
 
@@ -976,11 +1493,14 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
     )
 
     max_checkpoints = int(getattr(cfg.eval, "max_checkpoints", 5))
+    checkpoint_metric = str(getattr(cfg.eval, "checkpoint_metric", "reward")).lower()
+    success_metric_names = {"success", "success_rate", "sr"}
+    manager_metric = "reward" if checkpoint_metric in success_metric_names else checkpoint_metric
     manager = TopKCheckpointManager(
         out_dir=out_dir,
         max_keep=max_checkpoints,
         records_resume=bool(getattr(cfg.eval, "records_resume", True)),
-        metric=str(getattr(cfg.eval, "checkpoint_metric", "reward")),
+        metric=manager_metric,
     )
 
     n_steps = int(getattr(cfg.training, "rollout_steps", 300))
@@ -1002,21 +1522,102 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
     update_actor = bool(getattr(cfg.training, "update_actor", True))
     grad_accum_steps = max(1, int(getattr(cfg.training, "grad_accumulate", 1)))
     show_progress = bool(getattr(cfg.training, "show_progress", False))
+    rollout_progress = bool(getattr(cfg.training, "rollout_progress", show_progress))
+    rollout_log_interval = max(0, int(getattr(cfg.training, "rollout_log_interval", 100)))
+    training_progress = bool(getattr(cfg.training, "training_progress", show_progress))
+    training_log_interval = max(0, int(getattr(cfg.training, "training_log_interval", 100)))
+    reward_source = str(getattr(cfg.training, "reward_source", "env")).lower()
+    valid_reward_sources = {"env", "success_label"}
+    if reward_source not in valid_reward_sources:
+        raise ValueError(
+            f"training.reward_source must be one of {sorted(valid_reward_sources)}, "
+            f"got {reward_source!r}"
+        )
+    label_success_reward = float(getattr(cfg.training, "success_label_success_reward", 1.0))
+    label_failure_reward = float(getattr(cfg.training, "success_label_failure_reward", -1.0))
+    label_nonterminal_reward = float(getattr(cfg.training, "success_label_nonterminal_reward", 0.0))
+    success_time_bonus = float(getattr(cfg.training, "success_time_bonus", 0.0))
+    success_time_max_steps = int(
+        getattr(cfg.training, "success_time_max_steps", getattr(cfg.eval, "max_steps", 0))
+    )
+    bootstrap_on_truncation = bool(
+        getattr(cfg.training, "bootstrap_on_truncation", reward_source == "env")
+    )
+    svm_reward_enable = bool(getattr(cfg.training, "svm_reward_enable", False))
+    svm_feature_mode = str(
+        getattr(cfg.training, "svm_feature_mode", "global_base_residual")
+    ).lower()
+    svm_reward_coef = float(getattr(cfg.training, "svm_reward_coef", 0.05))
+    svm_reward_clip = float(getattr(cfg.training, "svm_reward_clip", 5.0))
+    svm_disc_hidden_dim = int(getattr(cfg.training, "svm_disc_hidden_dim", 256))
+    svm_disc_depth = int(getattr(cfg.training, "svm_disc_depth", 3))
+    svm_disc_lr = float(getattr(cfg.training, "svm_disc_lr", 1e-4))
+    svm_disc_weight_decay = float(getattr(cfg.training, "svm_disc_weight_decay", 0.0))
+    svm_disc_batch_size = int(getattr(cfg.training, "svm_disc_batch_size", 64))
+    svm_disc_updates = int(getattr(cfg.training, "svm_disc_updates", 32))
+    svm_buffer_max_transitions = int(getattr(cfg.training, "svm_buffer_max_transitions", 50000))
+    svm_buffer_storage = str(getattr(cfg.training, "svm_buffer_storage", "disk")).lower()
+    svm_buffer_dir = Path(str(getattr(cfg.training, "svm_buffer_dir", "outputs/buffer")))
+    if not svm_buffer_dir.is_absolute():
+        svm_buffer_dir = Path(ROOT_DIR) / svm_buffer_dir
+    svm_buffer_reset = bool(getattr(cfg.training, "svm_buffer_reset", True))
+    svm_min_positive = int(getattr(cfg.training, "svm_min_positive", 256))
+    svm_min_negative = int(getattr(cfg.training, "svm_min_negative", 256))
+    svm_feature_steps = 1 if ppo_control_step_training else act_steps
+    svm_input_dim = svm_feature_dim(
+        global_cond_dim=global_cond_dim,
+        act_steps=svm_feature_steps,
+        action_dim=action_dim,
+        feature_mode=svm_feature_mode,
+    )
+    svm_discriminator = None
+    svm_optimizer = None
+    svm_replay_buffer = None
+    svm_reward_ready = False
+    svm_last_stats = {"loss": float("nan"), "acc": float("nan"), "updates": 0}
+    if svm_reward_enable:
+        svm_discriminator = SVMDiscriminator(
+            input_dim=svm_input_dim,
+            hidden_dim=svm_disc_hidden_dim,
+            depth=svm_disc_depth,
+        ).to(device)
+        svm_optimizer = torch.optim.AdamW(
+            svm_discriminator.parameters(),
+            lr=svm_disc_lr,
+            weight_decay=svm_disc_weight_decay,
+        )
+        svm_replay_buffer = SVMReplayBuffer(
+            max_transitions=svm_buffer_max_transitions,
+            seed=int(cfg.seed),
+            feature_dim=svm_input_dim,
+            storage=svm_buffer_storage,
+            storage_dir=svm_buffer_dir,
+            reset=svm_buffer_reset,
+        )
 
     log_box(
         "Run Setup",
         [
             ("env", env_id),
-            ("cameras", obs_cameras),
+            ("train_cameras", train_cameras),
+            ("eval_cameras", eval_cameras),
             ("checkpoint", load_dir),
             ("action_dim", action_dim),
             ("horizon", horizon_steps),
             ("action_slice", f"[{action_start}:{action_end}]"),
+            ("residual_mode", policy.residual_mlp_mode),
+            ("residual_condition", policy.residual_mlp_condition),
+            ("residual_stepwise_obs", residual_mlp_stepwise_obs),
+            ("ppo_control_step_training", ppo_control_step_training),
+            ("global_cond_dim", policy.residual_global_cond_dim),
             ("arm_indices", arm_action_indices),
             ("cam_indices", cam_action_indices),
+            ("lambda_all", f"{lambda_all:.3f}"),
             ("lambda_arm/cam", f"{lambda_arm:.3f} / {lambda_cam:.3f}"),
+            ("residual_max_delta", residual_max_delta),
             ("n_envs", n_envs),
             ("rollout_steps", n_steps),
+            ("rollout_env_steps", n_steps * act_steps * n_envs),
             ("batch_size", batch_size),
             ("update_epochs", update_epochs),
             ("critic_warmup", critic_warmup_iters),
@@ -1024,9 +1625,28 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
             ("critic_lr", f"{float(getattr(cfg.training, 'critic_lr', 3e-4)):.3e}"),
             ("clip_ratio", clip_ratio),
             ("target_kl", target_kl),
+            ("reward_source", reward_source),
+            ("success/fail reward", f"{label_success_reward:.2f} / {label_failure_reward:.2f}"),
+            ("nonterminal reward", f"{label_nonterminal_reward:.2f}"),
+            ("success_time_bonus", success_time_bonus),
+            ("success_time_max_steps", success_time_max_steps),
+            ("bootstrap_on_truncation", bootstrap_on_truncation),
+            ("svm_reward_enable", svm_reward_enable),
+            ("svm_feature_mode", svm_feature_mode),
+            ("svm_feature_steps", svm_feature_steps if svm_reward_enable else "disabled"),
+            ("svm_reward_coef/clip", f"{svm_reward_coef:.3f} / {svm_reward_clip:.2f}"),
+            ("svm_buffer_storage", svm_buffer_storage if svm_reward_enable else "disabled"),
+            ("svm_buffer_dir", str(svm_buffer_dir) if svm_reward_enable else "disabled"),
+            ("svm_buffer_reset", svm_buffer_reset if svm_reward_enable else "disabled"),
+            ("svm_min_pos/neg", f"{svm_min_positive} / {svm_min_negative}"),
+            ("checkpoint_metric", checkpoint_metric),
             ("reward_scale_running", reward_scale_running),
             ("reward_scale_const", reward_scale_const),
             ("progress_bars", show_progress),
+            ("rollout_progress", rollout_progress),
+            ("rollout_log_interval", rollout_log_interval),
+            ("training_progress", training_progress),
+            ("training_log_interval", training_log_interval),
             ("quiet_terminal", quiet_terminal),
         ],
     )
@@ -1036,6 +1656,9 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
             ("frozen_diffusion", f"{sum(p.numel() for p in base_policy.parameters()) / 1e6:.2f}M"),
             ("trainable_residual_mlp", f"{sum(p.numel() for p in policy.adapter_parameters()) / 1e6:.2f}M"),
             ("critic", f"{sum(p.numel() for p in critic.parameters()) / 1e6:.2f}M"),
+            ("svm_discriminator", f"{sum(p.numel() for p in svm_discriminator.parameters()) / 1e6:.2f}M" if svm_discriminator is not None else "disabled"),
+            ("svm_input_dim", svm_input_dim if svm_reward_enable else "disabled"),
+            ("all_mlp", f"mode={policy.residual_mlp_mode}, cond={policy.residual_mlp_condition}, dim={policy.action_dim}, hidden={policy.all_hidden_dim}, depth={policy.all_depth}"),
             ("arm_mlp", f"dim={len(policy.arm_action_indices)}, hidden={policy.arm_hidden_dim}, depth={policy.arm_depth}"),
             ("cam_mlp", f"dim={len(policy.cam_action_indices)}, hidden={policy.cam_hidden_dim}, depth={policy.cam_depth}"),
             ("action_std", f"{float(policy.action_std.mean().detach().cpu().item()):.5f}"),
@@ -1047,10 +1670,14 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
     raw_obs_queue = {key: deque(maxlen=n_obs_steps) for key in prev_obs.keys()}
     reset_full_obs_queue(raw_obs_queue, prev_obs, n_obs_steps)
 
-    running_ep_rewards = np.zeros(n_envs, dtype=np.float32)
+    running_ep_train_rewards = np.zeros(n_envs, dtype=np.float32)
+    running_ep_env_rewards = np.zeros(n_envs, dtype=np.float32)
+    running_ep_steps = np.zeros(n_envs, dtype=np.int32)
+    svm_episode_features = [[] for _ in range(n_envs)]
     running_reward_scaler = RunningRewardScaler(n_envs, gamma=gamma)
     next_chunk_firsts = np.ones(n_envs, dtype=np.float32)
     best_policy_state = snapshot_trainable_state(policy)
+    best_eval_score = float("-inf")
     best_eval_reward = float("-inf")
     best_eval_success_rate = 0.0
     eval_collapse_count = 0
@@ -1083,6 +1710,16 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 mode="w+",
                 shape=(n_steps, n_envs, act_steps, action_dim),
             )
+            global_cond_step_trajs = (
+                np.memmap(
+                    os.path.join(buffer_path, "global_cond_step_trajs.npy"),
+                    dtype=np.float32,
+                    mode="w+",
+                    shape=(n_steps, n_envs, act_steps, global_cond_dim),
+                )
+                if residual_mlp_stepwise_obs
+                else None
+            )
         else:
             temp_buffer_dir = None
             buffer_path = None
@@ -1091,24 +1728,46 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 dtype=np.float32,
             )
             action_trajs = np.zeros((n_steps, n_envs, act_steps, action_dim), dtype=np.float32)
+            global_cond_step_trajs = (
+                np.zeros(
+                    (n_steps, n_envs, act_steps, global_cond_dim),
+                    dtype=np.float32,
+                )
+                if residual_mlp_stepwise_obs
+                else None
+            )
 
-        old_logprob_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
-        reward_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
-        terminated_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
-        firsts_trajs = np.zeros((n_steps + 1, n_envs), dtype=np.float32)
-        firsts_trajs[0] = next_chunk_firsts
-        completed_ep_rewards = []
+        if ppo_control_step_training:
+            old_logprob_trajs = np.zeros((n_steps, n_envs, act_steps), dtype=np.float32)
+            reward_trajs = np.zeros((n_steps, n_envs, act_steps), dtype=np.float32)
+            terminated_trajs = np.zeros((n_steps, n_envs, act_steps), dtype=np.float32)
+            firsts_trajs = np.zeros((n_steps, n_envs, act_steps), dtype=np.float32)
+            valid_step_trajs = np.zeros((n_steps, n_envs, act_steps), dtype=bool)
+            chunk_start_firsts = next_chunk_firsts.copy()
+        else:
+            old_logprob_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
+            reward_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
+            terminated_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
+            firsts_trajs = np.zeros((n_steps + 1, n_envs), dtype=np.float32)
+            firsts_trajs[0] = next_chunk_firsts
+            valid_step_trajs = None
+        completed_ep_train_rewards = []
+        completed_ep_env_rewards = []
         completed_ep_successes = []
+        completed_ep_steps = []
+        svm_rollout_rewards = []
 
         policy.eval()
         logging.info("Rollout | collecting frozen Diffusion + stochastic MLP actions")
-        for step in tqdm(
+        rollout_bar = tqdm(
             range(n_steps),
             desc=f"Rollout {itr + 1:04d}",
-            leave=False,
+            leave=rollout_progress,
             dynamic_ncols=True,
-            disable=not show_progress,
-        ):
+            mininterval=1.0,
+            disable=not rollout_progress,
+        )
+        for step in rollout_bar:
             stacked_raw_obs = stack_obs_queue(raw_obs_queue, n_envs, n_obs_steps)
             if obs_trajs is None:
                 obs_trajs = {}
@@ -1127,24 +1786,130 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
             batch_obs = build_history_batch(stacked_raw_obs, policy, device)
             with torch.no_grad():
                 with maybe_suppress_stdout(quiet_terminal):
-                    samples = policy.forward_history(
-                        cond=batch_obs,
-                        deterministic=False,
-                        return_global_cond=False,
-                    )
-                output_venv = samples["actions"].cpu().numpy()
-                base_venv = samples["base_actions"].cpu().numpy()
-                old_logprob_venv = samples["log_probs"].cpu().numpy()
+                    if residual_mlp_stepwise_obs:
+                        base_actions_t, initial_global_cond_t = policy.frozen_diffusion_actions(
+                            batch_obs,
+                            return_global_cond=True,
+                        )
+                        base_venv = base_actions_t.cpu().numpy()
+                        output_venv = base_venv.copy()
+                        old_logprob_steps = np.zeros((act_steps, n_envs), dtype=np.float32)
+                        step_global_cond_venv = np.zeros(
+                            (n_envs, act_steps, global_cond_dim),
+                            dtype=np.float32,
+                        )
+                        global_cond_venv = (
+                            initial_global_cond_t.detach().cpu().numpy()
+                            if svm_reward_enable
+                            else None
+                        )
+                    else:
+                        samples = policy.forward_history(
+                            cond=batch_obs,
+                            deterministic=False,
+                            return_global_cond=svm_reward_enable,
+                        )
+                        output_venv = samples["actions"].cpu().numpy()
+                        base_venv = samples["base_actions"].cpu().numpy()
+                        old_logprob_venv = samples["log_probs"].cpu().numpy()
+                        global_cond_venv = (
+                            samples["global_cond"].detach().cpu().numpy()
+                            if svm_reward_enable
+                            else None
+                        )
 
-            action_venv = output_venv[:, action_start:action_end]
-            chunk_reward = np.zeros(n_envs, dtype=np.float32)
+            action_venv = (
+                np.zeros((n_envs, act_steps, action_dim), dtype=np.float32)
+                if residual_mlp_stepwise_obs
+                else output_venv[:, action_start:action_end]
+            )
+            svm_features_venv = None
+            svm_reward_venv = np.zeros(n_envs, dtype=np.float32)
+            chunk_env_reward = np.zeros(n_envs, dtype=np.float32)
             any_done_accum = np.zeros(n_envs, dtype=bool)
             true_term_accum = np.zeros(n_envs, dtype=bool)
             success_accum = np.zeros(n_envs, dtype=bool)
             safe_actions = np.zeros((n_envs, action_dim), dtype=np.float32)
+            if ppo_control_step_training:
+                step_reward_venv = np.zeros((n_envs, act_steps), dtype=np.float32)
+                step_done_venv = np.zeros((n_envs, act_steps), dtype=np.float32)
+                step_first_venv = np.zeros((n_envs, act_steps), dtype=np.float32)
+                step_valid_venv = np.zeros((n_envs, act_steps), dtype=bool)
+                step_svm_reward_venv = np.zeros((n_envs, act_steps), dtype=np.float32)
+                current_firsts_venv = chunk_start_firsts.copy()
 
             for step_i in range(act_steps):
-                curr_action = action_venv[:, step_i, :].copy()
+                if residual_mlp_stepwise_obs:
+                    with torch.no_grad():
+                        if step_i == 0:
+                            global_cond_step_t = initial_global_cond_t
+                        else:
+                            step_stacked_raw_obs = stack_obs_queue(
+                                raw_obs_queue,
+                                n_envs,
+                                n_obs_steps,
+                            )
+                            step_batch_obs = build_history_batch(
+                                step_stacked_raw_obs,
+                                policy,
+                                device,
+                            )
+                            with maybe_suppress_stdout(quiet_terminal):
+                                global_cond_step_t = global_cond_from_obs(
+                                    policy,
+                                    step_batch_obs,
+                                )
+                        base_step_t = base_actions_t[
+                            :,
+                            action_start + step_i : action_start + step_i + 1,
+                        ]
+                        mean_step_t = policy.mean_actions(
+                            base_step_t,
+                            global_cond=global_cond_step_t,
+                        )
+                        std = policy.action_std.view(1, 1, -1)
+                        action_step_t = mean_step_t + torch.randn_like(mean_step_t) * std
+                        logprob_step_t = policy.log_prob_from_mean(
+                            mean_step_t,
+                            action_step_t,
+                            action_start=0,
+                            action_end=1,
+                        )
+                        curr_action = action_step_t[:, 0, :].cpu().numpy()
+                        action_venv[:, step_i, :] = curr_action
+                        old_logprob_steps[step_i] = logprob_step_t.cpu().numpy()
+                        step_global_cond_venv[:, step_i, :] = (
+                            global_cond_step_t.detach().cpu().numpy()
+                        )
+                else:
+                    curr_action = action_venv[:, step_i, :].copy()
+                active_mask = ~any_done_accum
+                if ppo_control_step_training and svm_reward_enable:
+                    svm_step_features_venv = build_svm_features(
+                        global_cond=step_global_cond_venv[:, step_i, :],
+                        base_actions=base_venv,
+                        action_chunk=action_venv[:, step_i : step_i + 1, :],
+                        action_start=action_start + step_i,
+                        action_end=action_start + step_i + 1,
+                        feature_mode=svm_feature_mode,
+                    )
+                    if svm_reward_ready and svm_discriminator is not None:
+                        svm_discriminator.eval()
+                        step_svm_reward_venv[:, step_i] = compute_svm_process_reward(
+                            discriminator=svm_discriminator,
+                            features=svm_step_features_venv,
+                            device=device,
+                            coef=svm_reward_coef,
+                            reward_clip=svm_reward_clip,
+                        )
+                    if active_mask.any():
+                        svm_rollout_rewards.extend(
+                            step_svm_reward_venv[active_mask, step_i].tolist()
+                        )
+                        for env_idx in np.flatnonzero(active_mask):
+                            svm_episode_features[env_idx].append(
+                                np.array(svm_step_features_venv[env_idx], copy=True)
+                            )
                 for env_idx in range(n_envs):
                     if any_done_accum[env_idx]:
                         curr_action[env_idx] = safe_actions[env_idx]
@@ -1161,12 +1926,40 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                     terminated_venv = np.asarray(terminated_venv, dtype=bool)
                     truncated_venv = np.asarray(truncated_venv, dtype=bool)
 
-                active_mask = ~any_done_accum
-                chunk_reward += reward_venv * active_mask
+                chunk_env_reward += reward_venv * active_mask
+                running_ep_steps[active_mask] += 1
                 just_done = (terminated_venv | truncated_venv) & active_mask
                 just_success = info_success_mask(info_venv, just_done, n_envs)
                 success_accum = success_accum | just_success
                 true_term_accum = true_term_accum | (terminated_venv & active_mask)
+                if ppo_control_step_training:
+                    if reward_source == "success_label":
+                        step_train_reward = success_label_chunk_rewards(
+                            done_mask=just_done,
+                            success_mask=just_success,
+                            success_reward=label_success_reward,
+                            failure_reward=label_failure_reward,
+                            nonterminal_reward=label_nonterminal_reward,
+                            success_time_bonus=success_time_bonus,
+                            episode_steps=running_ep_steps,
+                            max_episode_steps=success_time_max_steps,
+                        )
+                    else:
+                        step_train_reward = reward_venv.copy()
+                    if svm_reward_enable:
+                        step_train_reward = (
+                            step_train_reward + step_svm_reward_venv[:, step_i]
+                        )
+                    step_train_reward = step_train_reward * active_mask
+                    step_reward_venv[:, step_i] = step_train_reward
+                    step_done_venv[:, step_i] = (
+                        (terminated_venv & active_mask)
+                        if bootstrap_on_truncation
+                        else just_done
+                    ).astype(np.float32)
+                    step_first_venv[:, step_i] = current_firsts_venv
+                    step_valid_venv[:, step_i] = active_mask
+                    current_firsts_venv = just_done.astype(np.float32)
 
                 if n_envs == 1 and just_done[0]:
                     reset_obs, _ = env.reset()
@@ -1188,38 +1981,171 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 reset_done_envs_in_obs_queue(raw_obs_queue, obs_venv, just_done, n_envs, n_obs_steps)
                 any_done_accum = any_done_accum | terminated_venv | truncated_venv
 
+            if residual_mlp_stepwise_obs:
+                if ppo_control_step_training:
+                    invalid_step_mask = ~step_valid_venv
+                    step_first_venv[invalid_step_mask] = 1.0
+                    step_done_venv[invalid_step_mask] = 1.0
+                    old_logprob_venv = old_logprob_steps.T
+                elif policy.logprob_reduction == "sum":
+                    old_logprob_venv = old_logprob_steps.sum(axis=0)
+                else:
+                    old_logprob_venv = old_logprob_steps.mean(axis=0)
+                output_venv[:, action_start:action_end] = action_venv
+
+            if svm_reward_enable and not ppo_control_step_training:
+                svm_features_venv = build_svm_features(
+                    global_cond=global_cond_venv,
+                    base_actions=base_venv,
+                    action_chunk=action_venv,
+                    action_start=action_start,
+                    action_end=action_end,
+                    feature_mode=svm_feature_mode,
+                )
+                if svm_reward_ready and svm_discriminator is not None:
+                    svm_discriminator.eval()
+                    svm_reward_venv = compute_svm_process_reward(
+                        discriminator=svm_discriminator,
+                        features=svm_features_venv,
+                        device=device,
+                        coef=svm_reward_coef,
+                        reward_clip=svm_reward_clip,
+                    )
+                svm_rollout_rewards.extend(svm_reward_venv.tolist())
+
+            if ppo_control_step_training:
+                chunk_reward = step_reward_venv.sum(axis=1)
+            elif reward_source == "success_label":
+                chunk_reward = success_label_chunk_rewards(
+                    done_mask=any_done_accum,
+                    success_mask=success_accum,
+                    success_reward=label_success_reward,
+                    failure_reward=label_failure_reward,
+                    nonterminal_reward=label_nonterminal_reward,
+                    success_time_bonus=success_time_bonus,
+                    episode_steps=running_ep_steps,
+                    max_episode_steps=success_time_max_steps,
+                )
+            else:
+                chunk_reward = chunk_env_reward
+
+            if svm_reward_enable and not ppo_control_step_training:
+                chunk_reward = chunk_reward + svm_reward_venv
+
             prev_obs = obs_venv
-            running_ep_rewards += chunk_reward
+            running_ep_train_rewards += chunk_reward
+            running_ep_env_rewards += chunk_env_reward
+            if svm_reward_enable and svm_features_venv is not None:
+                for env_idx in range(n_envs):
+                    svm_episode_features[env_idx].append(
+                        np.array(svm_features_venv[env_idx], copy=True)
+                    )
             for env_idx in range(n_envs):
                 if any_done_accum[env_idx]:
-                    completed_ep_rewards.append(float(running_ep_rewards[env_idx]))
+                    if svm_replay_buffer is not None:
+                        svm_replay_buffer.add_episode(
+                            svm_episode_features[env_idx],
+                            success=bool(success_accum[env_idx]),
+                        )
+                    svm_episode_features[env_idx].clear()
+                    completed_ep_train_rewards.append(float(running_ep_train_rewards[env_idx]))
+                    completed_ep_env_rewards.append(float(running_ep_env_rewards[env_idx]))
                     completed_ep_successes.append(bool(success_accum[env_idx]))
-                    running_ep_rewards[env_idx] = 0.0
+                    completed_ep_steps.append(int(running_ep_steps[env_idx]))
+                    running_ep_train_rewards[env_idx] = 0.0
+                    running_ep_env_rewards[env_idx] = 0.0
+                    running_ep_steps[env_idx] = 0
 
             for key in obs_trajs:
                 obs_trajs[key][step] = stacked_raw_obs[key]
             base_action_trajs[step] = base_venv
             action_trajs[step] = action_venv
-            old_logprob_trajs[step] = old_logprob_venv
-            reward_trajs[step] = chunk_reward
-            terminated_trajs[step] = true_term_accum
-            firsts_trajs[step + 1] = any_done_accum
+            if residual_mlp_stepwise_obs and global_cond_step_trajs is not None:
+                global_cond_step_trajs[step] = step_global_cond_venv
+            if ppo_control_step_training:
+                old_logprob_trajs[step] = old_logprob_venv
+                reward_trajs[step] = step_reward_venv
+                terminated_trajs[step] = step_done_venv
+                firsts_trajs[step] = step_first_venv
+                valid_step_trajs[step] = step_valid_venv
+                chunk_start_firsts = any_done_accum.astype(np.float32)
+            else:
+                old_logprob_trajs[step] = old_logprob_venv
+                reward_trajs[step] = chunk_reward
+                terminated_trajs[step] = (
+                    true_term_accum if bootstrap_on_truncation else any_done_accum
+                )
+                firsts_trajs[step + 1] = any_done_accum
 
-        next_chunk_firsts = firsts_trajs[-1].copy()
-        rollout_avg_return = np.mean(completed_ep_rewards) if completed_ep_rewards else float("-inf")
-        rollout_success_rate = np.mean(completed_ep_successes) if completed_ep_successes else 0.0
-        logging.info(
-            "Rollout | "
-            f"episodes={len(completed_ep_rewards):3d} | "
-            f"success={fmt_pct(rollout_success_rate):>6} | "
-            f"avg_return={rollout_avg_return:8.2f}"
+            if rollout_progress and ((step + 1) % max(1, n_steps // 100) == 0 or step + 1 == n_steps):
+                rollout_bar.set_postfix(
+                    episodes=len(completed_ep_train_rewards),
+                    success=fmt_pct(np.mean(completed_ep_successes))
+                    if completed_ep_successes
+                    else "n/a",
+                    svm=fmt_float(float(np.mean(svm_rollout_rewards)), 3)
+                    if svm_reward_enable and svm_rollout_rewards
+                    else "n/a",
+                )
+            if rollout_log_interval > 0 and (
+                (step + 1) % rollout_log_interval == 0 or step + 1 == n_steps
+            ):
+                logging.info(
+                    "Rollout progress | "
+                    f"chunk={step + 1}/{n_steps} | "
+                    f"env_steps={(step + 1) * act_steps * n_envs}/{n_steps * act_steps * n_envs} | "
+                    f"episodes={len(completed_ep_train_rewards)} | "
+                    f"success={fmt_pct(np.mean(completed_ep_successes)) if completed_ep_successes else 'n/a'}"
+                )
+
+        next_chunk_firsts = (
+            chunk_start_firsts.copy()
+            if ppo_control_step_training
+            else firsts_trajs[-1].copy()
         )
+        rollout_avg_return = (
+            np.mean(completed_ep_train_rewards) if completed_ep_train_rewards else float("-inf")
+        )
+        rollout_avg_env_return = (
+            np.mean(completed_ep_env_rewards) if completed_ep_env_rewards else float("-inf")
+        )
+        rollout_avg_ep_steps = np.mean(completed_ep_steps) if completed_ep_steps else float("nan")
+        rollout_success_rate = np.mean(completed_ep_successes) if completed_ep_successes else 0.0
+        rollout_svm_reward_mean = (
+            float(np.mean(svm_rollout_rewards)) if svm_rollout_rewards else 0.0
+        )
+        rollout_svm_reward_std = (
+            float(np.std(svm_rollout_rewards)) if svm_rollout_rewards else 0.0
+        )
+        rollout_message = (
+            "Rollout | "
+            f"episodes={len(completed_ep_train_rewards):3d} | "
+            f"success={fmt_pct(rollout_success_rate):>6} | "
+            f"train_return={rollout_avg_return:8.2f} | "
+            f"env_return={rollout_avg_env_return:8.2f} | "
+            f"avg_steps={rollout_avg_ep_steps:6.1f}"
+        )
+        if svm_reward_enable:
+            rollout_message += (
+                f" | svm_reward={rollout_svm_reward_mean:7.4f}"
+                f"±{rollout_svm_reward_std:.4f}"
+            )
+        logging.info(rollout_message)
+        if reward_source == "success_label" and not completed_ep_successes:
+            logging.warning(
+                "Rollout produced no completed episodes, so success_label reward has no "
+                "terminal labels in this batch. Increase training.rollout_steps or shorten episodes."
+            )
             
 
         if skip_update:
             logging.info("training.skip_update=true; skipping MLP/Critic update.")
             try:
                 del base_action_trajs, action_trajs, obs_trajs
+                if global_cond_step_trajs is not None:
+                    del global_cond_step_trajs
+                if valid_step_trajs is not None:
+                    del valid_step_trajs
                 if use_disk_cache and temp_buffer_dir is not None:
                     temp_buffer_dir.cleanup()
             except Exception:
@@ -1227,58 +2153,188 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
             torch.cuda.empty_cache()
             continue
 
-        total_samples = n_steps * n_envs
-        obs_flat = {
-            key: value.reshape(total_samples, *value.shape[2:])
-            for key, value in obs_trajs.items()
-        }
-        base_actions_flat = base_action_trajs.reshape(total_samples, horizon_steps, action_dim)
-        actions_flat = action_trajs.reshape(total_samples, act_steps, action_dim)
-        old_logprobs_flat = old_logprob_trajs.reshape(total_samples)
+        if svm_reward_enable and svm_replay_buffer is not None and svm_discriminator is not None:
+            if svm_replay_buffer.can_train(svm_min_positive, svm_min_negative):
+                svm_last_stats = train_svm_discriminator(
+                    discriminator=svm_discriminator,
+                    replay_buffer=svm_replay_buffer,
+                    optimizer=svm_optimizer,
+                    device=device,
+                    batch_size=svm_disc_batch_size,
+                    updates=svm_disc_updates,
+                )
+                svm_reward_ready = True
+                logging.info(
+                    "SVM     | "
+                    f"updates={svm_last_stats['updates']} | "
+                    f"loss={fmt_float(svm_last_stats['loss'])} | "
+                    f"acc={fmt_pct(svm_last_stats['acc']) if np.isfinite(svm_last_stats['acc']) else 'nan'} | "
+                    f"pos={svm_replay_buffer.num_positive} | "
+                    f"neg={svm_replay_buffer.num_negative} | "
+                    f"ready={svm_reward_ready}"
+                )
+            else:
+                logging.info(
+                    "SVM     | waiting for balanced labels | "
+                    f"pos={svm_replay_buffer.num_positive}/{svm_min_positive} | "
+                    f"neg={svm_replay_buffer.num_negative}/{svm_min_negative} | "
+                    f"ready={svm_reward_ready}"
+                )
 
         logging.info("Update  | computing values and GAE")
-        with torch.no_grad():
-            values_flat = np.zeros(total_samples, dtype=np.float32)
-            val_batch_size = batch_size * 2
-            for i in range(0, total_samples, val_batch_size):
-                end_i = min(i + val_batch_size, total_samples)
-                obs_chunk = {}
-                for key, value in obs_flat.items():
-                    tensor_value = torch.from_numpy(value[i:end_i]).float().to(device)
-                    if "images" in key:
-                        tensor_value = tensor_value.permute(0, 1, 4, 2, 3) / 255.0
-                    obs_chunk[key] = tensor_value
-                global_cond = global_cond_from_obs(policy, obs_chunk)
-                values_flat[i:end_i] = critic(global_cond.detach()).cpu().numpy().flatten()
+        if ppo_control_step_training:
+            total_raw_samples = n_steps * n_envs * act_steps
+            obs_flat = None
+            base_actions_flat = base_action_trajs[
+                :,
+                :,
+                action_start:action_end,
+            ].reshape(total_raw_samples, 1, action_dim)
+            actions_flat = action_trajs.reshape(total_raw_samples, 1, action_dim)
+            global_cond_steps_flat = global_cond_step_trajs.reshape(
+                total_raw_samples,
+                global_cond_dim,
+            )
+            old_logprobs_flat = old_logprob_trajs.reshape(total_raw_samples)
+            valid_flat = valid_step_trajs.reshape(total_raw_samples)
+            valid_indices_np = np.flatnonzero(valid_flat)
+            if valid_indices_np.size == 0:
+                raise RuntimeError("No valid control-step samples were collected for PPO update.")
 
-            values_trajs = values_flat.reshape(n_steps, n_envs)
-            last_stacked_raw_obs = stack_obs_queue(raw_obs_queue, n_envs, n_obs_steps)
-            last_obs = build_history_batch(last_stacked_raw_obs, policy, device)
-            global_cond_last = global_cond_from_obs(policy, last_obs)
-            next_values_last = critic(global_cond_last.detach()).cpu().numpy().flatten()
+            with torch.no_grad():
+                values_all_flat = np.zeros(total_raw_samples, dtype=np.float32)
+                val_batch_size = batch_size * 4
+                for i in range(0, total_raw_samples, val_batch_size):
+                    end_i = min(i + val_batch_size, total_raw_samples)
+                    global_cond = torch.from_numpy(
+                        np.ascontiguousarray(global_cond_steps_flat[i:end_i])
+                    ).float().to(device)
+                    values_all_flat[i:end_i] = (
+                        critic(global_cond.detach()).cpu().numpy().flatten()
+                    )
 
-        if reward_scale_running:
-            scaled_rewards = running_reward_scaler(
-                reward=reward_trajs.T,
-                first=firsts_trajs[:-1].T,
-            ).T
+                values_trajs = values_all_flat.reshape(n_steps, n_envs, act_steps)
+                values_time = values_trajs.transpose(0, 2, 1).reshape(
+                    n_steps * act_steps,
+                    n_envs,
+                )
+                last_stacked_raw_obs = stack_obs_queue(raw_obs_queue, n_envs, n_obs_steps)
+                last_obs = build_history_batch(last_stacked_raw_obs, policy, device)
+                global_cond_last = global_cond_from_obs(policy, last_obs)
+                next_values_last = critic(global_cond_last.detach()).cpu().numpy().flatten()
+
+            rewards_time = reward_trajs.transpose(0, 2, 1).reshape(
+                n_steps * act_steps,
+                n_envs,
+            )
+            terminated_time = terminated_trajs.transpose(0, 2, 1).reshape(
+                n_steps * act_steps,
+                n_envs,
+            )
+            firsts_time = firsts_trajs.transpose(0, 2, 1).reshape(
+                n_steps * act_steps,
+                n_envs,
+            )
+            if reward_scale_running:
+                scaled_rewards_time = running_reward_scaler(
+                    reward=rewards_time.T,
+                    first=firsts_time.T,
+                ).T
+            else:
+                scaled_rewards_time = rewards_time
+
+            advantages_time = np.zeros_like(scaled_rewards_time)
+            last_gae_lam = np.zeros(n_envs, dtype=np.float32)
+            for t in reversed(range(n_steps * act_steps)):
+                next_val = next_values_last if t == n_steps * act_steps - 1 else values_time[t + 1]
+                nonterminal = 1.0 - terminated_time[t]
+                delta = (
+                    scaled_rewards_time[t] * reward_scale_const
+                    + gamma * next_val * nonterminal
+                    - values_time[t]
+                )
+                last_gae_lam = delta + gamma * gae_lambda * nonterminal * last_gae_lam
+                advantages_time[t] = last_gae_lam
+
+            returns_time = advantages_time + values_time
+            returns_trajs = returns_time.reshape(n_steps, act_steps, n_envs).transpose(0, 2, 1)
+            advantages_trajs = advantages_time.reshape(n_steps, act_steps, n_envs).transpose(0, 2, 1)
+            returns_flat = returns_trajs.reshape(total_raw_samples)
+            advantages_flat = advantages_trajs.reshape(total_raw_samples)
+            critic_ev, critic_corr = compute_value_diagnostics(
+                values_all_flat[valid_indices_np],
+                returns_flat[valid_indices_np],
+            )
+
+            base_actions_flat = base_actions_flat[valid_indices_np]
+            actions_flat = actions_flat[valid_indices_np]
+            global_cond_steps_flat = global_cond_steps_flat[valid_indices_np]
+            old_logprobs_flat = old_logprobs_flat[valid_indices_np]
+            returns_k = torch.from_numpy(returns_flat[valid_indices_np]).float().to(device)
+            advantages_k = torch.from_numpy(advantages_flat[valid_indices_np]).float().to(device)
+            old_logprobs_k = torch.from_numpy(old_logprobs_flat).float().to(device)
+            total_samples = int(valid_indices_np.size)
         else:
-            scaled_rewards = reward_trajs
+            total_samples = n_steps * n_envs
+            obs_flat = {
+                key: value.reshape(total_samples, *value.shape[2:])
+                for key, value in obs_trajs.items()
+            }
+            base_actions_flat = base_action_trajs.reshape(
+                total_samples,
+                horizon_steps,
+                action_dim,
+            )
+            actions_flat = action_trajs.reshape(total_samples, act_steps, action_dim)
+            global_cond_steps_flat = None
+            old_logprobs_flat = old_logprob_trajs.reshape(total_samples)
 
-        advantages_trajs = np.zeros_like(scaled_rewards)
-        last_gae_lam = 0
-        for t in reversed(range(n_steps)):
-            next_val = next_values_last if t == n_steps - 1 else values_trajs[t + 1]
-            nonterminal = 1.0 - terminated_trajs[t]
-            delta = scaled_rewards[t] * reward_scale_const + gamma * next_val * nonterminal - values_trajs[t]
-            last_gae_lam = delta + gamma * gae_lambda * nonterminal * last_gae_lam
-            advantages_trajs[t] = last_gae_lam
+            with torch.no_grad():
+                values_flat = np.zeros(total_samples, dtype=np.float32)
+                val_batch_size = batch_size * 2
+                for i in range(0, total_samples, val_batch_size):
+                    end_i = min(i + val_batch_size, total_samples)
+                    obs_chunk = {}
+                    for key, value in obs_flat.items():
+                        tensor_value = torch.from_numpy(value[i:end_i]).float().to(device)
+                        if "images" in key:
+                            tensor_value = tensor_value.permute(0, 1, 4, 2, 3) / 255.0
+                        obs_chunk[key] = tensor_value
+                    global_cond = global_cond_from_obs(policy, obs_chunk)
+                    values_flat[i:end_i] = critic(global_cond.detach()).cpu().numpy().flatten()
 
-        returns_trajs = advantages_trajs + values_trajs
-        critic_ev, critic_corr = compute_value_diagnostics(values_trajs, returns_trajs)
-        returns_k = torch.from_numpy(returns_trajs.reshape(-1)).float().to(device)
-        advantages_k = torch.from_numpy(advantages_trajs.reshape(-1)).float().to(device)
-        old_logprobs_k = torch.from_numpy(old_logprobs_flat).float().to(device)
+                values_trajs = values_flat.reshape(n_steps, n_envs)
+                last_stacked_raw_obs = stack_obs_queue(raw_obs_queue, n_envs, n_obs_steps)
+                last_obs = build_history_batch(last_stacked_raw_obs, policy, device)
+                global_cond_last = global_cond_from_obs(policy, last_obs)
+                next_values_last = critic(global_cond_last.detach()).cpu().numpy().flatten()
+
+            if reward_scale_running:
+                scaled_rewards = running_reward_scaler(
+                    reward=reward_trajs.T,
+                    first=firsts_trajs[:-1].T,
+                ).T
+            else:
+                scaled_rewards = reward_trajs
+
+            advantages_trajs = np.zeros_like(scaled_rewards)
+            last_gae_lam = 0
+            for t in reversed(range(n_steps)):
+                next_val = next_values_last if t == n_steps - 1 else values_trajs[t + 1]
+                nonterminal = 1.0 - terminated_trajs[t]
+                delta = (
+                    scaled_rewards[t] * reward_scale_const
+                    + gamma * next_val * nonterminal
+                    - values_trajs[t]
+                )
+                last_gae_lam = delta + gamma * gae_lambda * nonterminal * last_gae_lam
+                advantages_trajs[t] = last_gae_lam
+
+            returns_trajs = advantages_trajs + values_trajs
+            critic_ev, critic_corr = compute_value_diagnostics(values_trajs, returns_trajs)
+            returns_k = torch.from_numpy(returns_trajs.reshape(-1)).float().to(device)
+            advantages_k = torch.from_numpy(advantages_trajs.reshape(-1)).float().to(device)
+            old_logprobs_k = torch.from_numpy(old_logprobs_flat).float().to(device)
 
         def normalize_clip_minibatch_advantage(advantages):
             """按原版 DPPO 口径在 minibatch 内归一化并裁剪 advantage。"""
@@ -1290,7 +2346,12 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 advantages = torch.clamp(advantages, min=adv_lower, max=adv_upper)
             return advantages
 
-        actor_update_enabled = bool(update_actor and itr >= critic_warmup_iters)
+        has_reward_signal = reward_source != "success_label" or len(completed_ep_successes) > 0
+        actor_update_enabled = bool(
+            update_actor and itr >= critic_warmup_iters and has_reward_signal
+        )
+        if reward_source == "success_label" and itr >= critic_warmup_iters and not has_reward_signal:
+            logging.warning("Update  | actor update disabled because this batch has no success/fail labels.")
         policy.train()
         policy.apply(freeze_batch_norm)
         critic.train()
@@ -1303,42 +2364,42 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
         running_kl = []
         running_bc_loss = []
         early_stop = False
+        num_batches = max(1, math.ceil(total_samples / batch_size))
+        total_update_batches = update_epochs * num_batches
+        update_batches_done = 0
         logging.info(
             "Update  | "
             f"actor_update={actor_update_enabled} | "
             f"epochs={update_epochs} | "
-            f"minibatches/epoch={max(1, math.ceil(total_samples / batch_size))}"
+            f"minibatches/epoch={num_batches} | "
+            f"total_minibatches={total_update_batches}"
         )
 
-        for epoch in tqdm(
+        update_epoch_bar = tqdm(
             range(update_epochs),
             desc=f"PPO {itr + 1:04d}",
-            leave=False,
+            leave=training_progress,
             dynamic_ncols=True,
-            disable=not show_progress,
-        ):
+            mininterval=1.0,
+            disable=not training_progress,
+        )
+        for epoch in update_epoch_bar:
             if early_stop:
                 break
             indices = torch.randperm(total_samples, device=device)
-            num_batches = max(1, math.ceil(total_samples / batch_size))
-            for batch_idx in tqdm(
+            minibatch_bar = tqdm(
                 range(num_batches),
                 desc=f"epoch {epoch + 1}",
                 leave=False,
                 dynamic_ncols=True,
-                disable=not show_progress,
-            ):
+                mininterval=1.0,
+                disable=not training_progress,
+            )
+            for batch_idx in minibatch_bar:
                 start = batch_idx * batch_size
                 end = min(start + batch_size, total_samples)
                 inds_b = indices[start:end]
                 inds_np = inds_b.cpu().numpy()
-
-                obs_b = {}
-                for key, value in obs_flat.items():
-                    tensor_value = torch.from_numpy(value[inds_np]).float().to(device)
-                    if "images" in key:
-                        tensor_value = tensor_value.permute(0, 1, 4, 2, 3) / 255.0
-                    obs_b[key] = tensor_value
 
                 base_actions_b = torch.from_numpy(base_actions_flat[inds_np]).float().to(device)
                 actions_b = torch.from_numpy(actions_flat[inds_np]).float().to(device)
@@ -1347,16 +2408,41 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 advantages_b = normalize_clip_minibatch_advantage(advantages_b)
                 old_logprobs_b = old_logprobs_k[inds_b]
 
-                with torch.no_grad():
-                    global_cond_b = global_cond_from_obs(policy, obs_b)
+                if ppo_control_step_training:
+                    global_cond_b = torch.from_numpy(
+                        np.ascontiguousarray(global_cond_steps_flat[inds_np])
+                    ).float().to(device)
+                else:
+                    obs_b = {}
+                    for key, value in obs_flat.items():
+                        tensor_value = torch.from_numpy(value[inds_np]).float().to(device)
+                        if "images" in key:
+                            tensor_value = tensor_value.permute(0, 1, 4, 2, 3) / 255.0
+                        obs_b[key] = tensor_value
+                    with torch.no_grad():
+                        global_cond_b = global_cond_from_obs(policy, obs_b)
+
+                if ppo_control_step_training:
+                    actor_base_actions_b = base_actions_b
+                    actor_global_cond_b = global_cond_b
+                    actor_action_start = 0
+                    actor_action_end = 1
+                else:
+                    actor_base_actions_b = base_actions_b
+                    actor_global_cond_b = global_cond_b
+                    actor_action_start = action_start
+                    actor_action_end = action_end
 
                 if actor_update_enabled:
-                    mean_actions_b = policy.mean_actions(base_actions_b)
+                    mean_actions_b = policy.mean_actions(
+                        actor_base_actions_b,
+                        global_cond=actor_global_cond_b,
+                    )
                     new_logprobs_b = policy.log_prob_from_mean(
                         mean_actions_b,
                         actions_b,
-                        action_start=action_start,
-                        action_end=action_end,
+                        action_start=actor_action_start,
+                        action_end=actor_action_end,
                     )
                     raw_log_ratio = new_logprobs_b - old_logprobs_b
                     log_ratio = torch.clamp(raw_log_ratio, min=-20.0, max=5.0)
@@ -1364,19 +2450,29 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                     surr1 = ratio * advantages_b
                     surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages_b
                     pg_loss = -torch.min(surr1, surr2).mean()
-                    bc_loss = F.mse_loss(
-                        mean_actions_b[:, action_start:action_end],
-                        base_actions_b[:, action_start:action_end],
+                    bc_target_b = (
+                        actor_base_actions_b
+                        if ppo_control_step_training
+                        else actor_base_actions_b[:, action_start:action_end]
                     )
+                    bc_pred_b = (
+                        mean_actions_b
+                        if ppo_control_step_training
+                        else mean_actions_b[:, action_start:action_end]
+                    )
+                    bc_loss = F.mse_loss(bc_pred_b, bc_target_b)
                     approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean().item()
                 else:
                     with torch.no_grad():
-                        mean_actions_b = policy.mean_actions(base_actions_b)
+                        mean_actions_b = policy.mean_actions(
+                            actor_base_actions_b,
+                            global_cond=actor_global_cond_b,
+                        )
                         new_logprobs_b = policy.log_prob_from_mean(
                             mean_actions_b,
                             actions_b,
-                            action_start=action_start,
-                            action_end=action_end,
+                            action_start=actor_action_start,
+                            action_end=actor_action_end,
                         )
                         raw_log_ratio = new_logprobs_b - old_logprobs_b
                         log_ratio = torch.clamp(raw_log_ratio, min=-20.0, max=5.0)
@@ -1394,6 +2490,26 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 running_pg_loss.append(float(pg_loss.item()))
                 running_bc_loss.append(float(bc_loss.item()))
                 running_kl.append(float(approx_kl))
+                update_batches_done += 1
+                if training_progress:
+                    minibatch_bar.set_postfix(
+                        v=fmt_float(float(v_loss.item()), 3),
+                        pg=fmt_float(float(pg_loss.item()), 3),
+                        kl=f"{approx_kl:.2e}",
+                    )
+                if training_log_interval > 0 and (
+                    update_batches_done % training_log_interval == 0
+                    or update_batches_done == total_update_batches
+                ):
+                    logging.info(
+                        "Update progress | "
+                        f"minibatch={update_batches_done}/{total_update_batches} | "
+                        f"epoch={epoch + 1}/{update_epochs} | "
+                        f"batch={batch_idx + 1}/{num_batches} | "
+                        f"value_loss={v_loss.item():.4f} | "
+                        f"policy_loss={pg_loss.item():.4f} | "
+                        f"kl={approx_kl:.3e}"
+                    )
 
                 if actor_update_enabled and approx_kl > target_kl:
                     logging.warning(
@@ -1429,22 +2545,34 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
         max_kl = float(np.max(running_kl)) if running_kl else 0.0
         avg_bc_loss = float(np.mean(running_bc_loss)) if running_bc_loss else 0.0
 
-        log_box(
-            f"Iteration {itr + 1} Summary",
-            [
-                ("episodes", len(completed_ep_rewards)),
-                ("rollout_success", fmt_pct(rollout_success_rate)),
-                ("rollout_return", f"{rollout_avg_return:.2f}"),
-                ("actor_update", actor_update_enabled),
-                ("value_loss", fmt_float(avg_v_loss)),
-                ("policy_loss", fmt_float(avg_pg_loss)),
-                ("bc_loss", f"{avg_bc_loss:.5f}"),
-                ("kl_avg/max", f"{avg_kl:.3e} / {max_kl:.3e}"),
-                ("critic_ev", fmt_float(critic_ev)),
-                ("value_return_corr", fmt_float(critic_corr)),
-                ("action_std", f"{float(policy.action_std.mean().detach().cpu().item()):.5f}"),
-            ],
-        )
+        summary_rows = [
+            ("episodes", len(completed_ep_train_rewards)),
+            ("rollout_success", fmt_pct(rollout_success_rate)),
+            ("rollout_train_return", f"{rollout_avg_return:.2f}"),
+            ("rollout_env_return", f"{rollout_avg_env_return:.2f}"),
+            ("rollout_avg_steps", f"{rollout_avg_ep_steps:.1f}"),
+            ("ppo_granularity", "control_step" if ppo_control_step_training else "chunk"),
+            ("ppo_samples", total_samples),
+            ("actor_update", actor_update_enabled),
+            ("value_loss", fmt_float(avg_v_loss)),
+            ("policy_loss", fmt_float(avg_pg_loss)),
+            ("bc_loss", f"{avg_bc_loss:.5f}"),
+            ("kl_avg/max", f"{avg_kl:.3e} / {max_kl:.3e}"),
+            ("critic_ev", fmt_float(critic_ev)),
+            ("value_return_corr", fmt_float(critic_corr)),
+            ("action_std", f"{float(policy.action_std.mean().detach().cpu().item()):.5f}"),
+        ]
+        if svm_reward_enable and svm_replay_buffer is not None:
+            summary_rows.extend(
+                [
+                    ("svm_ready", svm_reward_ready),
+                    ("svm_reward_mean/std", f"{rollout_svm_reward_mean:.4f} / {rollout_svm_reward_std:.4f}"),
+                    ("svm_loss", fmt_float(svm_last_stats["loss"])),
+                    ("svm_acc", fmt_pct(svm_last_stats["acc"]) if np.isfinite(svm_last_stats["acc"]) else "nan"),
+                    ("svm_pos/neg", f"{svm_replay_buffer.num_positive} / {svm_replay_buffer.num_negative}"),
+                ]
+            )
+        log_box(f"Iteration {itr + 1} Summary", summary_rows)
 
         try:
             del (
@@ -1453,6 +2581,9 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 obs_flat,
                 base_action_trajs,
                 action_trajs,
+                global_cond_step_trajs,
+                global_cond_steps_flat,
+                valid_step_trajs,
                 obs_trajs,
                 returns_k,
                 advantages_k,
@@ -1496,8 +2627,10 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 f"success={fmt_pct(sr):>6} | "
                 f"avg_reward={ar:8.2f}"
             )
+            eval_score = sr if checkpoint_metric in success_metric_names else ar
 
-            if ar > best_eval_reward:
+            if eval_score > best_eval_score:
+                best_eval_score = eval_score
                 best_eval_reward = ar
                 best_eval_success_rate = sr
                 best_policy_state = snapshot_trainable_state(policy)
@@ -1506,13 +2639,34 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 rollback_enabled = bool(getattr(cfg.training, "rollback_on_eval_collapse", True))
                 rollback_sr = float(getattr(cfg.training, "rollback_success_rate", 0.1))
                 rollback_reward = float(getattr(cfg.training, "rollback_reward", -100.0))
+                rollback_success_drop = float(getattr(cfg.training, "rollback_success_drop", 0.2))
+                rollback_min_best_success = float(getattr(cfg.training, "rollback_min_best_success", 0.5))
+                rollback_reward_gate = bool(
+                    getattr(
+                        cfg.training,
+                        "rollback_reward_gate",
+                        checkpoint_metric not in success_metric_names,
+                    )
+                )
                 rollback_patience = int(getattr(cfg.training, "rollback_patience", 1))
-                eval_collapsed = sr <= rollback_sr and ar <= rollback_reward
+                success_floor = rollback_sr
+                if best_eval_success_rate >= rollback_min_best_success and rollback_success_drop > 0.0:
+                    success_floor = max(success_floor, best_eval_success_rate - rollback_success_drop)
+                success_collapsed = sr < success_floor
+                reward_collapsed = ar <= rollback_reward
+                if checkpoint_metric in success_metric_names:
+                    eval_collapsed = success_collapsed and (
+                        reward_collapsed if rollback_reward_gate else True
+                    )
+                else:
+                    eval_collapsed = reward_collapsed
                 if rollback_enabled and eval_collapsed:
                     eval_collapse_count += 1
                     logging.warning(
                         f"Eval collapse detected ({eval_collapse_count}/{rollback_patience}). "
-                        f"success={sr * 100:.1f}% reward={ar:.2f}"
+                        f"success={sr * 100:.1f}% reward={ar:.2f} "
+                        f"success_floor={success_floor * 100:.1f}% "
+                        f"reward_gate={rollback_reward_gate}"
                     )
                     if eval_collapse_count >= rollback_patience:
                         restore_trainable_state(policy, best_policy_state, device)
@@ -1544,6 +2698,30 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 shutil.move(str(tmp_videos_dir), str(final_videos_dir))
 
             policy.save_pretrained(save_path)
+            if svm_reward_enable and svm_discriminator is not None:
+                torch.save(
+                    {
+                        "model": svm_discriminator.state_dict(),
+                        "input_dim": int(svm_input_dim),
+                        "feature_mode": str(svm_feature_mode),
+                        "reward_coef": float(svm_reward_coef),
+                        "reward_clip": float(svm_reward_clip),
+                        "hidden_dim": int(svm_disc_hidden_dim),
+                        "depth": int(svm_disc_depth),
+                        "ready": bool(svm_reward_ready),
+                        "last_stats": dict(svm_last_stats),
+                        "buffer_storage": str(svm_buffer_storage),
+                        "buffer_dir": str(svm_buffer_dir),
+                        "buffer_reset": bool(svm_buffer_reset),
+                        "num_positive": int(svm_replay_buffer.num_positive)
+                        if svm_replay_buffer is not None
+                        else 0,
+                        "num_negative": int(svm_replay_buffer.num_negative)
+                        if svm_replay_buffer is not None
+                        else 0,
+                    },
+                    save_path / "svm_reward.pt",
+                )
 
             current_ft_dict = OmegaConf.to_container(cfg, resolve=True)
             base_config_dict = OmegaConf.to_container(hydra_cfg, resolve=True) if hydra_cfg is not None else {}
@@ -1566,13 +2744,21 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                     "action_start": int(action_start),
                     "action_end": int(action_end),
                     "residual_mlp_checkpoint": "residual_mlp.pt",
+                    "residual_mlp_mode": str(policy.residual_mlp_mode),
+                    "residual_mlp_condition": str(policy.residual_mlp_condition),
+                    "residual_mlp_stepwise_obs": bool(policy.residual_mlp_stepwise_obs),
+                    "global_cond_dim": int(policy.residual_global_cond_dim),
                     "residual_mlp_hidden_dim": int(residual_hidden_dim),
                     "residual_mlp_depth": int(residual_depth),
                     "residual_mlp_learn_std": bool(residual_learn_std),
                     "arm_action_indices": list(policy.arm_action_indices),
                     "cam_action_indices": list(policy.cam_action_indices),
+                    "lambda_all": float(policy.lambda_all),
                     "lambda_arm": float(policy.lambda_arm),
                     "lambda_cam": float(policy.lambda_cam),
+                    "residual_mlp_max_delta": float(policy.residual_mlp_max_delta),
+                    "all_hidden_dim": int(policy.all_hidden_dim),
+                    "all_depth": int(policy.all_depth),
                     "arm_hidden_dim": int(policy.arm_hidden_dim),
                     "cam_hidden_dim": int(policy.cam_hidden_dim),
                     "arm_depth": int(policy.arm_depth),
@@ -1584,12 +2770,44 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 "iteration": int(itr + 1),
                 "success_rate": float(sr),
                 "average_reward": float(ar),
+                "selection_metric": checkpoint_metric,
+                "selection_score": float(eval_score),
                 "avg_policy_loss": float(avg_pg_loss),
                 "avg_value_loss": float(avg_v_loss),
                 "critic_explained_variance": float(critic_ev),
                 "critic_value_return_correlation": float(critic_corr),
                 "rollout_success_rate": float(rollout_success_rate),
                 "rollout_average_return": float(rollout_avg_return),
+                "rollout_average_env_return": float(rollout_avg_env_return),
+                "rollout_average_steps": float(rollout_avg_ep_steps),
+                "ppo_control_step_training": bool(ppo_control_step_training),
+                "ppo_update_samples": int(total_samples),
+                "reward_source": reward_source,
+                "success_label_success_reward": float(label_success_reward),
+                "success_label_failure_reward": float(label_failure_reward),
+                "success_label_nonterminal_reward": float(label_nonterminal_reward),
+                "success_time_bonus": float(success_time_bonus),
+                "success_time_max_steps": int(success_time_max_steps),
+                "residual_mlp_stepwise_obs": bool(residual_mlp_stepwise_obs),
+                "svm_reward_enable": bool(svm_reward_enable),
+                "svm_reward_ready": bool(svm_reward_ready),
+                "svm_feature_mode": str(svm_feature_mode),
+                "svm_reward_coef": float(svm_reward_coef),
+                "svm_reward_clip": float(svm_reward_clip),
+                "svm_reward_mean": float(rollout_svm_reward_mean),
+                "svm_reward_std": float(rollout_svm_reward_std),
+                "svm_buffer_storage": str(svm_buffer_storage),
+                "svm_buffer_dir": str(svm_buffer_dir),
+                "svm_buffer_reset": bool(svm_buffer_reset),
+                "svm_disc_loss": float(svm_last_stats["loss"]),
+                "svm_disc_acc": float(svm_last_stats["acc"]),
+                "svm_buffer_positive": int(svm_replay_buffer.num_positive)
+                if svm_replay_buffer is not None
+                else 0,
+                "svm_buffer_negative": int(svm_replay_buffer.num_negative)
+                if svm_replay_buffer is not None
+                else 0,
+                "bootstrap_on_truncation": bool(bootstrap_on_truncation),
                 "frozen_diffusion": True,
             }
 
@@ -1599,7 +2817,7 @@ def train_mlp_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: st
                 yaml.dump(current_ft_dict, f, allow_unicode=True, sort_keys=False)
 
             logging.info(f"Save    | checkpoint={save_path}")
-            manager.update(step=itr + 1, loss=avg_pg_loss, ckpt_path=ckpt_path, reward=ar)
+            manager.update(step=itr + 1, loss=avg_pg_loss, ckpt_path=ckpt_path, reward=eval_score)
         elif (itr + 1) <= critic_warmup_iters:
             logging.info(
                 f"Eval    | skipped during critic warmup ({itr + 1}/{critic_warmup_iters})"
@@ -1618,14 +2836,12 @@ def train_cli(cfg: DictConfig):
 
 if __name__ == "__main__":
     default_args = [
-        "policy=ft_wrist_diffusion_mlp",
-        "training.pretrained_ckpt_path='outputs/1_hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion'",
-        "env.n_envs=1",
+        "policy=ft_zed_diffusion_mlp",
+        "training.pretrained_ckpt_path='outputs/2_pretrain/train/2026-06-26/17-07-44_InsertCylinder-3Arms-v0_pre_zed_diffusion/checkpoints/148000_loss=0.0026_sr=0.0_ar=387.35'",
+        "env.n_envs=10",
         "training.rollout_steps=400",
         "training.batch_size=16",
-        "training.update_epochs=4",
-        "+training.show_progress=false",
-        "+training.quiet_terminal=true",
+        "training.update_epochs=2",
         "wandb.enable=false",
     ]
 

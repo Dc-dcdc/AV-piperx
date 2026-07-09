@@ -30,11 +30,6 @@ training:
   delta_timestamps:
     action: "[i / ${fps} for i in range(${policy.chunk_size})]"
 
-eval:
-  batch_size: 1
-  max_steps: 300             # 环境的单局最大步数截断
-
-# See `configuration_act.py` for more details.
 policy:
   name: act
 

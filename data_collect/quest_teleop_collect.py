@@ -1,4 +1,4 @@
-#!/home/dc/miniforge3/envs/DPPO/bin/python
+#!/home/dc/miniforge3/envs/AV-piper/bin/python
 from __future__ import annotations
 
 import json
@@ -705,10 +705,7 @@ def run(cfg: DictConfig) -> None:
         "observation_height": cfg.render_height,
         "observation_width": cfg.render_width,
     }
-    if str(cfg.env_id) in {
-        "guided_vision/InsertCylinder-3Arms-v0",
-        "guided_vision/InsertCylinder-Piper3Arms-v0",
-    }:
+    if str(cfg.env_id) == "guided_vision/InsertCylinder-3Arms-v0":
         env_make_kwargs["enable_reward_debug"] = bool(cfg.get("save_reward_debug", False))
 
     env_obj = gym.make(cfg.env_id, **env_make_kwargs)

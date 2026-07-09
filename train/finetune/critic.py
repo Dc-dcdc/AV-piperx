@@ -90,23 +90,50 @@ class ImageCritic(nn.Module):
     
 # 和actor共享视觉底座
 class SharedFeatureCritic(nn.Module):
-    def __init__(self, global_cond_dim):
+    def __init__(
+        self,
+        global_cond_dim,
+        hidden_dims=(256, 256, 256),
+        activation_type="Mish",
+        use_layernorm=False,
+    ):
         """
         纯净版共享 Critic：没有卷积，没有状态编码器。
         参数 global_cond_dim: Actor 吐出的全局特征向量维度
         """
         super().__init__()
-        
-        # 核心 MLP 评价网络 (由于输入已经是高维融合特征，直接上 512)
-        self.mlp = nn.Sequential(
-            nn.Linear(global_cond_dim, 512),
-            nn.LayerNorm(512), 
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
+        hidden_dims = tuple(int(dim) for dim in hidden_dims)
+
+        layers = []
+        in_dim = int(global_cond_dim)
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            if use_layernorm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(self._make_activation(activation_type))
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, 1))
+
+        # 核心 MLP 评价网络：默认对齐原版 DPPO critic head 的 [256, 256, 256] + Mish。
+        self.mlp = nn.Sequential(*layers)
         self._apply_orthogonal_init()
+
+    @staticmethod
+    def _make_activation(activation_type):
+        activation_type = str(activation_type).lower()
+        if activation_type == "mish":
+            return nn.Mish()
+        if activation_type == "relu":
+            return nn.ReLU()
+        if activation_type == "gelu":
+            return nn.GELU()
+        if activation_type == "elu":
+            return nn.ELU()
+        if activation_type == "tanh":
+            return nn.Tanh()
+        if activation_type == "identity":
+            return nn.Identity()
+        raise ValueError(f"Unsupported critic activation_type: {activation_type}")
 
     def _apply_orthogonal_init(self):
         for m in self.mlp.modules():

@@ -17,6 +17,9 @@ hydra:
 
 training:
   pretrained_ckpt_path: "outputs/2_pretrain/train/.../checkpoints/050000"
+  critic_hidden_dims: [256, 256, 256] # 对齐原版DPPO critic head
+  critic_activation: Mish             # 原版DPPO MLP默认激活
+  critic_use_layernorm: false         # 原版ResidualMLP默认不使用LayerNorm
   min_sampling_denoising_std: 0.02  # DDIM采样探索标准差；视觉机器人任务建议保持小而非0
   min_logprob_denoising_std: 0.02   # 与采样标准差保持一致，避免old/new logprob尺度不匹配
   logprob_reduction: mean           # 原版DPPO口径：对动作块内logprob取均值
@@ -25,11 +28,14 @@ training:
   norm_adv: true                    # 在每个minibatch内部归一化advantage
   clip_advantage_lower_quantile: 0.05 # minibatch内advantage下分位裁剪
   clip_advantage_upper_quantile: 0.95 # minibatch内advantage上分位裁剪
-  target_kl: 0.03                   # PPO早停阈值；只在critic warmup之后生效
-  bc_loss_coef: 0.0002               # BC 正则/teacher 约束
+  clip_ploss_coef: 0.01             # 原版DPPO PPO clip上限
+  clip_ploss_coef_base: 0.001       # 原版DPPO PPO clip下限，按去噪步递增
+  clip_ploss_coef_rate: 3.0         # 原版DPPO PPO clip指数增长率
+  target_kl: 0.1                    # PPO早停阈值；先用0.1，比原版1.0更保守
+  bc_coef: 0.0                    # BC 正则/teacher 约束；设为0可对齐原版图像UNet DPPO
   lr_backbone: 1e-5
   use_disk_cache: True   # True 开启硬盘缓存 (省内存), False 开启纯内存模式 (速度最快)
-  grad_accumulate: 4     # 梯度累计步数
+  grad_accumulate: 8     # 梯度累计步数
   post_update_probe_size: 256  # 固定一批样本，诊断actor更新后是否按advantage方向改变logprob
   actor_lr_warmup_iters: 5
   rollout_policy: dppo   # dppo: DPPO采样；select_action: 复用eval推理，只做排查
@@ -44,15 +50,19 @@ training:
   rollback_patience: 1
 eval:
   seed: 100            # 评估时的随机种子
+  batch_size: 10        # 并行评估环境数，最多不会超过 n_episodes
+  use_async_envs: true # true 使用多进程 AsyncVectorEnv，false 使用单进程 SyncVectorEnv
   checkpoint_metric: "reward" # 筛选指标：可选 'loss' 或 'reward'
   max_checkpoints: 20  # 最多保存loss最小的几个模型快照
-  n_episodes: 20             # 每次评估跑多少个完整的 episode
+  n_episodes: 100             # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 1   # 最多保存前几个 episode 的录像视频
   records_resume: True  # 是否读取top-k的快照和视频列表 即top_k_records.json
   fps: 25                    # 录制的 MP4 视频帧率
 
 wandb:
   enable: true
+  disable_system_stats: true  # 不采集或上传CPU、GPU、内存等周期性System指标
+  disable_machine_info: true  # 不上传主机与硬件信息
   # Set to true to disable saving an artifact despite save_checkpoint == True
   disable_artifact: true # 不保存artifact，即不上传权重模型
   project: ${env.task}_finetune  #项目名称

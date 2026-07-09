@@ -1,0 +1,108 @@
+# @package _global_
+# 冻结 ZED-only 预训练 Diffusion，只训练控制步级 residual PPO。
+# 可用命令查看最终合并结果:
+# python train/finetune/finetune_residual.py policy=ft_zed_diffusion_residual --cfg job
+
+seed: 1000  # 随机种子
+dataset_repo_id: "av_piper_residual_rollout"  # Logger 数据集标识
+
+env:
+  name: guided_vision  # Gym 环境命名空间
+  task: InsertCylinder-3Arms-v0  # 任务名称
+  n_envs: 10  # 并行环境数量
+
+training:
+  pretrained_ckpt_path: "outputs/2_pretrain/train/2026-06-26/17-07-44_InsertCylinder-3Arms-v0_pre_zed_diffusion/checkpoints/148000_loss=0.0026_sr=0.0_ar=387.35"  # ZED-only 预训练权重目录
+
+  n_train_itr: 1000   # PPO 总训练轮数
+  n_critic_warmup_itr: 5  # 只训练 critic 的预热轮数
+  rollout_steps: 4000  # 每轮采集 DP action chunk 数
+  batch_size: 256     # PPO minibatch 大小
+  update_epochs: 20   # 每轮 PPO 更新 epoch 数
+  grad_accumulate: 4  # 梯度累计步数
+  max_grad_norm: 1.0  # 梯度裁剪阈值
+
+  actor_lr: 5e-6  # residual actor 学习率
+  critic_lr: 3e-4  # residual critic 学习率
+  weight_decay: 1e-6  # actor 权重衰减
+  critic_weight_decay: 1e-6  # critic 权重衰减
+  actor_lr_warmup_iters: 5  # actor 学习率预热步数
+  optimizer_betas_actor: [0.9, 0.999]  # actor AdamW beta 参数
+
+  gamma: 0.999  # 回报折扣因子
+  gae_lambda: 0.95  # GAE 平滑系数
+  clip_ratio: 0.06  # PPO ratio 截断范围
+  target_kl: 0.015  # PPO KL 早停阈值
+  vf_coef: 1.0   # value loss 权重
+  ent_coef: 0.0  # entropy 奖励权重
+  residual_l1: 0.0  # residual 均值 L1 正则
+  residual_l2: 0.0  # residual 均值 L2 正则
+
+  reward_source: "binary_success_label"  # 训练奖励来源，成功为1，其余为0
+  success_label_success_reward: 1.0  # 成功控制步奖励，保留记录用
+  success_label_failure_reward: 0.0  # 失败控制步奖励，保留记录用
+  success_label_nonterminal_reward: 0.0  # 未终止控制步奖励，保留记录用
+  success_time_bonus: 0.0  # residual 版本不使用时间奖励
+  success_time_max_steps: 400  # 时间奖励最大步数，保留兼容
+  reward_scale_running: false  # 是否按运行方差缩放奖励，二值奖励默认关闭
+  reward_scale_const: 1.0  # 奖励常数倍率
+  norm_adv: true  # 是否归一化 advantage
+  clip_advantage_lower_quantile: 0.05  # advantage 下分位裁剪
+  clip_advantage_upper_quantile: 0.95  # advantage 上分位裁剪
+  bootstrap_on_truncation: false  # 截断结束时是否 bootstrap
+
+  residual_hidden_dim: 512  # residual actor 隐藏层宽度
+  residual_depth: 2  # residual actor 隐藏层数量
+  residual_critic_hidden_dim: 512  # residual critic 隐藏层宽度
+  residual_critic_depth: 2  # residual critic 隐藏层数量
+  residual_activation: "SiLU"  # residual 网络激活函数
+  residual_std: 0.008  # residual 动作采样标准差
+  residual_learn_std: true  # 是否学习 residual 标准差
+  residual_action_head_std: 0.0  # actor 输出层初始化标准差，0 表示近零初始化
+  residual_action_scale: 1.0  # residual 原始采样动作缩放
+  residual_max_delta: 0.015  # residual 单维动作最大修正幅度
+  residual_stepwise_obs: true  # 每个控制步是否使用最新观测重新修正
+  logprob_reduction: mean  # 20 维 residual logprob 聚合方式
+
+  use_disk_cache: true  # 是否使用磁盘缓存 rollout 张量
+  rollout_buffer_dir: "outputs/buffer/finetune_residual"  # rollout 磁盘缓存目录
+  rollout_buffer_keep_iterations: false  # 是否保留每一轮 rollout，false 只保留 current
+  skip_update: false  # 是否只采集不更新
+  update_actor: true  # 是否更新 residual actor
+  show_progress: false  # 总进度开关
+  rollout_progress: true  # 是否显示 rollout 进度条
+  rollout_log_interval: 0  # rollout 周期日志间隔，0 表示关闭
+  training_progress: true  # 是否显示 PPO 更新进度条
+  training_log_interval: 0  # PPO 周期日志间隔，0 表示关闭
+  quiet_terminal: true  # 是否屏蔽环境冗余输出
+
+  rollback_on_eval_collapse: true  # 评估崩溃时是否回滚
+  rollback_success_rate: 0.25  # 绝对回滚成功率阈值
+  rollback_success_drop: 0.20  # 相对历史最佳成功率最大允许下降
+  rollback_min_best_success: 0.50  # 启用相对回滚所需历史最佳成功率
+  rollback_reward_gate: false  # 是否要求奖励也低于阈值才回滚
+  rollback_reward: -100.0  # 回滚平均奖励阈值
+  rollback_patience: 2  # 连续崩溃容忍次数
+
+eval:
+  eval_freq: 2  # 评估频率
+  render_camera: ['overhead_cam']  # 评估录像视角
+  checkpoint_metric: "success"  # checkpoint 筛选指标
+  max_checkpoints: 20  # 最多保留 checkpoint 数
+  n_episodes: 20  # 每次评估 episode 数
+  max_steps: 400  # 每个评估 episode 最大步数
+  max_episodes_rendered: 1  # 最多保存录像 episode 数
+  records_resume: true  # 是否读取历史 top-k 记录
+  fps: 25  # 录像帧率
+
+wandb:
+  enable: false  # 是否启用 wandb
+  disable_artifact: true  # 是否禁用 artifact 上传
+  project: ${env.task}_finetune  # wandb 项目名
+  notes: ""  # wandb 备注
+  save_code: false  # 是否保存代码到 wandb
+
+policy:
+  name: diffusion  # 基础策略类型
+  n_action_steps: 8  # DP 每个 action chunk 实际执行步数
+  ft_denoising_steps: 10  # 兼容旧 DPPO 配置字段

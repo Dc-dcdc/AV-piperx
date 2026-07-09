@@ -2,11 +2,11 @@
 # 使用@package _global_让policy文件的内容提升到和default文件目录以进行合并
 # 可以使用命令行 python train/finetune/train_finetune.py --cfg job 进行查看
 seed: 1000
-dataset_repo_id : "dppo_online_rollout"  # lerobot底层的logger需要这个进行分组，不写会报错
+dataset_repo_id : "av_piper_online_rollout"  # lerobot底层的logger需要这个进行分组，不写会报错
 
 env:
   name : guided_vision
-  task : SewNeedle-2Arms-v0
+  task : InsertCylinder-3Arms-v0
   n_envs: 5                            # 并行环境数量
 
 training:

@@ -4,7 +4,7 @@ dataset_repo_id: iantc104/gv_quest_teleop_insert_cylinder_3arms  # 圆柱插入�
 fps: 25
 
 eval:
-  # ALOHA 仿真环境建议先关闭异步环境，避免 MuJoCo/渲染上下文冲突。
+  # PiperX 仿真环境建议先关闭异步环境，避免 MuJoCo/渲染上下文冲突。
   use_async_envs: false
 
 env:

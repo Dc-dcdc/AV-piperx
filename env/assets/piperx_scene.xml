@@ -1,5 +1,5 @@
 <mujoco model="piper_scene">
-<!-- meshdir/texturedir="."：XML 中的 file 路径直接从 env/assets 开始写，例如 meshes/aloha/xxx.stl。 -->
+<!-- meshdir/texturedir="."：XML 中的 file 路径直接从 env/assets 开始写，例如 meshes/piperx/xxx.stl。 -->
   <compiler meshdir="." texturedir="."/>
 
   <include file="piperx_sim.xml"/>
@@ -15,9 +15,9 @@
   </visual>
 
   <asset>
-    <!-- Assets that scene.xml receives indirectly from aloha_sim.xml. -->
+    <!-- Shared scene assets. -->
     <material name="black" rgba="0.15 0.15 0.15 1"/>
-    <mesh name="d405_solid" file="meshes/aloha/d405_solid.stl"/>
+    <mesh name="d405_solid" file="meshes/cameras/d405_solid.stl"/>
 
     <!-- table extrusions and frame -->
     <mesh file="meshes/extrusion_2040_1200.stl"/>
@@ -44,7 +44,7 @@
   </asset>
 
   <default>
-    <!-- Defaults that scene.xml receives indirectly from aloha_sim.xml. -->
+    <!-- Shared visual/collision defaults. -->
     <default class="visual">
       <geom type="mesh" mass="0" group="2" material="black" contype="0" conaffinity="0"/>
     </default>

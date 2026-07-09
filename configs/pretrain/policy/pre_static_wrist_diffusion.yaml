@@ -48,10 +48,6 @@ training:
     observation.images.worms_eye_cam: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
     observation.images.wrist_cam_left: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
     observation.images.wrist_cam_right: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
-eval:
-  batch_size: 1
-  max_steps: 300             # 环境的单局最大步数截断
-
 
 policy:
   name: diffusion

@@ -189,7 +189,7 @@ if __name__ == "__main__":
     LEFT_ARM_POSE = np.array([1,0,0,-1,0,1])
 
     # setup mujoco 
-    mjcf_root = mjcf.from_path(os.path.join(XML_DIR, 'aloha_sim.xml'))
+    mjcf_root = mjcf.from_path(os.path.join(XML_DIR, 'piperx_sim.xml'))
     physics = mjcf.Physics.from_mjcf_model(mjcf_root) 
     left_joints = [mjcf_root.find('joint', name) for name in LEFT_JOINT_NAMES]
     left_actuators = [mjcf_root.find('actuator', name) for name in LEFT_ACTUATOR_NAMES]

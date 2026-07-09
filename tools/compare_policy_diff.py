@@ -189,7 +189,7 @@ def read_env_id(config_yaml: Path) -> tuple[str, str]:
     with open(config_yaml, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     env_cfg = cfg.get("env", {}) if isinstance(cfg, dict) else {}
-    return env_cfg.get("name", "guided_vision"), env_cfg.get("task", "SewNeedle-3Arms-v0")
+    return env_cfg.get("name", "guided_vision"), env_cfg.get("task", "InsertCylinder-3Arms-v0")
 
 
 def compare_actions(
@@ -518,10 +518,10 @@ USE_FILE_CONFIG = True
 
 FILE_CONFIG = {
     # 原始预训练模型路径。可以填 checkpoint 目录，也可以直接填 pretrained_model 目录。
-    "base": "outputs/1_hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion",
+    "base": "outputs/1_hugging_model/pre_sim_insert_cylinder_3arms_zed_wrist_diffusion",
 
     # 微调后模型路径。把这里改成你想检查的第几十轮 checkpoint。
-    "tuned": "outputs/3_finetune/train/2026-05-29/19-41-54_SewNeedle-3Arms-v0_ft_zed_wrist_diffusion/checkpoints/000220_sr=0.80_reward=495.12_Ploss=-0.0024_Vloss=0.5348",
+    "tuned": "outputs/3_finetune/train/2026-05-29/19-41-54_InsertCylinder-3Arms-v0_ft_zed_wrist_diffusion/checkpoints/000220_sr=0.80_reward=495.12_Ploss=-0.0024_Vloss=0.5348",
 
     # 基础对比配置。
     "device": "cuda:0",

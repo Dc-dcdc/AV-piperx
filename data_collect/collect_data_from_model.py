@@ -179,10 +179,7 @@ def read_env_id(config_yaml: Path) -> str:
 
 
 def collect_env_id_for(env_id: str) -> str:
-    if env_id.endswith("SewNeedle-2Arms-v0"):
-        return env_id.replace("SewNeedle-2Arms-v0", "SewNeedle-2Arms-Collect-v0")
-    if env_id.endswith("SewNeedle-3Arms-v0"):
-        return env_id.replace("SewNeedle-3Arms-v0", "SewNeedle-3Arms-Collect-v0")
+    # PiperX 只保留 InsertCylinder 主环境，自动采集也直接使用同一个 Gym ID。
     return env_id
 
 
@@ -691,7 +688,7 @@ def build_arg_parser():
     parser = argparse.ArgumentParser(description="Collect rollout data from a checkpoint policy.")
     parser.add_argument(
         "--ckpt-path",
-        default="outputs/1_hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion",
+        default="outputs/1_hugging_model/pre_sim_insert_cylinder_3arms_zed_wrist_diffusion",
     )
     
     parser.add_argument("--output-dir", default="outputs/4_data_collect")
@@ -767,7 +764,7 @@ def train_cli():
 
 if __name__ == "__main__":
     # 需要采集数据的 checkpoint 路径；可以指向 checkpoint 文件夹或 pretrained_model 子文件夹。
-    CKPT_PATH = "outputs/1_hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion"
+    CKPT_PATH = "outputs/1_hugging_model/pre_sim_insert_cylinder_3arms_zed_wrist_diffusion"
 
     # 已有采集目录；为空时新建目录。人工剔除后要补采，就填旧目录路径。
     APPEND_RUN_DIR = ""

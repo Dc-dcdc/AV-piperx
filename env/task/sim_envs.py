@@ -299,96 +299,6 @@ class GuidedVisionEnv(gym.Env):
             self._viewer.close()
 
 
-class SlotInsertionEnv(GuidedVisionEnv):
-    def __init__(self, **kwargs):
-        xml = os.path.join(XML_DIR, 'task_slot_insertion.xml')
-        super().__init__(xml, **kwargs)
-
-        self.max_reward = 4
-
-        self._slot_joint = self._mjcf_root.find('joint', 'slot_joint')
-        self._stick_joint = self._mjcf_root.find('joint', 'stick_joint')
-
-    def reset(self, seed=None, options=None) -> tuple:
-        super().reset(seed=seed, options=options)
-        rng = self.np_random
-
-        # reset physics
-        x_range = [-0.05, 0.05]
-        y_range = [0.1, 0.15]
-        z_range = [0.0, 0.0]
-        ranges = np.vstack([x_range, y_range, z_range])
-        slot_position = rng.uniform(ranges[:, 0], ranges[:, 1])
-        slot_quat = np.array([1, 0, 0, 0])
-
-
-        peg_position = rng.uniform(ranges[:, 0], ranges[:, 1])
-        peg_quat = np.array([1, 0, 0, 0])
-
-        x_range = [-0.08, 0.08]
-        y_range = [-0.1, 0.0]
-        z_range = [0.0, 0.0]
-        ranges = np.vstack([x_range, y_range, z_range])
-        stick_position = rng.uniform(ranges[:, 0], ranges[:, 1])
-        stick_quat = np.array([1, 0, 0, 0])
-
-        self._physics.bind(self._slot_joint).qpos = np.concatenate([slot_position, slot_quat])
-        self._physics.bind(self._stick_joint).qpos = np.concatenate([stick_position, stick_quat])
-
-        self._physics.forward()
-
-        observation = self.get_obs()
-        info = {"is_success": False}
-
-        return observation, info
-
-
-    def get_reward(self):
-
-        touch_left_gripper = False
-        touch_right_gripper = False
-        stick_touch_table = False
-        stick_touch_slot = False
-        pins_touch = False
-
-        # return whether peg touches the pin
-        contact_pairs = []
-        for i_contact in range(self._physics.data.ncon):
-            id_geom_1 = self._physics.data.contact[i_contact].geom1
-            id_geom_2 = self._physics.data.contact[i_contact].geom2
-            geom1 = self._physics.model.id2name(id_geom_1, 'geom')
-            geom2 = self._physics.model.id2name(id_geom_2, 'geom')
-            contact_pairs.append((geom1, geom2))
-            contact_pairs.append((geom2, geom1))
-
-        for geom1, geom2 in contact_pairs:
-            if geom1 == "stick" and geom2.startswith("right"):
-                touch_right_gripper = True
-
-            if geom1 == "stick" and geom2.startswith("left"):
-                touch_left_gripper = True
-
-            if geom1 == "table" and geom2 == "stick":
-                stick_touch_table = True
-
-            if geom1 == "stick" and geom2.startswith("slot-"):
-                stick_touch_slot = True
-
-            if geom1 == "pin-stick" and geom2 == "pin-slot":
-                pins_touch = True
-
-        reward = 0
-        if touch_left_gripper and touch_right_gripper: # touch both
-            reward = 1
-        if touch_left_gripper and touch_right_gripper and (not stick_touch_table): # grasp stick
-            reward = 2
-        if stick_touch_slot and (not stick_touch_table): # peg and socket touching
-            reward = 3
-        if pins_touch: # successful insertion
-            reward = 4
-        return reward
-
-
 if __name__ == "__main__":
     import argparse
 
@@ -454,7 +364,7 @@ if __name__ == "__main__":
         display_name = args.env_id
     else:
         if xml_path is None:
-            xml_path = os.path.join(XML_DIR, "task_insert_cylinder.xml")
+            xml_path = os.path.join(XML_DIR, "task_insert_cylinder_piper.xml")
         if not os.path.isabs(xml_path):
             xml_path = os.path.abspath(xml_path)
         if not os.path.exists(xml_path):

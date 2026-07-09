@@ -43,7 +43,7 @@ def download_model_to_pretrain(repo_id: str, base_dir: str):
 if __name__ == "__main__":
     # 1. 在这里配置你的实际参数
     # 目标仓库
-    TARGET_REPO_ID = "Dc-dc/pre_sim_sew_needle_3arms_zed_wrist_diffusion"
+    TARGET_REPO_ID = "Dc-dc/pre_sim_insert_cylinder_3arms_zed_wrist_diffusion"
     
     # 本地文件夹，会在后面自动创建任务+相机名称
     BASE_PRETRAIN_DIR = "outputs/1_hugging_model"

@@ -1,32 +1,37 @@
-# DPPO
+# AV-piper
+## 环境配置
+conda env create -f environment.yml
+pip install -e .
+去lerobot项目代码下执行：
+pip install -e .
+
+
 先用扩散模型预训练并使用强化学习PPO算法进行微调
 
 ## 当前状态速览
 
-本项目当前圆柱插入主线已经切换到松灵 PiperX。`guided_vision/InsertCylinder-3Arms-v0` 是 PiperX 主入口，`guided_vision/InsertCylinder-Piper3Arms-v0` 仅作为旧命令兼容别名保留。
+本项目当前只保留松灵 PiperX 三臂圆柱插入主线。`guided_vision/InsertCylinder-3Arms-v0` 是唯一推荐入口，默认加载 `env/assets/task_insert_cylinder_piper.xml`，再包含 `piperx_scene.xml` 和 `piperx_sim.xml`。
 
 | 类型 | Gym 环境 ID | 主要 XML/入口 | 说明 |
 |---|---|---|---|
-| ALOHA 穿针 | `guided_vision/SewNeedle-3Arms-v0` / `guided_vision/SewNeedle-2Arms-v0` | `env/assets/task_sew_needle.xml` -> `scene.xml` -> `aloha_sim.xml` | 原始 ALOHA 任务 |
 | PiperX 圆柱插入 | `guided_vision/InsertCylinder-3Arms-v0` | `env/assets/task_insert_cylinder_piper.xml` -> `piperx_scene.xml` -> `piperx_sim.xml` | 当前主入口 |
-| ALOHA 插槽 | `guided_vision/SlotInsertion-3Arms-v0` | `env/assets/task_slot_insertion.xml` | 插槽任务 |
 
 
 ## 快速验证命令
 
 ```bash
-# ALOHA/Piper 环境是否能创建和显示
-/home/dc/miniforge3/envs/DPPO/bin/python env/task/sim_envs.py
+# PiperX 环境是否能创建和显示
+/home/dc/miniforge3/envs/AV-piper/bin/python env/task/sim_envs.py
 
-# Quest -> MuJoCo -> IK 在线测试，Piper 入口
-/home/dc/miniforge3/envs/DPPO/bin/python data_collect/quest_mujoco_test.py \
+# Quest -> MuJoCo -> IK 在线测试，PiperX 入口
+/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/quest_mujoco_test.py \
   env_id=guided_vision/InsertCylinder-3Arms-v0 \
   display_camera=zed_cam_left \
   head_control=true \
   lock_roll=true
 
 # Quest 正式采集，建议显式传 env_id，避免脚本默认参数造成任务切换不明确
-/home/dc/miniforge3/envs/DPPO/bin/python data_collect/quest_teleop_collect.py \
+/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/quest_teleop_collect.py \
   env_id=guided_vision/InsertCylinder-3Arms-v0 \
   head_control=true \
   lock_roll=true
@@ -34,28 +39,27 @@
 
 `quest_teleop_collect.py` 直接运行时会读取 yaml 配置，同时底部 `default_args` 也会补默认参数；实际采集前建议在命令行中显式写出 `env_id`、`head_control`、`record_cameras` 和保存选项。
 
-## ✨ Pretrain部分 
+## ✨ Pretrain部分
 1. 训练代码位于 `train/pretrain/train_pretrain.py`，训练对应的配置参数位于`configs/pretrain/policy`，训练不同的任务时，需要注意修改`train_pretrain.py`中的`env`(决定场景)和`policy`(决定训练策略：ACT、diffusion)。
-2. 模型快照和评估视频储存的默认位置位于`configs/pretrain/pre_default.yaml`中的hydra.run.dir,这是相对于该项目（DPPO）的相对保存位置，注意命令行的运行位置，否则会存到其他地方，wandb的保存文件名为hydra.run.job。
+2. 模型快照和评估视频储存的默认位置位于`configs/pretrain/pre_default.yaml`中的hydra.run.dir,这是相对于该项目（AV-piper）的相对保存位置，注意命令行的运行位置，否则会存到其他地方，wandb的保存文件名为hydra.run.job。
 3. 预训练代码设置了断点续训，输入保存的模型快照路径并设置`resume=true`即可，会自动读取训练时使用的policy配置参数。
 4. 评估代码位于`train/pretrain/eval_policy.py`，输入模型快照的路径即可，会自动读取训练时使用的policy配置参数，可以在`eval_policy.py`设置`render_camera=['overhead_cam']`来设置录制视频的视角。
-5. 值得注意的是，这里用到了av-aloha的lerobot代码，换设备训练需要注意，后期可以注意更新为官网版本的lerobot
-## ✨ Finetune部分 
+5. 值得注意的是，这里使用项目内置的 lerobot 代码，换设备训练时需确认依赖版本一致，后期可以更新为官方版本。
+## ✨ Finetune部分
 1. 微调代码位于`train/finetune/train_finetune.py`，输入模型快照的路径即可，会自动读取训练时使用的policy配置参数
 2. 为了适配评估代码`train/pretrain/eval_policy.py`，保存权重的同时生成了对应的训练参数配置表`config.yaml`和`config.json`
 
 
-## ✨ sim_env部分 
+## ✨ sim_env部分
 1. 添加了模型推理部分，可以添加训练好的模型进行在线仿真推理，可以修改display_cameras参数获取要单独渲染的相机视角，一行两个进行排布。此外还可以通过修改代码中SIM_DT为具体值，从而实现慢速的观测效果。
 
-## ✨ PiperX/松灵兼容层 
+## ✨ PiperX/松灵主线
 1. PiperX 仿真 XML 位于 `env/assets/piperx_sim.xml`，场景文件为 `env/assets/piperx_scene.xml`，圆柱任务入口为 `env/assets/task_insert_cylinder_piper.xml`。
-2. 当前 PiperX 主入口使用 `guided_vision/InsertCylinder-3Arms-v0`，兼容别名为 `guided_vision/InsertCylinder-Piper3Arms-v0`。接口保持 ALOHA 风格：左臂 7 维、右臂 7 维、中间臂 6 轴，总动作维度 `20`，动作切片为 `left[0:7] + right[7:14] + middle[14:20]`。
+2. 当前 PiperX 主入口使用 `guided_vision/InsertCylinder-3Arms-v0`。左臂 7 维、右臂 7 维、中间臂 6 轴，总动作维度 `20`，动作切片为 `left[0:7] + right[7:14] + middle[14:20]`。
 3. 关节、执行器和末端 site 名称需要继续和 `env/constants.py` 对齐，例如 `left_gripper_control`、`right_gripper_control`、`middle_zed_camera_center`。
-4. Piper 圆柱入口使用 `InsertCylinderEnv`，默认加载 `task_insert_cylinder_piper.xml`，并支持 `enable_reward_debug`；正式训练或采集前应先用 `data_collect/quest_mujoco_test.py` 做 Quest 映射和 IK 小步测试。
-5. Piper 与 ALOHA 的动力学、工作空间、关节方向、夹爪和相机外参不同，旧 ALOHA checkpoint 只能作为流程参考，不建议直接用于 Piper 真机。
+4. 圆柱入口使用 `InsertCylinderEnv`，默认加载 `task_insert_cylinder_piper.xml`，并支持 `enable_reward_debug`；正式训练或采集前应先用 `data_collect/quest_mujoco_test.py` 做 Quest 映射和 IK 小步测试。
 
-## ✨ data_collect部分 
+## ✨ data_collect部分
 ### 1. 脚本说明
 | 文件/目录 | 作用 | 关键参数或输入输出 |
 |---|---|---|
@@ -96,7 +100,7 @@ configs/data_collect/quest_teleop_collect.yaml
 ```
 默认输出目录：
 ```text
-outputs/4_data_collect/quest_teleop/quest_teleop_SewNeedle-3Arms-v0_rgb
+outputs/4_data_collect/quest_teleop/quest_teleop_InsertCylinder-3Arms-v0_rgb
 ```
 关键配置：
 ```text
@@ -121,7 +125,7 @@ episodes/
 ```
 采集脚本只保存任务成功并经过 A+X 确认的轨迹；转换为 LeRobot/HF 数据集见下一节 `hugging face部分`。
 
-## ✨ hugging face部分 
+## ✨ hugging face部分
 ### 1. 脚本说明
 | 文件 | 作用 | 关键参数 |
 |---|---|---|
@@ -134,7 +138,7 @@ episodes/
 ### 2. 原始数据格式
 原始遥操数据默认保存位置：
 ```text
-outputs/4_data_collect/quest_teleop/quest_teleop_SewNeedle-3Arms-v0_rgb
+outputs/4_data_collect/quest_teleop/quest_teleop_InsertCylinder-3Arms-v0_rgb
 ```
 目录结构：
 ```text
@@ -158,7 +162,7 @@ episodes/
 ### 3. 转换后数据格式
 转换后的本地 LeRobot/HF 数据集默认保存位置：
 ```text
-outputs/5_hf_datasets/quest_teleop_sew_needle_3arms
+outputs/5_hf_datasets/quest_teleop_insert_cylinder_3arms
 ```
 目录结构：
 ```text
@@ -188,15 +192,15 @@ index                                 # 全局帧编号
 
 
 ## 🧾 小贴士
-1. mujoco环境中`aloha_real.xml`比`aloha_sim.xml`多出以下两处聚光灯：
+1. mujoco环境中`piperx_scene.xml` 比 `piperx_sim.xml`多出以下两处聚光灯：
 ```
 <light mode="targetbodycom" target="left_gripper_link" pos="-.5 .7 2.5" cutoff="55"/>
 <light mode="targetbodycom" target="right_gripper_link" pos=".5 .7 2.5" cutoff="55"/>
 ```
-2. 且两者的双目相机广角不一样，`aloha_real.xml`中`fovy="90"`，而`aloha_sim.xml`中为`fovy="66.21"`
+2. 且两者的双目相机广角不一样，`piperx_scene.xml` 中 `fovy="90"`，而 `piperx_sim.xml` 中为 `fovy="66.21"`
 ```
 <camera name="zed_cam_left" pos="0.03 0.00119254 -0.04325" euler="1.57079632679 0 3.14159265359" fovy="66.21" mode="fixed"/>
-<camera name="zed_cam_right" pos="-0.03 0.00119254 -0.04325" euler="1.57079632679 0 3.14159265359" fovy="66.21" mode="fixed"/> 
+<camera name="zed_cam_right" pos="-0.03 0.00119254 -0.04325" euler="1.57079632679 0 3.14159265359" fovy="66.21" mode="fixed"/>
 ```
 3. 可以在评估 `eval_policy.py` 代码中查看推理时间，一般来说一次会推理 horizon 步，这一次推理时间是最久的，后续只从推理的动作中取出并执行即可，所以推理时间会呈现类似 `[31.86 ms、0.26 ms、0.31 ms、0.29 ms...]` 的分布，长度是实际执行的步数 `n_action_steps`。
 

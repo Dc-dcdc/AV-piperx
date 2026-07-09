@@ -1,0 +1,168 @@
+WARNING Tue Jul  7 14:17:53 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 14:18:24 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 14:18:53 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 14:19:29 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 14:27:06 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 14:27:50 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 14:28:07 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 14:40:41 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 14:47:49 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 14:49:51 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 14:55:06 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 15:07:12 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 15:08:11 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 15:41:50 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 15:43:27 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 15:43:55 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 15:52:30 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 15:53:15 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 15:54:43 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 15:56:17 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 15:56:41 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 16:04:38 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 16:14:37 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+
+WARNING Tue Jul  7 19:18:27 2026: Attach conflict when attaching 'piper_scene', policy is 'warning'
+noslip_iterations: parent has 0, child has 3, keeping parent value
+impratio: parent has 1, child has 100, keeping parent value
+integrator: parent has 0, child has 3, keeping parent value
+cone: parent has 0, child has 1, keeping parent value
+znear: parent has 0.010000, child has 0.050000, keeping parent value
+

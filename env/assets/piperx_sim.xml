@@ -18,6 +18,7 @@
     <mesh name="piperx_link6" file="meshes/piperx/link6.stl"/>
     <mesh name="piper_link6_stand_camera" file="meshes/piperx/link6_stand_camera.stl"/>
     <mesh name="piper_link6_stand_zed" file="meshes/piperx/link6_stand_zed.stl"/>
+    <mesh name="piper_link6_mid_camera" file="meshes/piperx/mid_camera.stl"/>
     <mesh name="piperx_flange" file="meshes/piperx/flange.stl"/>
     <mesh name="piperx_gripper_base" file="meshes/piperx/gripper_base.stl"/>
     <mesh name="piperx_gripper_link1" file="meshes/piperx/gripper_link1.stl"/>
@@ -295,8 +296,8 @@
                             mass="0.007"
                             fullinertia="0.00152112 0.00138626 0.00031152 0.00000202 0.00000261 0.00000002"/>
                   <joint name="middle_wrist_2_joint" class="piperx_joint" axis="0 0 1" range="-2.0943951 2.0943951"/>
-                  <geom mesh="piper_link6_stand_zed" quat="0 0 0 1" class="piperx_visual"/>
-                  <geom mesh="piper_link6_stand_zed" quat="0.707105 0 0 0.707108" class="piperx_collision"/>
+                  <geom mesh="piper_link6_mid_camera" quat="0 0 0 1" class="piperx_visual"/>
+                  <geom mesh="piper_link6_mid_camera" quat="0.707105 0 0 0.707108" class="piperx_collision"/>
 
                   <body name="middle_flange_link"  quat="0.707108 0 0 0.707105" gravcomp="1">
                     <inertial pos="0.001151691 0.000782428 0.004798051"

@@ -17,14 +17,23 @@
           000001.jpg
 
 转换后的本地 LeRobot/HF 数据集格式:
-
   data/train-00000-of-00001.parquet         # 每一帧的 action、observation.state、timestamp、episode/frame/index 以及视频帧引用。
+        observation.state: 机器人当前关节状态，维度由 raw 数据推断；当前 PiperX 三臂数据为 20 维
+        action: 关节动作，维度由 raw 数据推断；当前 PiperX 三臂数据为 20 维，来自 raw 数据的 joint_action
+        episode_index: 第几个 episode
+        frame_index: episode 内第几帧
+        timestamp: 时间戳，25 FPS，所以通常 0.00, 0.04, 0.08...
+        next.done: 这一帧后 episode 是否结束
+        index: 全局帧编号
+        observation.images.<camera>: 不直接存图片，而是存 {path, timestamp}，指向对应 mp4 里的某一帧
   meta_data/info.json                       # 数据集基础信息，例如 fps、视频编码、相机键名和 episode 数量。
-  meta_data/stats.safetensors               # action、observation.state 和图像观测的均值、方差、最小值、最大值。
-  meta_data/episode_data_index.safetensors  # 每条 episode 在 parquet 全局帧序列中的起止索引。
+  meta_data/stats.safetensors               # 训练归一化统计量：action、observation.state、timestamp、index 等字段的 mean/std/min/max
+  meta_data/episode_data_index.safetensors  # 每条 episode 在 parquet 全局帧序列中的起止索引。例如 episode 0 是 [0, 392)
+        from: 每条 episode 起始行
+        to:   每条 episode 结束行，不包含该行
   videos/observation.images.<camera>_episode_000000.mp4  # 每个相机对应的 episode 视频，parquet 通过 path + timestamp 引用具体帧。
                                                         # 视频会统一重编码为 LeRobot 短 GOP MP4，方便训练时随机读帧。
-    
+
 其中 raw 的 joint_action 或 pose_action 会根据 --action-key 映射到
 LeRobot 数据集中的 action 字段。
 
@@ -773,7 +782,7 @@ def run_from_args(args: argparse.Namespace) -> None:
 # 使用 Python 变量调用转换流程。
 def convert_data_folder_to_hf(
     raw_dir: str,
-    output_dir: str = "outputs/5_hf_datasets/quest_teleop_sew_needle_3arms",
+    output_dir: str = "outputs/5_hf_datasets/quest_teleop_insert_cylinder_3arms",
     overwrite: bool = True,
     max_episodes: int | None = None,
     cameras: str | None = None,

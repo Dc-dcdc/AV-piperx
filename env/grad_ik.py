@@ -239,7 +239,7 @@ if __name__ == '__main__':
     PHYSICS_ENV_STEP_RATIO = int(DT/PHYSICS_DT)
     DT = PHYSICS_DT * PHYSICS_ENV_STEP_RATIO
 
-    xml_path = os.path.join(XML_DIR, f'single_arm.xml')
+    xml_path = os.path.join(XML_DIR, f'task_insert_cylinder_piper.xml')
     mjcf_root = mjcf.from_path(xml_path)  
     mjcf_root.option.timestep = PHYSICS_DT  
     

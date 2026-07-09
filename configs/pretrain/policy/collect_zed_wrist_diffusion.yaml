@@ -52,13 +52,6 @@ training:
     observation.images.wrist_cam_left: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
     observation.images.wrist_cam_right: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
 
-eval:
-  checkpoint_metric: reward  # 补训阶段按评估奖励筛选 checkpoint，不按训练 loss 选
-  n_episodes: 20             # 每次评估跑 20 个 episode，降低单次评估偶然性
-  batch_size: 1
-  max_steps: 300             # 环境的单局最大步数截断
-
-
 policy:
   name: diffusion
   # ==========================================

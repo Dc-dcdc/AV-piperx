@@ -22,7 +22,7 @@ SIM_DT = 0.04  #读取操作员动捕设备或模型推理动作的频率：25HZ
 SIM_PHYSICS_ENV_STEP_RATIO = int(SIM_DT/SIM_PHYSICS_DT) #AI 每输出一个动作，仿真器会在底层保持这个动作不变，连续运行 20 次物理演算（每次 0.002 秒），然后再把第 20 次演算后的最新状态返回给 AI。
 SIM_DT = SIM_PHYSICS_DT * SIM_PHYSICS_ENV_STEP_RATIO # 强制确保最终的 SIM_DT 绝对是底层物理步长的整数倍，这样可以保证仿真器的稳定性
 
-# Piper robot parameters
+# PiperX robot parameters
 LEFT_ARM_POSE = [0.0, 1.60, -0.30, -1.16, 0, 0.0, 0.027] # 左臂默认初始姿态
 RIGHT_ARM_POSE = [0.0, 1.60, -0.30, -1.16, 0, 0.0, 0.027] # 右臂默认初始姿态
 MIDDLE_ARM_POSE = [0.0, 1.1, -1.1, 0.37, 0.0, 0.0] # 中臂初始姿态，6 轴
@@ -33,22 +33,6 @@ MIDDLE_BASE_POS = [0.0, -0.65, 0.0] # 中臂默认底座位置
 # 按任务管理机器人初始配置；env/__init__.py 会读取并传入对应环境。
 ROBOT_INIT_CONFIGS = {
     "default": {
-        "left_arm_pose": LEFT_ARM_POSE,
-        "right_arm_pose": RIGHT_ARM_POSE,
-        "middle_arm_pose": MIDDLE_ARM_POSE,
-        "left_base_pos": LEFT_BASE_POS,
-        "right_base_pos": RIGHT_BASE_POS,
-        "middle_base_pos": MIDDLE_BASE_POS,
-    },
-    "sew_needle": {
-        "left_arm_pose": LEFT_ARM_POSE,
-        "right_arm_pose": RIGHT_ARM_POSE,
-        "middle_arm_pose": MIDDLE_ARM_POSE,
-        "left_base_pos": LEFT_BASE_POS,
-        "right_base_pos": RIGHT_BASE_POS,
-        "middle_base_pos": MIDDLE_BASE_POS,
-    },
-    "slot_insertion": {
         "left_arm_pose": LEFT_ARM_POSE,
         "right_arm_pose": RIGHT_ARM_POSE,
         "middle_arm_pose": MIDDLE_ARM_POSE,

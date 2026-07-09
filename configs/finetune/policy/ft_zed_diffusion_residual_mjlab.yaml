@@ -1,0 +1,102 @@
+# @package _global_
+# Frozen Diffusion + residual PPO on mjlab.
+#
+# 支持 state-only 或 observation.images.* 视觉 Diffusion checkpoint。
+# 视觉输入会按 checkpoint 的 observation.images.<camera> key 渲染同名 mjlab XML camera。
+
+seed: 1000
+task_id: Mjlab-Insert-Cylinder-PiperX
+experiment_name: piperx_insert_cylinder_residual_mjlab
+log_root: logs/rsl_rl
+gpu_ids: auto
+
+env:
+  num_envs: 80
+  episode_length_s: 16.0    # 每条轨迹最大时长，16s: 16 * 25Hz = 400 步
+  # auto: Diffusion state_dim=20 时使用 legacy_agent_pos；state_dim=79 时使用 actor。
+  state_mode: auto
+  # legacy_absolute: 冻结 DP 输出旧 Gym 绝对关节动作，再转换为 mjlab raw action。
+  # mjlab_raw: 冻结 DP 本身就是用 mjlab raw action 训练的。
+  base_action_mode: legacy_absolute
+  env_action_clip: null
+  # 可选：当 checkpoint 图像 key 后缀和 XML camera 名不一致时配置映射。
+  # 例如 observation.images.zed_left: zed_cam_left
+  camera_map: {}
+
+policy:
+  n_action_steps: 8
+
+training:
+  # 必填：传 Diffusion checkpoint，或用 CLI 覆盖：
+  #   --pretrained-ckpt-path outputs/.../checkpoints/.../pretrained_model
+  pretrained_ckpt_path: null
+  resume_path: null
+
+  run_name: residual_ppo
+  n_train_itr: 1000
+  n_critic_warmup_itr: 0
+  rollout_steps: 100          
+  num_minibatches: 1
+  minibatch_size: null       # null 时等于本轮收集到的全部样本 / num_minibatches
+  update_epochs: 50
+  grad_accumulate: 1
+  max_grad_norm: 1.0
+  save_interval: 20
+  eval_interval: 5
+  eval_first: true
+  reset_every_iteration: true
+
+  actor_lr: 3.0e-4
+  critic_lr: 5.0e-3
+  weight_decay: 1.0e-6
+  critic_weight_decay: 1.0e-6
+  lr_scheduler: cosine
+  actor_lr_warmup_iters: 5
+  critic_lr_warmup_iters: 0
+  optimizer_betas_actor: [0.9, 0.999]
+
+  gamma: 0.999
+  gae_lambda: 0.95
+  clip_ratio: 0.2
+  clip_vloss: false
+  target_kl: 0.1
+  vf_coef: 1.0
+  ent_coef: 0.0
+  residual_l1: 0.0
+  residual_l2: 0.0
+
+  # mjlab 的环境奖励是 dense reward，用它训练 PPO；成功率仍由 success label 单独统计。
+  reward_source: env
+  success_metric_source: success_count
+  success_reward_count_threshold: 1
+  reward_scale_running: true
+  reward_clip: 5.0
+  reward_scale_const: 1.0
+  norm_adv: true
+  clip_advantage_lower_quantile: 0.0
+  clip_advantage_upper_quantile: 1.0
+  bootstrap_on_truncation: false
+
+  residual_action_space: normalized
+  residual_hidden_dim: 256
+  residual_depth: 2
+  residual_critic_hidden_dim: 256
+  residual_critic_depth: 2
+  residual_activation: ReLU
+  residual_init_logstd: -1.0
+  residual_std: null
+  residual_learn_std: false
+  residual_action_head_std: 0.0
+  residual_action_scale: 0.1
+  residual_max_delta: 0.0
+  residual_stepwise_obs: true
+  logprob_reduction: sum
+
+  use_disk_cache: false
+  rollout_buffer_dir: outputs/buffer/finetune_residual_mjlab
+  rollout_buffer_keep_iterations: false
+  skip_update: false
+  update_actor: true
+  rollout_progress: true
+  training_progress: true
+  quiet_terminal: true

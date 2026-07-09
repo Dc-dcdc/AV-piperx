@@ -24,7 +24,7 @@ for path in (ROOT_DIR, CURRENT_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/dppo_numba_cache")
+os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/av_piper_numba_cache")
 
 from quest_control import QuestControl
 from quest_receive import QuestReceive

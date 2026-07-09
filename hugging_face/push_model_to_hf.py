@@ -94,10 +94,10 @@ def push_model_folder_to_hf(
 
 if __name__ == "__main__":
     # 你的本地模型文件夹路径；通常末尾是 pretrained_model。
-    LOCAL_MODEL_DIR = "outputs/2_pretrain/train/2026-05-18/21-39-48_SewNeedle-3Arms-v0_pre_zed_wrist_act/checkpoints/032000_loss=0.0729_sr=0.0_ar=-113.35/pretrained_model"
+    LOCAL_MODEL_DIR = "outputs/2_pretrain/train/2026-05-18/21-39-48_InsertCylinder-3Arms-v0_pre_zed_wrist_act/checkpoints/032000_loss=0.0729_sr=0.0_ar=-113.35/pretrained_model"
 
     # 你的 Hugging Face 模型仓库，格式为 用户名/仓库名。
-    HF_REPO_ID = "Dc-dc/pre_sim_sew_needle_3arms_zed_wrist_act"
+    HF_REPO_ID = "Dc-dc/pre_sim_insert_cylinder_3arms_zed_wrist_act"
 
     # 上传到仓库内的子目录；如果想上传到仓库根目录，改成 "".
     PATH_IN_REPO = "pretrained_model"

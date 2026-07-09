@@ -1,0 +1,115 @@
+# @package _global_
+
+seed: 1000
+
+
+
+override_dataset_stats:
+  observation.images.zed_cam_left:
+    # stats from imagenet, since we use a pretrained vision model
+    mean: [[[0.485]], [[0.456]], [[0.406]]]  # (c,1,1)
+    std: [[[0.229]], [[0.224]], [[0.225]]]  # (c,1,1)
+  observation.images.zed_cam_right:
+    # stats from imagenet, since we use a pretrained vision model
+    mean: [[[0.485]], [[0.456]], [[0.406]]]  # (c,1,1)
+    std: [[[0.229]], [[0.224]], [[0.225]]]  # (c,1,1)
+
+training:
+  lr_scheduler: "cosine"    # 调度器策略：强烈推荐 "cosine" (余弦衰减)，让模型在末期平滑落地
+  lr_warmup_steps: 5000      # 预热步数：模型刚开始是白纸，用 500 步慢慢把学习率升到 1e-4，防止梯度爆炸，一般设置为总步数的1-5%
+  offline_steps: 500000      # 离线训练总步数
+  online_steps: 0
+  save_freq: 100         # 每 5000 步保存一次模型快照
+  eval_freq: 100         # 每 5000 步评估一次
+  save_checkpoint: true
+  num_workers: 4   # Number of workers for the offline training dataloader.
+  batch_size: 32
+  lr: 1e-4 # 学习率
+  lr_backbone: 1.0e-5    # 为骨干网络单独设置小学习率
+  adam_betas: [0.95, 0.999]
+  adam_eps: 1.0e-8
+  weight_decay: 1.0e-6  # L2正则化 1.0e-6
+  grad_clip_norm: 10 # 梯度裁剪
+  online_steps_between_rollouts: 1
+  # 时间戳计算
+  delta_timestamps:
+    # 动作向未来取 (例如 chunk_size 为 50)
+    action: "[i / ${env.fps} for i in range(${policy.horizon})]"
+    
+    # 状态和图片向过去取 (例如 n_obs_steps 为 2)
+    observation.state: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.zed_cam_left: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.zed_cam_right: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+
+policy:
+  name: two_model_diffusion
+  # ==========================================
+  # 0. 双模型动作拆分 (Two-Model Action Split)
+  # ==========================================
+  arm_action_dim: 14       # 左右双臂动作维度，默认 action[0:14]
+  view_action_dim: 6       # 中间臂/头部视角动作维度，默认 action[14:20]
+  view_loss_weight: 0.2    # 视角模型 loss 权重，避免视角动作压过双臂动作
+
+  # ==========================================
+  # 1. 形状与时序 (Shape & Temporal)
+  # ==========================================
+  n_obs_steps: 2 # 2帧历史画面
+  horizon : 16 # 推理总步数   一个horizon视为一个动作块
+  n_action_steps: 8 # 执行的实际步数
+
+  resize_shape: [240,320]
+  crop_shape: [216, 288] # ch, cw 480x640 90% [432, 576]  [216, 288]
+  crop_is_random: True  # 是否进行随机裁剪 
+  input_shapes:
+    # TODO(rcadene, alexander-soare): add variables for height and width from the dataset/env?
+    observation.images.zed_cam_left: [3, 480, 640]
+    observation.images.zed_cam_right: [3, 480, 640]
+    observation.state: ["${env.state_dim}"]
+  output_shapes:
+    action: ["${env.action_dim}"]
+
+  # Normalization / Unnormalization
+  input_normalization_modes:
+    observation.images.zed_cam_left: mean_std
+    observation.images.zed_cam_right: mean_std
+    observation.state: mean_std
+  output_normalization_modes:
+    action: min_max
+
+  # ==========================================
+  # 2. 视觉特征提取 (Vision Backbone)
+  # ==========================================
+  vision_backbone: resnet18
+  # 数据集小的情况下推荐使用预训练权重
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1 #预训练的视觉编码器模型，一般来说会设置较小的lr_backbone进行微调，
+  # Diffusion 更偏向于使用 GroupNorm(特别是use_ema=true时)，但预训练模型与BatchNorm的绑定，所以只能二选一
+  use_group_norm: false                #  如果使用了预训练参数，则设置为false
+  spatial_softmax_num_keypoints: 32    #  提取图片关键点，替代 ACT 的特征平铺
+
+  # ==========================================
+  # 3. U-Net 降噪网络架构 (U-Net Architecture)
+  # ==========================================
+  down_dims: [256, 512, 1024]    #[128, 256, 512],[256, 512, 1024]，[512, 1024, 2048] 
+  kernel_size: 5
+  n_groups: 8
+  diffusion_step_embed_dim: 128
+  use_film_scale_modulation: true     # 【关键】将状态特征通过 FiLM 层注入 U-Net
+
+  # ==========================================
+  # 4. 噪声调度器 (Noise Scheduler)
+  # ==========================================
+  noise_scheduler_type: DDIM          # 噪声调度器
+  num_inference_steps: 10             # 去噪步数
+  num_train_timesteps: 100            # 训练时的总加噪步数
+  beta_schedule: squaredcos_cap_v2    # 建议的 beta 调度策略，确保加噪过程更加平滑，平替beta_start和beta_end的线性加噪
+  beta_start: 0.0001                  # 初始噪声方差。代表在第一步加噪时，只加入极小量（0.01%）的噪声
+  beta_end: 0.02                      # 最终噪声方差
+  prediction_type: epsilon            # 预测目标：噪声 (epsilon)
+  clip_sample: True                  # 对输出值进行截断
+  clip_sample_range: 1.0              # 截断范围[-1,1]
+
+  # ==========================================
+  # 5. 推理与 EMA (Inference & EMA)
+  # ==========================================
+  use_ema: true                       # 【关键】必须开启,降低精度提升推理速度
+  ema_decay: 0.999                   # 【关键】EMA 的衰减系数

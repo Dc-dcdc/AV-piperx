@@ -1,0 +1,113 @@
+# @package _global_
+# 冻结 ZED-only 预训练 Diffusion，只训练 20 维动作上的单个 residual MLP。
+# 可用命令查看最终合并结果:
+# python train/finetune/finetune_mlp.py policy=ft_zed_diffusion_mlp --cfg job
+
+seed: 1000  # 随机种子
+dataset_repo_id: "av_piper_online_rollout"  # Logger 数据集标识
+
+env:
+  name: guided_vision  # Gym 环境命名空间
+  task: InsertCylinder-3Arms-v0  # 任务名称
+  n_envs: 1  # 并行环境数量
+
+training:
+  pretrained_ckpt_path: "outputs/1_hugging_model/pre_sim_insert_cylinder_3arms_zed_diffusion"  # ZED-only 预训练权重目录
+
+  n_critic_warmup_itr: 5  # Critic 预热轮数
+
+  n_train_itr: 1000  # PPO 总训练轮数
+  rollout_steps: 400  # 每轮采集 action chunk 数
+  batch_size: 16  # PPO minibatch 大小
+  update_epochs: 2  # 每轮 PPO 更新 epoch 数
+
+  actor_lr: 5e-6  # residual MLP 学习率
+  critic_lr: 3e-4  # Critic 学习率
+  weight_decay: 1e-6  # 权重衰减
+  actor_lr_warmup_iters: 5  # Actor 学习率预热步数
+
+  gamma: 0.99  # 回报折扣因子
+  gae_lambda: 0.98  # GAE 平滑系数
+  clip_ratio: 0.06  # PPO ratio 截断范围
+  target_kl: 0.015  # PPO KL 早停阈值
+  grad_accumulate: 4  # 梯度累计步数
+  reward_scale_running: true  # 是否按运行方差缩放奖励
+  reward_scale_const: 1.0  # 奖励常数倍率
+  norm_adv: true  # 是否归一化 advantage
+  clip_advantage_lower_quantile: 0.05  # advantage 下分位裁剪
+  clip_advantage_upper_quantile: 0.95  # advantage 上分位裁剪
+  reward_source: "success_label"  # 训练奖励来源
+  success_label_success_reward: 1.0  # 成功 episode 终止奖励
+  success_label_failure_reward: -1.0  # 失败 episode 终止惩罚
+  success_label_nonterminal_reward: 0.0  # 未结束 chunk 中间奖励
+  success_time_bonus: 0.3  # 成功越早完成获得的额外奖励
+  success_time_max_steps: 400  # 计算时间奖励使用的最大步数
+  svm_reward_enable: true  # 是否启用 SVM 过程奖励
+  svm_reward_coef: 0.05  # SVM 过程奖励缩放系数
+  svm_reward_clip: 5.0  # SVM logit 奖励裁剪范围
+  svm_feature_mode: "global_base_residual"  # SVM 判别器输入特征组成
+  svm_disc_hidden_dim: 256  # SVM 判别器隐藏层宽度
+  svm_disc_depth: 3  # SVM 判别器隐藏层数量
+  svm_disc_lr: 1e-4  # SVM 判别器学习率
+  svm_disc_weight_decay: 0.0  # SVM 判别器权重衰减
+  svm_disc_batch_size: 64  # SVM 判别器 batch 大小
+  svm_disc_updates: 32  # 每轮 rollout 后的 SVM 更新步数
+  svm_buffer_max_transitions: 50000  # SVM 正负样本各自最多保留访问样本数
+  svm_buffer_storage: "disk"  # SVM 样本缓存方式，disk 表示写入磁盘
+  svm_buffer_dir: "outputs/buffer"  # SVM 磁盘缓存目录
+  svm_buffer_reset: true  # 启动训练时是否清空旧 SVM 磁盘缓存
+  svm_min_positive: 128  # 启用 SVM 训练所需最少成功访问样本数
+  svm_min_negative: 128  # 启用 SVM 训练所需最少失败访问样本数
+  bootstrap_on_truncation: false  # 截断结束时是否 bootstrap
+
+  residual_mlp_mode: "joint"  # residual MLP 结构，joint 表示单个 20 维 MLP
+  residual_mlp_condition: "global_cond"  # residual MLP 输入是否接入 Diffusion 全局条件
+  residual_mlp_stepwise_obs: true  # 是否在每个控制步用最新观测修正 DP 长序列动作
+  ppo_control_step_training: true  # 是否把 PPO 样本展开到每个控制步
+  arm_action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # split 模式双臂动作维度
+  cam_action_indices: [14, 15, 16, 17, 18, 19]  # split 模式头部/相机动作维度
+  residual_mlp_hidden_dim: 512  # residual MLP 隐藏层宽度
+  residual_mlp_depth: 2  # residual MLP 层数
+  lambda_all: 1.0  # 20 维 residual 缩放
+  lambda_arm: 1.0  # 双臂残差缩放
+  lambda_cam: 1.0  # 头部/相机残差缩放
+  residual_mlp_max_delta: 0.015  # residual 单维动作最大修正幅度
+  residual_mlp_std: 0.008  # residual 动作采样标准差
+  residual_mlp_learn_std: true  # 是否学习采样标准差
+  logprob_reduction: mean  # action chunk logprob 聚合方式
+
+  use_disk_cache: true  # 是否使用磁盘缓存 rollout
+  skip_update: false  # 是否跳过网络更新
+  update_actor: true  # 是否更新 residual actor
+  show_progress: false  # 是否显示进度条
+  rollout_progress: true  # 是否显示 rollout 采集进度条
+  rollout_log_interval: 0  # 关闭 rollout 周期日志，只看进度条
+  training_progress: true  # 是否显示 PPO 训练进度条
+  training_log_interval: 0  # 关闭训练周期日志，只看进度条
+  quiet_terminal: true  # 是否屏蔽冗余终端输出
+
+  bc_loss_coef: 3.0  # residual 偏离 Diffusion 的 MSE 正则系数
+
+  rollback_on_eval_collapse: true  # 评估崩溃时是否回滚
+  rollback_success_rate: 0.25  # 绝对回滚成功率阈值
+  rollback_success_drop: 0.20  # 相对历史最佳成功率的最大允许下降
+  rollback_min_best_success: 0.50  # 启用相对回滚前需要达到的历史最佳成功率
+  rollback_reward_gate: false  # 是否要求奖励也低于阈值才回滚
+  rollback_reward: -100.0  # 回滚平均奖励阈值
+  rollback_patience: 2  # 连续崩溃容忍次数
+
+eval:
+  eval_freq: 2  # 评估频率
+  render_camera: ['overhead_cam']  # 评估录像视角
+  checkpoint_metric: "success"  # checkpoint 筛选指标
+  max_checkpoints: 20  # 最多保留 checkpoint 数
+  n_episodes: 20  # 每次评估 episode 数
+  max_steps: 400  # 每个评估 episode 最大步数
+  max_episodes_rendered: 1  # 最多保存录像 episode 数
+  records_resume: true  # 是否读取历史 top-k 记录
+  fps: 25  # 录像帧率
+
+policy:
+  name: diffusion  # 基础策略类型
+  n_action_steps: 8  # 每个 action chunk 实际执行步数
+  ft_denoising_steps: 10  # 兼容旧 DPPO 配置字段

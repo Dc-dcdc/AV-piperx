@@ -128,7 +128,7 @@ if __name__ == '__main__':
     mjcf 模块提供了更高层次的接口，将XML转换为可编辑的mjcf_root对象树，可以进行参数修改和各个xml文件的组合，
     最后通过mjcf.Physics.from_mjcf_model(mjcf_root) 创建物理引擎实例，加载机器人模型并设置时间步长。
     '''
-    xml_path = os.path.join(XML_DIR, f'single_arm.xml')
+    xml_path = os.path.join(XML_DIR, f'task_insert_cylinder_piper.xml')
     mjcf_root = mjcf.from_path(xml_path)  
     mjcf_root.option.timestep = PHYSICS_DT  # 仿真时间步长，即控制频率
     

@@ -10,13 +10,12 @@ if str(ROOT_DIR) not in sys.path:
 
 import gymnasium as gym
 import env
-from env.task.sew_needle_env import SewNeedleEnv
 import logging
 import time
 from contextlib import nullcontext
 from pprint import pformat
 
-from train.pretrain.eval_train import  evaluate_and_checkpoint_if_needed,TopKCheckpointManager
+from train.pretrain.eval_train import evaluate_and_checkpoint_if_needed, TopKCheckpointManager, make_eval_env
 
 import hydra
 import torch
@@ -144,7 +143,7 @@ def make_optimizer_and_scheduler(cfg, policy):
             optimizer_params_dicts, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
         )
         lr_scheduler = None
-    elif cfg.policy.name == "diffusion":
+    elif cfg.policy.name in ["diffusion", "dual_head_diffusion", "two_model_diffusion"]:
         # 修复：分离视觉 Backbone 和 U-Net 的学习率，并将所有参数纳入优化器
         optimizer_params_dicts = [
             {
@@ -204,6 +203,72 @@ def make_optimizer_and_scheduler(cfg, policy):
 
 
 
+def interpolate_view_action_targets(
+    action: torch.Tensor,
+    action_is_pad: torch.Tensor | None,
+    *,
+    start: int,
+    dim: int,
+    stride: int,
+) -> torch.Tensor:
+    """对 action[..., start:start+dim] 做关键帧线性插值平滑，双臂动作保持原始高频。"""
+    stride = max(1, int(stride))
+    end = int(start) + int(dim)
+    if stride <= 1 or action.ndim != 3 or action.shape[-1] < end:
+        return action
+
+    smoothed = action.clone()
+    batch_size, horizon = action.shape[:2]
+    for batch_idx in range(batch_size):
+        valid_len = horizon
+        if action_is_pad is not None:
+            pad_indices = torch.nonzero(action_is_pad[batch_idx].bool(), as_tuple=False)
+            if pad_indices.numel() > 0:
+                valid_len = int(pad_indices[0].item())
+        if valid_len <= 1:
+            continue
+
+        key_indices = list(range(0, valid_len, stride))
+        if key_indices[-1] != valid_len - 1:
+            key_indices.append(valid_len - 1)
+
+        for left, right in zip(key_indices[:-1], key_indices[1:], strict=True):
+            if right <= left:
+                continue
+            left_value = action[batch_idx, left, start:end]
+            right_value = action[batch_idx, right, start:end]
+            alpha = torch.linspace(
+                0.0,
+                1.0,
+                right - left + 1,
+                device=action.device,
+                dtype=action.dtype,
+            ).unsqueeze(-1)
+            smoothed[batch_idx, left : right + 1, start:end] = left_value * (1.0 - alpha) + right_value * alpha
+
+    return smoothed
+
+
+def smooth_batch_view_action_targets(batch: dict, cfg: DictConfig) -> int:
+    """根据 training.view_action_smooth_* 配置平滑训练 batch 中的视角动作 target。"""
+    if "action" not in batch:
+        return 1
+    training_cfg = cfg.training
+    stride = int(training_cfg.get("view_action_smooth_stride", 1))
+    start = int(training_cfg.get("view_action_smooth_start", 14))
+    dim = int(training_cfg.get("view_action_smooth_dim", 6))
+    if stride <= 1:
+        return stride
+    batch["action"] = interpolate_view_action_targets(
+        batch["action"],
+        batch.get("action_is_pad"),
+        start=start,
+        dim=dim,
+        stride=stride,
+    )
+    return stride
+
+
 def update_policy(
     policy,
     batch,
@@ -213,6 +278,7 @@ def update_policy(
     lr_scheduler=None,
     use_amp: bool = False,
     lock=None,
+    cfg: DictConfig | None = None,
 ):
     """进行一次训练更新，计算损失，反向传播，更新模型参数，并返回一个包含训练信息的字典."""
     start_time = time.perf_counter()
@@ -221,6 +287,7 @@ def update_policy(
     # ==========================================
     # 1. 向前传播计算loss
     # ==========================================
+    view_action_smooth_stride = smooth_batch_view_action_targets(batch, cfg) if cfg is not None else 1
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16) if use_amp else nullcontext(): # 如果 use_amp = True，它会开启 torch.autocast，意味着接下来的计算会自动在 Float32 和 Float16 之间切换，省显存且加速
         output_dict = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
@@ -270,6 +337,7 @@ def update_policy(
         "grad_norm": float(grad_norm),
         "lr": optimizer.param_groups[0]["lr"],
         "update_s": time.perf_counter() - start_time,
+        "view_action_smooth_stride": int(view_action_smooth_stride),
     }
     # 遍历 output_dict，安全地提取数据
     for k, v in output_dict.items():
@@ -314,12 +382,20 @@ def log_train_info(logger: Logger, info, step, cfg, dataset):
         # number of time all unique samples are seen
         f"epch:{num_epochs:.2f}", #计算得到的训练轮次
         f"loss:{loss:.3f}",
+    ]
+    if "arm_loss" in info:
+        log_items.append(f"arm_loss:{info['arm_loss']:.3f}")
+    if "view_loss" in info:
+        log_items.append(f"view_loss:{info['view_loss']:.3f}")
+    if int(info.get("view_action_smooth_stride", 1)) > 1:
+        log_items.append(f"view_smooth_stride:{int(info['view_action_smooth_stride'])}")
+    log_items.extend([
         f"grdn:{grad_norm:.3f}", #梯度范数，衡量了模型参数更新的幅度，过大可能导致训练不稳定，过小可能导致训练停滞
         f"lr:{lr:0.1e}",
         # in seconds
         f"updt_s:{update_s:.3f}", #模型参数更新所花费的时间
         f"data_s:{dataloading_s:.3f}",  # 一般趋近于0，如果这个时间过长，说明cpu太弱了
-    ]
+    ])
     logging.info(" ".join(log_items))
 
     info["step"] = step
@@ -393,7 +469,7 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
         raise ValueError("配置文件`delta_timestamps` 中缺失了最核心的 `action` 时间轴！\n")
         
     # 软警告（可选）：Diffusion 通常还需要历史视觉帧，如果没写，可以给个黄字警告
-    if cfg.policy.name == "diffusion" and not any("images" in k for k in delta_timestamps_dict.keys()):
+    if cfg.policy.name in ["diffusion", "dual_head_diffusion", "two_model_diffusion"] and not any("images" in k for k in delta_timestamps_dict.keys()):
         import logging
         logging.warning("警告: 你的 `delta_timestamps` 中没有包含任何图片的过去时间帧。\n")
 
@@ -683,18 +759,13 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         raise ValueError(f"严重冲突：模型中未找到相机相关参数。请检查模型输入是否正确。")
     obs_cameras = list(dict.fromkeys(ref_cams + cfg.eval.render_camera))
 
-    # 读取 YAML 中的 name ("guided_vision") 和 task ("SewNeedle-2Arms-v0")
-    # 拼接出 "guided_vision/SewNeedle-2Arms-v0"
+    # 读取 YAML 中的 name ("guided_vision") 和 task ("InsertCylinder-3Arms-v0")
+    # 拼接出 "guided_vision/InsertCylinder-3Arms-v0"
     env_id = f"{cfg.env.name}/{cfg.env.task}" 
     
     logging.info(f"正在通过 Gym 注册表构建环境: {env_id}")
 
-    # 使用 gym.make 创建环境，并通过 kwargs 强行覆盖你需要的相机
-    eval_env = gym.make(
-        id=env_id, 
-        disable_env_checker=True,  
-        cameras=obs_cameras,  # 👈 这里的传参会直接覆盖 __init__.py 里的默认套餐！
-    )
+    eval_env = make_eval_env(env_id, obs_cameras, cfg.eval)
     logging.info(f"✅ 环境加载成功！最终挂载的相机: {obs_cameras}")
 
     # ==========================================
@@ -708,6 +779,14 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
                                     records_resume=records_resume, 
                                     metric=checkpoint_metric)
     policy.train()
+    view_action_smooth_stride = int(cfg.training.get("view_action_smooth_stride", 1))
+    if view_action_smooth_stride > 1:
+        logging.info(
+            "训练 target 视角动作插值平滑已启用: "
+            f"action[{int(cfg.training.get('view_action_smooth_start', 14))}:"
+            f"{int(cfg.training.get('view_action_smooth_start', 14)) + int(cfg.training.get('view_action_smooth_dim', 6))}] "
+            f"stride={view_action_smooth_stride}"
+        )
     logging.info("开始 DPPO 预训练 (模仿学习阶段)...")
     
     # 从 start_step 开始，避免覆盖之前的进度！
@@ -731,6 +810,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
             grad_scaler=grad_scaler,
             lr_scheduler=lr_scheduler,
             use_amp=cfg.use_amp, # 是否使用混合精度训练，把部分计算从 float32 改成 float16，速度快 30%~100%
+            cfg=cfg,
         )
         train_info["dataloading_s"] = dataloading_s
 
@@ -773,16 +853,19 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 命令行手动传入同名参数时，会优先生效。
     default_args = [
-        f"env=sim_sew_needle_3arms",
+        f"env=sim_insert_cylinder_3arms",
         f"policy=collect_zed_wrist_diffusion",
         # 额外采集数据集；留空只使用 env 配置中的原始 dataset_repo_id。
-        # 如果要加入新采集数据，就改成: f"+collect_dataset_repo_id=Dc-dc/collect_sim_sew_needle_3arms"
-        f"+collect_dataset_repo_id='Dc-dc/collect_sim_sew_needle_3arms'",
+        # 如果要加入新采集数据，就改成: f"+collect_dataset_repo_id=Dc-dc/collect_sim_insert_cylinder_3arms"
+        f"+collect_dataset_repo_id='Dc-dc/collect_sim_insert_cylinder_3arms'",
         f"resume=True",
-        f"resume_path='outputs/1_hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion'",
+        f"resume_path='outputs/1_hugging_model/pre_sim_insert_cylinder_3arms_zed_wrist_diffusion'",
         f"+resume_training_state=False",  #是否恢复训练状态（优化器、调度器、步数等），false仅加载模型权重
         f"training.batch_size=16",
         f"training.num_workers=4",
+        f"+training.view_action_smooth_stride=2", # 视角/中间臂动作 target 每2步一个关键帧，线性插值回25Hz；设为1关闭。
+        f"+training.view_action_smooth_start=14",
+        f"+training.view_action_smooth_dim=6",
         f"wandb.enable=False",
     ]
     for arg in default_args:

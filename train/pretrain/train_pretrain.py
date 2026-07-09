@@ -15,13 +15,12 @@ if str(ROOT_DIR) not in sys.path:
 
 import gymnasium as gym
 import env
-from env.task.sew_needle_env import SewNeedleEnv
 import logging
 import time
 from contextlib import nullcontext
 from pprint import pformat
 
-from train.pretrain.eval_train import  evaluate_and_checkpoint_if_needed,TopKCheckpointManager
+from train.pretrain.eval_train import evaluate_and_checkpoint_if_needed, TopKCheckpointManager, make_eval_env
 
 import hydra
 import datasets
@@ -77,7 +76,7 @@ def make_optimizer_and_scheduler(cfg, policy):
             optimizer_params_dicts, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
         )
         lr_scheduler = None
-    elif cfg.policy.name == "diffusion":
+    elif cfg.policy.name in ["diffusion", "dual_head_diffusion", "two_model_diffusion"]:
         # 🌟 修复：分离视觉 Backbone 和 U-Net 的学习率，并将所有参数纳入优化器
         optimizer_params_dicts = [
             {
@@ -247,12 +246,18 @@ def log_train_info(logger: Logger, info, step, cfg, dataset):
         # number of time all unique samples are seen
         f"epch:{num_epochs:.2f}", #计算得到的训练轮次
         f"loss:{loss:.3f}",
+    ]
+    if "arm_loss" in info:
+        log_items.append(f"arm_loss:{info['arm_loss']:.3f}")
+    if "view_loss" in info:
+        log_items.append(f"view_loss:{info['view_loss']:.3f}")
+    log_items.extend([
         f"grdn:{grad_norm:.3f}", #梯度范数，衡量了模型参数更新的幅度，过大可能导致训练不稳定，过小可能导致训练停滞
         f"lr:{lr:0.1e}",
         # in seconds
         f"updt_s:{update_s:.3f}", #模型参数更新所花费的时间
         f"data_s:{dataloading_s:.3f}",  # 一般趋近于0，如果这个时间过长，说明cpu太弱了
-    ]
+    ])
     logging.info(" ".join(log_items))
 
     info["step"] = step
@@ -326,7 +331,7 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
         raise ValueError("配置文件`delta_timestamps` 中缺失了最核心的 `action` 时间轴！\n")
         
     # ⚠️ 软警告（可选）：Diffusion 通常还需要历史视觉帧，如果没写，可以给个黄字警告
-    if cfg.policy.name == "diffusion" and not any("images" in k for k in delta_timestamps_dict.keys()):
+    if cfg.policy.name in ["diffusion", "dual_head_diffusion", "two_model_diffusion"] and not any("images" in k for k in delta_timestamps_dict.keys()):
         import logging
         logging.warning("警告: 你的 `delta_timestamps` 中没有包含任何图片的过去时间帧。\n")
 
@@ -419,6 +424,22 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     logging.info(pformat(OmegaConf.to_container(cfg))) #打印配置cfg
 
     # 初始化日志记录器与设备
+    wandb_enabled = bool(getattr(cfg.wandb, "enable", False))
+    disable_system_stats = bool(getattr(cfg.wandb, "disable_system_stats", False))
+    disable_machine_info = bool(getattr(cfg.wandb, "disable_machine_info", False))
+    if wandb_enabled and (disable_system_stats or disable_machine_info):
+        import wandb
+
+        wandb.setup(
+            settings=wandb.Settings(
+                x_disable_stats=disable_system_stats,
+                x_disable_machine_info=disable_machine_info,
+            )
+        )
+        logging.info(
+            f"W&B系统数据设置: disable_system_stats={disable_system_stats}, "
+            f"disable_machine_info={disable_machine_info}"
+        )
     logger = Logger(cfg, out_dir, wandb_job_name=job_name)
     set_global_seed(cfg.seed)
     device = get_safe_torch_device(cfg.device, log=True)
@@ -621,18 +642,13 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         raise ValueError(f"❌ 严重冲突：模型中未找到相机相关参数。请检查模型输入是否正确。")
     obs_cameras = list(dict.fromkeys(ref_cams + cfg.eval.render_camera))
 
-    # 读取 YAML 中的 name ("guided_vision") 和 task ("SewNeedle-2Arms-v0")
-    # 拼接出 "guided_vision/SewNeedle-2Arms-v0"
+    # 读取 YAML 中的 name ("guided_vision") 和 task ("InsertCylinder-3Arms-v0")
+    # 拼接出 "guided_vision/InsertCylinder-3Arms-v0"
     env_id = f"{cfg.env.name}/{cfg.env.task}" 
     
     logging.info(f"正在通过 Gym 注册表构建环境: {env_id}")
 
-    # 使用 gym.make 创建环境，并通过 kwargs 强行覆盖你需要的相机
-    eval_env = gym.make(
-        id=env_id, 
-        disable_env_checker=True,  
-        cameras=obs_cameras,  # 👈 这里的传参会直接覆盖 __init__.py 里的默认套餐！
-    )
+    eval_env = make_eval_env(env_id, obs_cameras, cfg.eval)
     logging.info(f"✅ 环境加载成功！最终挂载的相机: {obs_cameras}")
 
     # ==========================================
@@ -713,11 +729,11 @@ if __name__ == "__main__":
         "dataset_local_dir=outputs/5_hf_datasets/quest_teleop_insert_cylinder_3arms_rgb_joint",
         "dataset_repo_id=Dc-dc/quest_teleop_insert_cylinder_3arms_rgb_joint",
         "env=sim_insert_cylinder_3arms", # 环境，这俩定义在default文件中
-        "policy=pre_zed_diffusion", # 策略
+        "policy=pre_zed_dual_head_diffusion", # 策略
         "resume=false",
-        "resume_path='outputs/2_pretrain/train/2026-05-19/00-57-05_SewNeedle-3Arms-v0_pre_zed_static_wrist_diffusion/checkpoints/108000_loss=0.0111_sr=0.0_ar=-64.33'",
+        "resume_path='outputs/2_pretrain/train/2026-05-19/00-57-05_InsertCylinder-3Arms-v0_pre_zed_static_wrist_diffusion/checkpoints/108000_loss=0.0111_sr=0.0_ar=-64.33'",
         "training.batch_size=16",
-        "training.num_workers=4",
+        "training.num_workers=8",
         "wandb.enable=false",
     ]
     

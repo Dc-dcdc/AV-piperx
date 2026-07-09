@@ -41,7 +41,7 @@ from PIL import Image, ImageDraw
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_XML_PATH = PROJECT_ROOT / "env" / "assets" / "task_sew_needle.xml"
+DEFAULT_XML_PATH = PROJECT_ROOT / "env" / "assets" / "task_insert_cylinder_piper.xml"
 
 
 def is_cv2_usable() -> bool:

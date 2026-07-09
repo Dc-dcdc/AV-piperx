@@ -1,20 +1,20 @@
 # @package _global_
-# 冻结预训练 Diffusion，只训练 20 维动作上的双 residual MLP。
+# 冻结预训练 Diffusion，只训练 20 维动作上的单个 residual MLP。
 # 可用命令查看最终合并结果:
 # python train/finetune/test_finetune.py --cfg job
 
 seed: 1000
-dataset_repo_id: "dppo_online_rollout"
+dataset_repo_id: "av_piper_online_rollout"
 
 env:
   name: guided_vision
-  task: SewNeedle-3Arms-v0
+  task: InsertCylinder-3Arms-v0
   # 调试建议先用单环境，确认 MLP/PPO 链路无误后再改成 5。
   n_envs: 1
 
 training:
   # 预训练 Diffusion 权重目录；运行前按你的真实路径修改。
-  pretrained_ckpt_path: "outputs/1_hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion"
+  pretrained_ckpt_path: "outputs/1_hugging_model/pre_sim_insert_cylinder_3arms_zed_wrist_diffusion"
 
   # Critic 预热期间只训练 Critic，不更新后置 MLP。
   n_critic_warmup_itr: 5
@@ -26,7 +26,7 @@ training:
   update_epochs: 2
 
   # 后置 MLP 是唯一被 PPO 更新的 actor 部分，可以比直接微调 Diffusion 稍大一点。
-  actor_lr: 1e-5
+  actor_lr: 3e-6
   critic_lr: 3e-4
   weight_decay: 1e-6
   actor_lr_warmup_iters: 5
@@ -34,48 +34,87 @@ training:
   # PPO / GAE 参数。
   gamma: 0.99
   gae_lambda: 0.95
-  clip_ratio: 0.08
-  target_kl: 0.03
+  clip_ratio: 0.04
+  target_kl: 0.01
   grad_accumulate: 4
   reward_scale_running: true
   reward_scale_const: 1.0
   norm_adv: true
   clip_advantage_lower_quantile: 0.05
   clip_advantage_upper_quantile: 0.95
+  reward_source: "success_label"              # 训练奖励来源：只用成功/失败标签
+  success_label_success_reward: 1.0           # 成功 episode 的终止奖励
+  success_label_failure_reward: -1.0          # 失败 episode 的终止惩罚
+  success_label_nonterminal_reward: 0.0       # 未结束 chunk 的中间奖励
+  success_time_bonus: 0.3                     # 成功越早完成获得的额外奖励
+  success_time_max_steps: 400                 # 计算时间奖励使用的最大步数
+  svm_reward_enable: true                     # 是否启用 SVM 过程奖励
+  svm_reward_coef: 0.05                       # SVM 过程奖励缩放系数
+  svm_reward_clip: 5.0                        # SVM logit 奖励裁剪范围
+  svm_feature_mode: "global_base_residual"    # SVM 判别器输入特征组成
+  svm_disc_hidden_dim: 256                    # SVM 判别器隐藏层宽度
+  svm_disc_depth: 3                           # SVM 判别器隐藏层数量
+  svm_disc_lr: 1e-4                           # SVM 判别器学习率
+  svm_disc_weight_decay: 0.0                  # SVM 判别器权重衰减
+  svm_disc_batch_size: 64                     # SVM 判别器 batch 大小
+  svm_disc_updates: 32                        # 每轮 rollout 后的 SVM 更新步数
+  svm_buffer_max_transitions: 50000           # SVM 正负样本各自最多保留访问样本数
+  svm_buffer_storage: "disk"                  # SVM 样本缓存方式，disk 表示写入磁盘
+  svm_buffer_dir: "outputs/buffer"            # SVM 磁盘缓存目录
+  svm_buffer_reset: true                      # 启动训练时是否清空旧 SVM 磁盘缓存
+  svm_min_positive: 128                       # 启用 SVM 训练所需最少成功访问样本数
+  svm_min_negative: 128                       # 启用 SVM 训练所需最少失败访问样本数
+  bootstrap_on_truncation: false              # 截断结束时不做价值 bootstrap
 
-  # Frozen Diffusion + 双 residual MLP。
+  # Frozen Diffusion + 条件 residual MLP。
   # 20 维动作顺序: left[0:7], right[7:14], middle/cam[14:20]。
   # 初始最后一层为 0，因此 mean action 初始等价于预训练 Diffusion 输出。
+  residual_mlp_mode: "joint"       # residual MLP 结构，joint 表示单个 20 维 MLP
+  residual_mlp_condition: "global_cond"  # residual MLP 输入是否接入 Diffusion 全局条件
+  residual_mlp_stepwise_obs: true  # 是否在每个控制步用最新观测修正 DP 长序列动作
+  ppo_control_step_training: true  # 是否把 PPO 样本展开到每个控制步
   arm_action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
   cam_action_indices: [14, 15, 16, 17, 18, 19]
   residual_mlp_hidden_dim: 512
   residual_mlp_depth: 2
+  lambda_all: 1.0                  # 20 维 residual 缩放
   lambda_arm: 1.0
   lambda_cam: 1.0
+  residual_mlp_max_delta: 0.01       # residual 单维动作最大修正幅度
   residual_mlp_std: 0.02
   residual_mlp_learn_std: true
   logprob_reduction: mean
 
   # 调试开关。
-  use_disk_cache: false
+  use_disk_cache: true         # 是否使用磁盘缓存 rollout
   skip_update: false
   update_actor: true
+  show_progress: false        # 关闭训练进度条输出
+  rollout_progress: true      # 开启 rollout 数据采集进度条
+  rollout_log_interval: 0     # 关闭 rollout 周期日志，只看进度条
+  training_progress: true     # 开启 PPO 训练更新进度条
+  training_log_interval: 0    # 关闭训练周期日志，只看进度条
+  quiet_terminal: true        # 屏蔽环境冗余终端输出
 
   # 防止后置 MLP 初期过度偏离 Diffusion 输出；设为 0 则关闭。
-  bc_loss_coef: 0.0
+  bc_loss_coef: 3.0                # residual 偏离 Diffusion 的 MSE 正则系数
 
   # 评估崩溃回滚。
   rollback_on_eval_collapse: true
-  rollback_success_rate: 0.1
+  rollback_success_rate: 0.25
+  rollback_success_drop: 0.20        # 相对历史最佳成功率的最大允许下降
+  rollback_min_best_success: 0.50    # 启用相对回滚前需要达到的历史最佳成功率
+  rollback_reward_gate: false        # 是否要求奖励也低于阈值才回滚
   rollback_reward: -100.0
   rollback_patience: 1
 
 eval:
   eval_freq: 2
   render_camera: ['overhead_cam']
-  checkpoint_metric: "reward"
+  checkpoint_metric: "success" # 按评估成功率保留 checkpoint
   max_checkpoints: 20
   n_episodes: 20
+  max_steps: 400              # 每个评估 episode 最大步数
   max_episodes_rendered: 1
   records_resume: true
   fps: 25
