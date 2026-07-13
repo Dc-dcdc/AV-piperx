@@ -28,7 +28,8 @@ training:
   gae_lambda: 0.95             # GAE 优势计算参数
   clip_ratio: 0.05             # PPO 截断范围
   gamma_denoising: 0.99
-  weight_decay: 1e-6
+  actor_weight_decay: 0.0
+  critic_weight_decay: 0.0
   min_sampling_denoising_std: 0.04
   min_logprob_denoising_std: 0.04
   target_kl: 0.05

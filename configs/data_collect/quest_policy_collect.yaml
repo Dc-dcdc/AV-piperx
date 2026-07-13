@@ -1,0 +1,86 @@
+# 预训练策略 + Quest3 分区接管数据采集默认配置
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+# ===== 1. 策略与推理设备 =====
+ckpt_path: outputs/2_pretrain/train/
+device: cuda
+random_seed: 100
+
+# ===== 2. Quest3 位姿通信 =====
+host: 0.0.0.0
+port: 5005
+timeout: 0.0  # 非阻塞读取，未收到新包时继续使用上一帧
+
+# ===== 3. 数据保存 =====
+output_dir: outputs/4_data_collect/quest_policy
+run_name: null
+append: true
+fps: 25
+save_rgb: true
+save_videos: true
+save_depth: false
+video_queue_size: 300
+save_pose_action: true
+save_reward_debug: false
+min_steps_to_save: 2
+max_steps_per_episode: 600
+record_cameras:
+  - zed_cam_left
+  - zed_cam_right
+  - wrist_cam_left
+  - wrist_cam_right
+  - overhead_cam
+  - worms_eye_cam
+
+# ===== 4. 仿真与接管控制 =====
+env_id: null  # null 表示使用 checkpoint 中保存的环境
+episode_length: 100000
+takeover_blend_steps: 15
+hand_position_scale: 1.0
+head_position_scale: 1.0
+hand_max_delta: 1.0
+head_max_delta: 1.0
+head_control: true
+individual_hand_anchors: true
+lock_roll: true
+lock_pitch: true
+workspace_low: null
+workspace_high: null
+mujoco_gl: auto
+
+# ===== 5. 图像观测与显示 =====
+display_camera: zed_cam_left
+render_width: 640
+render_height: 480
+window_name: Quest Policy Takeover Collect
+viewer: true
+camera_window: true
+depth_vis_min: 0.0
+depth_vis_max: 2.0
+
+# ===== 6. 发送给 Unity/Quest 的画面 =====
+unity_image_stream: true
+unity_image_source: rgb
+unity_image_stereo: true
+unity_left_camera: zed_cam_left
+unity_right_camera: zed_cam_right
+unity_image_host: auto
+unity_image_port: 5010
+unity_image_hz: 25.0
+unity_image_jpeg_quality: 55
+unity_image_chunk_size: 1000
+unity_image_log_interval: 2.0
+
+# ===== 7. 状态打印 =====
+status_hz_interval: 0.5
+
+# ===== 8. Hydra 输出控制 =====
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false
+  output_subdir: null

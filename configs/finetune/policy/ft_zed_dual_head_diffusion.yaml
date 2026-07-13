@@ -1,10 +1,9 @@
 # @package _global_
-# ZED-only Diffusion checkpoint 的 DPPO 微调配置。
-# 可用命令查看最终合并结果:
-# python train/finetune/finetune_dppo.py policy=ft_zed_diffusion --cfg job
+# ZED双扩散头模型的DPPO微调配置。
+# 启动时请显式覆盖training.pretrained_ckpt_path为具体checkpoint目录。
 
 seed: 1000
-dataset_repo_id: "av_piper_dppo_zed_rollout"
+dataset_repo_id: "av_piper_dppo_zed_dual_head_rollout"
 
 env:
   name: guided_vision
@@ -12,7 +11,7 @@ env:
   n_envs: 2
 
 training:
-  pretrained_ckpt_path: "outputs/2_pretrain/train/2026-06-26/17-07-44_InsertCylinder-3Arms-v0_pre_zed_diffusion/checkpoints/148000_loss=0.0026_sr=0.0_ar=387.35"
+  pretrained_ckpt_path: "outputs/2_pretrain/train/2026-07-07/10-04-25_InsertCylinder-3Arms-v0_pre_zed_dual_head_diffusion/checkpoints/REPLACE_WITH_CHECKPOINT"
 
   n_train_itr: 1000
   n_critic_warmup_itr: 2
@@ -20,14 +19,18 @@ training:
   batch_size: 32
   update_epochs: 10
 
-  actor_lr: 1e-7
-  critic_lr: 5e-5
+  # both、arm_only、view_only。
+  train_head: both
+  view_loss_coef: 1.0
+  train_vision_encoder: false
+
+  actor_lr: 5e-7
+  critic_lr: 2e-4
   critic_hidden_dims: [256, 256, 256]
   critic_activation: Mish
   critic_use_layernorm: false
   actor_weight_decay: 0.0
   critic_weight_decay: 0.0
-  train_vision_encoder: false # 是否训练视觉底座模型参数
   lr_backbone: 1e-5
   actor_lr_warmup_iters: 5
 
@@ -38,23 +41,21 @@ training:
   clip_ploss_coef_rate: 3.0
   gamma_denoising: 0.99
   target_kl: 0.1
-  bc_coef: 0.0             # BC 正则/teacher 约束；设为0可对齐原版图像UNet DPPO
+  bc_coef: 0.0
 
-  reward_source: "binary_success_label"
+  reward_source: binary_success_label
   reward_scale_running: false
   reward_scale_const: 1.0
   norm_adv: true
   clip_advantage_lower_quantile: 0.05
   clip_advantage_upper_quantile: 0.95
 
-  min_sampling_denoising_std: 0.02   # DDIM采样探索标准差；越大探索性越强
-  min_logprob_denoising_std: 0.02    # 与采样标准差保持一致，避免old/new logprob尺度不匹配
-  ddim_eta: 0.0                      # 原版DPPO DDIM随机性系数，mu中会使用sigma项
-  randn_clip_value: 3.0              # 原版DPPO采样噪声裁剪范围
+  min_sampling_denoising_std: 0.05
+  min_logprob_denoising_std: 0.05
   logprob_reduction: mean
   use_disk_cache: true
-  disk_cache_dir: "outputs/buffer/finetune_dppo"
-  grad_accumulate: 16                 # 梯度累计步数
+  disk_cache_dir: "outputs/buffer/finetune_dppo_dual_head"
+  grad_accumulate: 16
   post_update_probe_size: 256
   rollout_policy: dppo
   skip_update: false
@@ -69,21 +70,21 @@ training:
   rollback_patience: 1
 
 eval:
-  eval_freq: 2
+  eval_freq: 1
   render_camera: ['zed_cam_left']
-  checkpoint_metric: "success"
+  checkpoint_metric: success
   max_steps: 400
-
-
 
 wandb:
   enable: false
   disable_artifact: true
-  project: ${env.task}_finetune
+  project: ${env.task}_finetune_dual_head
   notes: ""
   save_code: false
 
 policy:
-  name: diffusion
+  name: dual_head_diffusion
+  arm_action_dim: 14
+  view_action_dim: 6
   n_action_steps: 8
-  ft_denoising_steps: 5
+  ft_denoising_steps: 10

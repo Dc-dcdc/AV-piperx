@@ -27,7 +27,7 @@ from lerobot.common.policies.factory import make_policy
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
-from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
+from lerobot.common.policies.diffusion.modeling_dual_head_diffusion import DualHeadDiffusionPolicy
 from lerobot.common.utils.utils import get_safe_torch_device
 from lerobot.common.policies.utils import (
     get_device_from_parameters,
@@ -39,67 +39,6 @@ from contextlib import nullcontext
 
 import torch
 from types import MethodType
-
-
-WANDB_PARAMETER_TAGS = (
-    ("device", "device"),                                      # 训练设备
-    ("n_envs", "env.n_envs"),                                 # 并行环境数
-    ("rollout", "training.rollout_steps"),                     # 每轮采集步数
-    ("batch", "training.batch_size"),                          # PPO批大小
-    ("epochs", "training.update_epochs"),                      # 每轮更新次数
-    ("grad_acc", "training.grad_accumulate"),                  # 梯度累计步数
-    ("actor_lr", "training.actor_lr"),                         # Actor学习率
-    ("critic_lr", "training.critic_lr"),                       # Critic学习率
-    ("gamma", "training.gamma"),                               # 回报折扣因子
-    ("gae", "training.gae_lambda"),                            # GAE衰减系数
-    ("clip", "training.clip_ploss_coef"),                      # PPO裁剪系数
-    ("target_kl", "training.target_kl"),                       # KL早停阈值
-    ("reward", "training.reward_source"),                      # 训练奖励来源
-    ("rollout_policy", "training.rollout_policy"),             # 数据采集策略
-    ("sample_std", "training.min_sampling_denoising_std"),     # 去噪采样噪声
-    ("logprob_std", "training.min_logprob_denoising_std"),     # 概率计算噪声
-    ("ddim_eta", "training.ddim_eta"),                         # DDIM随机强度
-    ("act_steps", "policy.n_action_steps"),                    # 动作块执行长度
-    ("denoise_steps", "policy.ft_denoising_steps"),            # 微调去噪步数
-    ("train_vision", "training.train_vision_encoder"),         # 是否训练视觉底座
-)
-
-
-def _format_wandb_tag_value(value) -> str:
-    """Format config values into compact, stable W&B tag text."""
-    if isinstance(value, bool):
-        return str(value).lower()
-    if isinstance(value, float):
-        return f"{value:g}"
-    if isinstance(value, (list, tuple)):
-        return "-".join(_format_wandb_tag_value(item) for item in value)
-    return str(value).replace(" ", "_")
-
-
-def add_wandb_parameter_tags(logger: Logger, cfg: DictConfig) -> None:
-    """Append effective DPPO config values to the active W&B run tags."""
-    wandb_module = getattr(logger, "_wandb", None)
-    wandb_run = getattr(wandb_module, "run", None)
-    if wandb_run is None:
-        return
-
-    configured_tags = OmegaConf.select(cfg, "wandb.tags", default=[])
-    if configured_tags is None:
-        configured_tags = []
-    elif isinstance(configured_tags, str):
-        configured_tags = [configured_tags]
-    else:
-        configured_tags = list(configured_tags)
-
-    parameter_tags = []
-    for tag_name, config_path in WANDB_PARAMETER_TAGS:
-        value = OmegaConf.select(cfg, config_path, default=None)
-        if value is not None:
-            parameter_tags.append(f"{tag_name}:{_format_wandb_tag_value(value)}")
-
-    wandb_run.tags = tuple(
-        dict.fromkeys([*wandb_run.tags, *map(str, configured_tags), *parameter_tags])
-    )
 
 
 class InterpolatingLogFormatter(logging.Formatter):
@@ -345,277 +284,158 @@ class RunningRewardScaler:
         )
 
 
-def _optional_float(value):
-    if value is None:
-        return None
-    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
-        return None
-    return float(value)
-
-
-def _dppo_ddim_mean_std(self, sample: torch.Tensor, model_output: torch.Tensor, timesteps, std_attr: str):
-    """原版 DPPO 风格 DDIM：mu 中包含 eta/sigma 项，std 与 logprob 共用同一口径。"""
-    scheduler = self.diffusion.noise_scheduler
-    if scheduler.num_inference_steps is None:
-        scheduler.set_timesteps(self.diffusion.num_inference_steps)
-
-    if torch.is_tensor(timesteps):
-        timesteps = timesteps.to(device=sample.device, dtype=torch.long)
-    else:
-        timesteps = torch.as_tensor(timesteps, device=sample.device, dtype=torch.long)
-
-    alphas_cumprod = scheduler.alphas_cumprod.to(device=sample.device, dtype=sample.dtype)
-    alpha_prod_t = alphas_cumprod[timesteps].view(-1, 1, 1)
-
-    step_ratio = scheduler.config.num_train_timesteps // scheduler.num_inference_steps
-    prev_timesteps = timesteps - step_ratio
-    alpha_prod_t_prev = torch.where(
-        prev_timesteps >= 0,
-        alphas_cumprod[torch.clamp(prev_timesteps, min=0)],
-        torch.ones_like(prev_timesteps, device=sample.device, dtype=sample.dtype),
-    ).view(-1, 1, 1)
-
-    sqrt_alpha_prod_t = torch.sqrt(alpha_prod_t.clamp(min=1e-12))
-    sqrt_one_minus_alpha_prod_t = torch.sqrt((1 - alpha_prod_t).clamp(min=1e-12))
-    pred_original_sample = (sample - sqrt_one_minus_alpha_prod_t * model_output) / sqrt_alpha_prod_t
-
-    denoised_clip_value = _optional_float(getattr(self.config, "denoised_clip_value", None))
-    if denoised_clip_value is not None:
-        pred_original_sample = pred_original_sample.clamp(-denoised_clip_value, denoised_clip_value)
-        model_output = (sample - sqrt_alpha_prod_t * pred_original_sample) / sqrt_one_minus_alpha_prod_t
-
-    eps_clip_value = _optional_float(getattr(self.config, "eps_clip_value", None))
-    if eps_clip_value is not None:
-        model_output = model_output.clamp(-eps_clip_value, eps_clip_value)
-
-    eta = float(getattr(self.config, "ddim_eta", 1.0))
-    sigma = eta * torch.sqrt(
-        (
-            ((1 - alpha_prod_t_prev) / (1 - alpha_prod_t).clamp(min=1e-12))
-            * (1 - alpha_prod_t / alpha_prod_t_prev.clamp(min=1e-12))
-        ).clamp(min=0)
-    )
-    sigma = sigma.clamp(min=1e-10)
-
-    dir_xt_coef = torch.sqrt((1 - alpha_prod_t_prev - sigma ** 2).clamp(min=0))
-    mu = torch.sqrt(alpha_prod_t_prev.clamp(min=0)) * pred_original_sample + dir_xt_coef * model_output
-
-    min_std = float(getattr(self.config, std_attr, 0.04))
-    std = torch.clamp(sigma, min=min_std)
-    return mu, std
-
-
-@torch.no_grad()
-def forward_dppo(self, cond: dict, return_chain=True):
-    """
-    专为 LeRobot DiffusionPolicy 定制的 DPPO 推理函数。
-    cond 必须已经是 [B, n_obs_steps, ...] 的显式历史观测窗口。
-    """
-    self.eval()
-
-    # ==========================================
-    # 1. 观测输入归一化与相机堆叠
-    # ==========================================
-    batch = self.normalize_inputs(cond.copy())
-    # 按照 LeRobot 源码将多个相机的图像堆叠在一个张量里
-    if len(self.expected_image_keys) > 0:
-        batch = dict(batch)
-        batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
-
-    stacked_batch = batch
-    # 获取动态的 batch_size (即并行的 n_envs 个数) 和设备
-    batch_size = next(iter(stacked_batch.values())).shape[0]
-    device = get_device_from_parameters(self)
-    dtype = get_dtype_from_parameters(self)
-
-    # ==========================================
-    # 2. 提取视觉和状态的全局条件 (Global Conditioning)
-    # ==========================================
-    # 🌟 修正点：直接调用 DiffusionModel 内置的完美处理函数
-    global_cond = self.diffusion._prepare_global_conditioning(stacked_batch)
-
-    # ==========================================
-    # 3. 初始化纯噪声 [Batch, Horizon, Action_Dim]
-    # ==========================================
-    action_dim = self.config.output_shapes["action"][0]
+def _sample_head_dppo(self, global_cond, unet, scheduler, action_dim, return_chain):
+    """Sample one normalized action head and optionally retain its trainable DDIM chain."""
+    batch_size = global_cond.shape[0]
+    device = global_cond.device
     trajectory = torch.randn(
-        size=(batch_size, self.config.horizon, action_dim),
-        dtype=dtype,
-        device=device
+        (batch_size, self.config.horizon, action_dim),
+        dtype=get_dtype_from_parameters(self),
+        device=device,
     )
-
-    # ==========================================
-    # 4. 配置 Scheduler 步数并计算截断起点
-    # ==========================================
-    num_inference_steps = self.diffusion.num_inference_steps
-    self.diffusion.noise_scheduler.set_timesteps(num_inference_steps)
-    timesteps = self.diffusion.noise_scheduler.timesteps
-
-    ft_denoising_steps = getattr(self.config, "ft_denoising_steps", 10)
-    record_start_idx = len(timesteps) - ft_denoising_steps
-    if record_start_idx < 0:
-        record_start_idx = 0
-
-    chains = []
-
-    for i, t in enumerate(timesteps):
-        # 🌟 保存当前的带噪状态 x_t
-        if return_chain and i >= record_start_idx:
-            chains.append(trajectory.clone())
-
-        timestep_tensor = torch.full(trajectory.shape[:1], t, dtype=torch.long, device=device)
-        model_output = self.diffusion.unet(
-            trajectory,
-            timestep_tensor,
-            global_cond=global_cond
+    scheduler.set_timesteps(self.diffusion.num_inference_steps)
+    timesteps = scheduler.timesteps
+    ft_steps = int(getattr(self.config, "ft_denoising_steps", 10))
+    if ft_steps <= 0 or ft_steps > len(timesteps):
+        raise ValueError(
+            f"ft_denoising_steps必须位于[1, {len(timesteps)}]，当前为{ft_steps}"
         )
+    record_start = len(timesteps) - ft_steps
+    chains = []
+    alphas_cumprod = scheduler.alphas_cumprod.to(device)
+    step_ratio = scheduler.config.num_train_timesteps // self.diffusion.num_inference_steps
 
-        # 对齐原版 DPPO：DDIM 均值包含 eta/sigma 项，采样 std 与 logprob std 共用公式。
-        mu, std = _dppo_ddim_mean_std(self, trajectory, model_output, t, "min_sampling_denoising_std")
-        noise = torch.randn_like(mu)
-        randn_clip_value = _optional_float(getattr(self.config, "randn_clip_value", 3.0))
-        if randn_clip_value is not None:
-            noise = noise.clamp(-randn_clip_value, randn_clip_value)
-        trajectory = mu + std * noise
+    for index, timestep in enumerate(timesteps):
+        if return_chain and index >= record_start:
+            chains.append(trajectory.clone())
+        timestep_batch = torch.full(
+            trajectory.shape[:1],
+            int(timestep.item()),
+            dtype=torch.long,
+            device=device,
+        )
+        noise_pred = unet(trajectory, timestep_batch, global_cond=global_cond)
+        alpha_t = alphas_cumprod[timestep].reshape(1, 1, 1)
+        previous_timestep = int(timestep.item()) - step_ratio
+        alpha_previous = (
+            alphas_cumprod[previous_timestep].reshape(1, 1, 1)
+            if previous_timestep >= 0
+            else torch.ones((1, 1, 1), dtype=trajectory.dtype, device=device)
+        )
+        predicted_sample = (
+            trajectory - torch.sqrt(1 - alpha_t) * noise_pred
+        ) / torch.sqrt(alpha_t)
+        mean = (
+            torch.sqrt(alpha_previous) * predicted_sample
+            + torch.sqrt(1 - alpha_previous) * noise_pred
+        )
+        if index == len(timesteps) - 1:
+            trajectory = mean
+        else:
+            std = float(getattr(self.config, "min_sampling_denoising_std", 0.04))
+            trajectory = mean + torch.randn_like(mean) * std
 
-        final_action_clip_value = _optional_float(getattr(self.config, "final_action_clip_value", None))
-        if final_action_clip_value is not None and i == len(timesteps) - 1:
-            trajectory = trajectory.clamp(-final_action_clip_value, final_action_clip_value)
-
-    if return_chain and len(chains) < ft_denoising_steps + 1:
+    if return_chain:
         chains.append(trajectory.clone())
-
-    # 堆叠维度：[Batch, ft_denoising_steps + 1, Horizon, Action_Dim]
-    chains_tensor = torch.stack(chains, dim=1) if return_chain else None
-
-    # ==========================================
-    # 6. 反归一化并输出完整的 Horizon
-    # ==========================================
-    out_dict = self.unnormalize_outputs({"action": trajectory})
-    final_actions = out_dict["action"]
-
-    return {
-        "actions": final_actions,       # 完整的预测动作序列 [Batch, Horizon, Action_Dim]
-        "chains": chains_tensor         # 去噪链，+1是因为保存了纯噪声  [Batch, ft_denoising_steps + 1, Horizon, Action_Dim]
-    }
+        chain = torch.stack(chains, dim=1)
+    else:
+        chain = None
+    return trajectory, chain
 
 
 @torch.no_grad()
 def forward_dppo_from_global_cond(self, global_cond: torch.Tensor, return_chain=True):
-    """使用已缓存的 global_cond 采样动作链，避免重复跑视觉编码器。"""
+    """Sample both diffusion heads from one shared visual/state conditioning tensor."""
     self.eval()
-
-    batch_size = global_cond.shape[0]
-    device = global_cond.device
-    dtype = get_dtype_from_parameters(self)
-    action_dim = self.config.output_shapes["action"][0]
-    trajectory = torch.randn(
-        size=(batch_size, self.config.horizon, action_dim),
-        dtype=dtype,
-        device=device,
+    arm_actions, arm_chain = _sample_head_dppo(
+        self,
+        global_cond,
+        self.diffusion.arm_unet,
+        self.diffusion.arm_noise_scheduler,
+        self.diffusion.arm_action_dim,
+        return_chain,
     )
-
-    num_inference_steps = self.diffusion.num_inference_steps
-    self.diffusion.noise_scheduler.set_timesteps(num_inference_steps)
-    timesteps = self.diffusion.noise_scheduler.timesteps
-
-    ft_denoising_steps = getattr(self.config, "ft_denoising_steps", 10)
-    record_start_idx = max(0, len(timesteps) - ft_denoising_steps)
-    chains = []
-
-    for i, t in enumerate(timesteps):
-        if return_chain and i >= record_start_idx:
-            chains.append(trajectory.clone())
-
-        timestep_tensor = torch.full(trajectory.shape[:1], t, dtype=torch.long, device=device)
-        model_output = self.diffusion.unet(
-            trajectory,
-            timestep_tensor,
-            global_cond=global_cond,
-        )
-
-        mu, std = _dppo_ddim_mean_std(self, trajectory, model_output, t, "min_sampling_denoising_std")
-        noise = torch.randn_like(mu)
-        randn_clip_value = _optional_float(getattr(self.config, "randn_clip_value", 3.0))
-        if randn_clip_value is not None:
-            noise = noise.clamp(-randn_clip_value, randn_clip_value)
-        trajectory = mu + std * noise
-
-        final_action_clip_value = _optional_float(getattr(self.config, "final_action_clip_value", None))
-        if final_action_clip_value is not None and i == len(timesteps) - 1:
-            trajectory = trajectory.clamp(-final_action_clip_value, final_action_clip_value)
-
-    if return_chain and len(chains) < ft_denoising_steps + 1:
-        chains.append(trajectory.clone())
-
-    chains_tensor = torch.stack(chains, dim=1) if return_chain else None
-    out_dict = self.unnormalize_outputs({"action": trajectory})
-    final_actions = out_dict["action"]
-
-    return {
-        "actions": final_actions,
-        "chains": chains_tensor,
-    }
+    view_actions, view_chain = _sample_head_dppo(
+        self,
+        global_cond,
+        self.diffusion.view_unet,
+        self.diffusion.view_noise_scheduler,
+        self.diffusion.view_action_dim,
+        return_chain,
+    )
+    normalized_actions = torch.cat([arm_actions, view_actions], dim=-1)
+    actions = self.unnormalize_outputs({"action": normalized_actions})["action"]
+    chains = (
+        torch.cat([arm_chain, view_chain], dim=-1)
+        if return_chain
+        else None
+    )
+    return {"actions": actions, "chains": chains}
 
 
-# ==========================================
-# 🌟  定义 PPO 概率计算函数
-# ==========================================
-def get_logprobs(self, cond: dict, x_t: torch.Tensor, x_t_1: torch.Tensor, timesteps: torch.Tensor, return_global_cond=False):
-    """
-    计算扩散模型从 x_t 转移到 x_{t-1} 的对数概率 (Log-Likelihood)。
-    基于 DDIM (预测 Epsilon) 的数学展开，使用DDPM需要重新变化实现公式。
-    """
-    # 1. 提取条件特征 (复用 LeRobot 底层逻辑)，包括视觉和状态
+@torch.no_grad()
+def forward_dppo(self, cond: dict, return_chain=True):
+    """Normalize observations once, then sample both action heads."""
     batch = self.normalize_inputs(cond.copy())
-    # 堆叠后形状完美契合 LeRobot 底层要求: [Batch, Time, Num_Cams, C, H, W]
     if len(self.expected_image_keys) > 0:
         batch = dict(batch)
-        batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
-    # 这里的 global_cond 就是带着 Actor 视觉权重的特征
+        batch["observation.images"] = torch.stack(
+            [batch[key] for key in self.expected_image_keys],
+            dim=-4,
+        )
     global_cond = self.diffusion._prepare_global_conditioning(batch)
+    return forward_dppo_from_global_cond(self, global_cond, return_chain=return_chain)
 
-    # 2. 预测x_t中的噪声 (Epsilon)
-    noise_pred = self.diffusion.unet(x_t, timesteps, global_cond=global_cond)
 
-    # 3. 对齐原版 DPPO 的 DDIM 均值与方差；采样和 logprob 使用同一套 sigma 口径。
-    mu, std = _dppo_ddim_mean_std(self, x_t, noise_pred, timesteps, "min_logprob_denoising_std")
-    var = std ** 2
+def _head_logprob(
+    self,
+    global_cond,
+    x_t,
+    x_t_1,
+    timesteps,
+    unet,
+    scheduler,
+):
+    """Compute one head's reduced DDIM transition log probability."""
+    if self.config.prediction_type != "epsilon":
+        raise ValueError("双头DPPO当前仅支持prediction_type='epsilon'")
+    if scheduler.num_inference_steps is None:
+        scheduler.set_timesteps(self.diffusion.num_inference_steps)
 
-    # 4. 高斯分布的对数概率公式: -0.5 * ((x - mu)/std)^2 - log(std) - 0.5 * log(2*pi)
-    log_prob = -0.5 * ((x_t_1 - mu) ** 2) / var - torch.log(std) - 0.5 * math.log(2 * math.pi)
+    noise_pred = unet(x_t, timesteps, global_cond=global_cond)
+    alphas_cumprod = scheduler.alphas_cumprod.to(x_t.device)
+    alpha_t = alphas_cumprod[timesteps].reshape(-1, 1, 1)
+    step_ratio = scheduler.config.num_train_timesteps // scheduler.num_inference_steps
+    previous_timesteps = timesteps - step_ratio
+    alpha_previous = torch.where(
+        previous_timesteps >= 0,
+        alphas_cumprod[torch.clamp(previous_timesteps, min=0)],
+        torch.ones_like(previous_timesteps, dtype=x_t.dtype),
+    ).reshape(-1, 1, 1)
+    predicted_sample = (
+        x_t - torch.sqrt(1 - alpha_t) * noise_pred
+    ) / torch.sqrt(alpha_t)
+    mean = (
+        torch.sqrt(alpha_previous) * predicted_sample
+        + torch.sqrt(1 - alpha_previous) * noise_pred
+    )
 
-    # ==========================================
-    # 🌟 官方对齐 1：Action Chunking 真实执行步数截断
-    # ==========================================
-    act_steps = getattr(self.config, "n_action_steps", 8)
-    n_obs_steps = getattr(self.config, "n_obs_steps", 2)
-    action_start = n_obs_steps - 1
-    action_end = action_start + act_steps
+    std = float(getattr(self.config, "min_logprob_denoising_std", 0.04))
+    log_prob = (
+        -0.5 * ((x_t_1 - mean) ** 2) / (std**2)
+        - math.log(std)
+        - 0.5 * math.log(2 * math.pi)
+    )
+    action_start = int(getattr(self.config, "n_obs_steps", 2)) - 1
+    action_end = action_start + int(getattr(self.config, "n_action_steps", 8))
+    log_prob = torch.clamp(log_prob[:, action_start:action_end], min=-5.0, max=2.0)
 
-    log_prob = log_prob[:, action_start:action_end, :]
-
-    # ==========================================
-    # 🌟 官方对齐 2：概率限幅 (防止极端负数导致梯度崩塌)
-    # ==========================================
-    log_prob = torch.clamp(log_prob, min=-5.0, max=2.0)
-
-    # ==========================================
-    # 原版 DPPO 使用 action chunk 内所有维度 logprob 的均值，保持 PPO ratio 尺度稳定。
-    # 如需做联合概率实验，可在配置里设为 "sum"。
-    # ==========================================
-    logprob_reduction = getattr(self.config, "logprob_reduction", "mean")
-    if logprob_reduction == "sum":
-        log_prob = log_prob.sum(dim=(-1, -2))
-    elif logprob_reduction == "mean":
-        log_prob = log_prob.mean(dim=(-1, -2))
-    else:
-        raise ValueError(f"未知 logprob_reduction={logprob_reduction!r}，可选: 'sum' 或 'mean'")
-
-    # 按需返回特征，用于评价网络的resnet视觉底座
-    if return_global_cond:
-        return log_prob, global_cond
-    return log_prob
+    reduction = str(getattr(self.config, "logprob_reduction", "mean"))
+    if reduction == "sum":
+        return log_prob.sum(dim=(-1, -2))
+    if reduction == "mean":
+        return log_prob.mean(dim=(-1, -2))
+    raise ValueError(f"未知logprob_reduction={reduction!r}，可选: 'sum'或'mean'")
 
 
 def get_logprobs_from_global_cond(
@@ -625,29 +445,62 @@ def get_logprobs_from_global_cond(
     x_t_1: torch.Tensor,
     timesteps: torch.Tensor,
 ):
-    """使用已缓存的 global_cond 计算扩散转移 logprob，跳过图像特征提取。"""
-    noise_pred = self.diffusion.unet(x_t, timesteps, global_cond=global_cond)
+    """Return independent arm/view transition log probabilities."""
+    arm_dim = self.diffusion.arm_action_dim
+    enabled_heads = tuple(
+        getattr(self.config, "dppo_enabled_heads", ("arm", "view"))
+    )
+    logprobs = {}
+    if "arm" in enabled_heads:
+        logprobs["arm"] = _head_logprob(
+            self,
+            global_cond,
+            x_t[..., :arm_dim],
+            x_t_1[..., :arm_dim],
+            timesteps,
+            self.diffusion.arm_unet,
+            self.diffusion.arm_noise_scheduler,
+        )
+    if "view" in enabled_heads:
+        logprobs["view"] = _head_logprob(
+            self,
+            global_cond,
+            x_t[..., arm_dim:],
+            x_t_1[..., arm_dim:],
+            timesteps,
+            self.diffusion.view_unet,
+            self.diffusion.view_noise_scheduler,
+        )
+    return logprobs
 
-    mu, std = _dppo_ddim_mean_std(self, x_t, noise_pred, timesteps, "min_logprob_denoising_std")
-    var = std ** 2
-    log_prob = -0.5 * ((x_t_1 - mu) ** 2) / var - torch.log(std) - 0.5 * math.log(2 * math.pi)
 
-    act_steps = getattr(self.config, "n_action_steps", 8)
-    n_obs_steps = getattr(self.config, "n_obs_steps", 2)
-    action_start = n_obs_steps - 1
-    action_end = action_start + act_steps
-    log_prob = log_prob[:, action_start:action_end, :]
-
-    log_prob = torch.clamp(log_prob, min=-5.0, max=2.0)
-
-    logprob_reduction = getattr(self.config, "logprob_reduction", "mean")
-    if logprob_reduction == "sum":
-        log_prob = log_prob.sum(dim=(-1, -2))
-    elif logprob_reduction == "mean":
-        log_prob = log_prob.mean(dim=(-1, -2))
-    else:
-        raise ValueError(f"未知 logprob_reduction={logprob_reduction!r}，可选: 'sum' 或 'mean'")
-    return log_prob
+def get_logprobs(
+    self,
+    cond: dict,
+    x_t: torch.Tensor,
+    x_t_1: torch.Tensor,
+    timesteps: torch.Tensor,
+    return_global_cond=False,
+):
+    """Extract shared conditioning and return independent arm/view log probabilities."""
+    batch = self.normalize_inputs(cond.copy())
+    if len(self.expected_image_keys) > 0:
+        batch = dict(batch)
+        batch["observation.images"] = torch.stack(
+            [batch[key] for key in self.expected_image_keys],
+            dim=-4,
+        )
+    global_cond = self.diffusion._prepare_global_conditioning(batch)
+    logprobs = get_logprobs_from_global_cond(
+        self,
+        global_cond,
+        x_t,
+        x_t_1,
+        timesteps,
+    )
+    if return_global_cond:
+        return logprobs, global_cond
+    return logprobs
 
 def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
     """
@@ -679,7 +532,6 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             f"disable_machine_info={disable_machine_info}"
         )
     logger = Logger(cfg, out_dir, wandb_job_name=job_name)
-    add_wandb_parameter_tags(logger, cfg)
     set_global_seed(cfg.seed)
 
     # 获取设备
@@ -727,6 +579,11 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             hydra_cfg=hydra_cfg,
             pretrained_policy_name_or_path=str(load_dir)
         )
+        if not isinstance(actor, DualHeadDiffusionPolicy):
+            raise TypeError(
+                f"双头DPPO需要DualHeadDiffusionPolicy，实际加载为{type(actor).__name__}；"
+                "请确认checkpoint的policy.name为dual_head_diffusion。"
+            )
         actor_device = get_device_from_parameters(actor)
         if actor_device != device:
             raise RuntimeError(
@@ -742,17 +599,9 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         min_sampling_std = float(getattr(cfg.training, "min_sampling_denoising_std", 0.04))
         min_logprob_std = float(getattr(cfg.training, "min_logprob_denoising_std", min_sampling_std))
         logprob_reduction = str(getattr(cfg.training, "logprob_reduction", "mean"))
-        ddim_eta = float(getattr(cfg.training, "ddim_eta", 1.0))
-        randn_clip_value = _optional_float(getattr(cfg.training, "randn_clip_value", 3.0))
         actor.config.min_sampling_denoising_std = min_sampling_std
         actor.config.min_logprob_denoising_std = min_logprob_std
         actor.config.logprob_reduction = logprob_reduction
-        actor.config.ddim_eta = ddim_eta
-        actor.config.randn_clip_value = randn_clip_value
-        for optional_name in ("denoised_clip_value", "eps_clip_value", "final_action_clip_value"):
-            optional_value = _optional_float(getattr(cfg.training, optional_name, None))
-            if optional_value is not None:
-                setattr(actor.config, optional_name, optional_value)
         actor.config.ft_denoising_steps = int(
             getattr(cfg.policy, "ft_denoising_steps", getattr(actor.config, "ft_denoising_steps", 5))
         )
@@ -767,7 +616,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         actor.forward_dppo_from_global_cond = MethodType(forward_dppo_from_global_cond, actor)
         actor.get_logprobs = MethodType(get_logprobs, actor) # 将get_logprobs绑定到实例中
         actor.get_logprobs_from_global_cond = MethodType(get_logprobs_from_global_cond, actor)
-        logging.info("成功加载 Actor (DiffusionPolicy) 并挂载 DPPO 专用接口！")
+        logging.info("成功加载 Actor (DualHeadDiffusionPolicy) 并挂载 DPPO 专用接口！")
         for module in actor.modules():
             if "RgbEncoder" in module.__class__.__name__:
                 module._debug_img_counter = max(int(getattr(module, "_debug_img_counter", 0)), 3)
@@ -781,10 +630,19 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     ref_cams = [k.replace("observation.images.", "") for k in actor.config.input_shapes.keys() if "observation.images." in k]
     horizon_steps = getattr(actor.config, "horizon", None)
     action_dim = actor.config.output_shapes.get("action", [None])[-1]
+    arm_action_dim = int(actor.diffusion.arm_action_dim)
+    view_action_dim = int(actor.diffusion.view_action_dim)
     state_dim = actor.config.input_shapes.get("observation.state", [None])[0]
     # 优化 1：更严谨的校验，允许纯视觉策略 (state_dim=None)
     if not ref_cams or horizon_steps is None or action_dim is None:
         raise ValueError(f"严重冲突：模型快照中缺少关键参数 (ref_cams={ref_cams}, horizon={horizon_steps}, action_dim={action_dim})。")
+    if arm_action_dim + view_action_dim != action_dim:
+        raise ValueError(
+            f"双头动作维度不匹配: arm={arm_action_dim}, view={view_action_dim}, total={action_dim}"
+        )
+    logging.info(
+        f"双头动作维度: arm={arm_action_dim}, view={view_action_dim}, total={action_dim}"
+    )
 
     if state_dim is None:
         logging.warning("模型配置中未检测到 observation.state，如果这是纯视觉策略，请忽略此警告。")
@@ -915,14 +773,33 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             or ("backbone" in name and "unet" not in name)
         )
 
-    # 默认冻结视觉底座，只允许 RL 训练 UNet 动作去噪层。
-    # 如需对齐原版 DPPO 的端到端图像微调，可在配置里设 training.train_vision_encoder=true。
-    # 注意不要用泛化的 "encoder" 匹配，否则会冻结 UNet 的 diffusion_step_encoder 和 cond_encoder。
+    train_head = str(getattr(cfg.training, "train_head", "both")).lower()
+    valid_train_heads = {"both", "arm_only", "view_only"}
+    if train_head not in valid_train_heads:
+        raise ValueError(
+            f"training.train_head必须为{sorted(valid_train_heads)}之一，当前为{train_head!r}"
+        )
+    enabled_heads = (
+        ("arm", "view")
+        if train_head == "both"
+        else (("arm",) if train_head == "arm_only" else ("view",))
+    )
+    actor.config.dppo_enabled_heads = enabled_heads
+    actor_ref.config.dppo_enabled_heads = enabled_heads
+    view_loss_coef = float(getattr(cfg.training, "view_loss_coef", 1.0))
+    if view_loss_coef < 0:
+        raise ValueError(f"training.view_loss_coef必须非负，当前为{view_loss_coef}")
+    if "view" in enabled_heads and view_loss_coef == 0:
+        raise ValueError("启用view头训练时，training.view_loss_coef必须大于0")
+
+    # 共享视觉底座和两个扩散头分别控制 requires_grad。
     train_vision_encoder = bool(getattr(cfg.training, "train_vision_encoder", False))
     frozen_vision_params = 0
     trainable_vision_params = 0
-    trainable_unet_params = 0
-    trainable_other_params = 0
+    trainable_arm_params = 0
+    trainable_view_params = 0
+    frozen_arm_params = 0
+    frozen_view_params = 0
     actor_vision_params = []
     actor_main_params = []
     for name, param in actor.named_parameters():
@@ -934,13 +811,22 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             else:
                 param.requires_grad = False
                 frozen_vision_params += param.numel()
-        else:
-            param.requires_grad = True
-            actor_main_params.append(param)
-            if "unet" in name.lower():
-                trainable_unet_params += param.numel()
+        elif "arm_unet" in name.lower():
+            param.requires_grad = "arm" in enabled_heads
+            if param.requires_grad:
+                actor_main_params.append(param)
+                trainable_arm_params += param.numel()
             else:
-                trainable_other_params += param.numel()
+                frozen_arm_params += param.numel()
+        elif "view_unet" in name.lower():
+            param.requires_grad = "view" in enabled_heads
+            if param.requires_grad:
+                actor_main_params.append(param)
+                trainable_view_params += param.numel()
+            else:
+                frozen_view_params += param.numel()
+        else:
+            param.requires_grad = False
 
     actor_param_groups = []
     if actor_main_params:
@@ -970,10 +856,16 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         f"  Optimizer weight decay: actor={actor_weight_decay:.2e}, critic={critic_weight_decay:.2e}"
     )
     logging.info(
+        f"  双头训练模式: train_head={train_head}, enabled_heads={list(enabled_heads)}, "
+        f"view_loss_coef={view_loss_coef:.3f}, train_vision_encoder={train_vision_encoder}"
+    )
+    logging.info(
         f"  Actor冻结/训练参数统计: frozen_vision={frozen_vision_params / 1e6:.2f}M, "
         f"trainable_vision={trainable_vision_params / 1e6:.2f}M, "
-        f"trainable_unet={trainable_unet_params / 1e6:.2f}M, "
-        f"trainable_other={trainable_other_params / 1e6:.2f}M"
+        f"trainable_arm={trainable_arm_params / 1e6:.2f}M, "
+        f"frozen_arm={frozen_arm_params / 1e6:.2f}M, "
+        f"trainable_view={trainable_view_params / 1e6:.2f}M, "
+        f"frozen_view={frozen_view_params / 1e6:.2f}M"
     )
 
     def snapshot_actor_state():
@@ -1025,15 +917,12 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     clip_ploss_coef = float(getattr(cfg.training, "clip_ploss_coef", getattr(cfg.training, "clip_ratio", 0.01)))
     clip_ploss_coef_base = float(getattr(cfg.training, "clip_ploss_coef_base", 0.001))
     clip_ploss_coef_rate = float(getattr(cfg.training, "clip_ploss_coef_rate", 3.0))
-    ddim_eta = float(getattr(actor.config, "ddim_eta", getattr(cfg.training, "ddim_eta", 1.0)))
-    randn_clip_value = _optional_float(getattr(actor.config, "randn_clip_value", getattr(cfg.training, "randn_clip_value", 3.0)))
     logging.info(
         f"DPPO训练参数: rollout_steps={n_steps}, act_steps={act_steps}, "
         f"action_slice=[{action_start}:{action_end}], ft_denoising_steps={denoising_steps}, "
         f"critic_warmup={critic_warmup_iters}, target_kl={target_kl:.4f}, "
         f"clip_ploss_coef={clip_ploss_coef:.4f}, clip_ploss_coef_base={clip_ploss_coef_base:.4f}, "
         f"clip_ploss_coef_rate={clip_ploss_coef_rate:.2f}, "
-        f"ddim_eta={ddim_eta:.3f}, randn_clip_value={randn_clip_value}, "
         f"reward_source={reward_source}, reward_scale_running={reward_scale_running}, "
         f"reward_scale_const={reward_scale_const:.3f}, "
         f"bc_coef={float(getattr(cfg.training, 'bc_coef', getattr(cfg.training, 'bc_loss_coef', 0.0))):.6f}"
@@ -1678,8 +1567,12 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         total_steps = n_steps * n_envs * denoising_steps
 
         # 获取与去噪步对应的真实 TimeSteps
-        actor.diffusion.noise_scheduler.set_timesteps(actor.diffusion.num_inference_steps)
-        all_timesteps = actor.diffusion.noise_scheduler.timesteps
+        actor.diffusion.arm_noise_scheduler.set_timesteps(actor.diffusion.num_inference_steps)
+        actor.diffusion.view_noise_scheduler.set_timesteps(actor.diffusion.num_inference_steps)
+        all_timesteps = actor.diffusion.arm_noise_scheduler.timesteps
+        view_timesteps = actor.diffusion.view_noise_scheduler.timesteps
+        if not torch.equal(all_timesteps, view_timesteps):
+            raise RuntimeError("双头noise scheduler的推理timesteps不一致")
         record_start_idx = max(0, len(all_timesteps) - denoising_steps) # 只保留最后 denoising_steps 步
         recorded_timesteps = all_timesteps[record_start_idx:].to(device)
         actor_update_this_itr = allow_actor_update_this_itr and update_actor and itr >= critic_warmup_iters
@@ -1691,7 +1584,10 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         old_logprobs_k = None
         if actor_update_this_itr:
             logging.info("  正在预计算旧策略概率基准...")
-            old_logprobs_k = torch.zeros(total_steps, device=device)
+            old_logprobs_k = {
+                head: torch.zeros(total_steps, device=device)
+                for head in enabled_heads
+            }
             with torch.no_grad():
                 eval_batch_size = max(1, int(getattr(cfg.training, "batch_size", 32)))
                 eval_ranges = range(0, total_steps, eval_batch_size)
@@ -1716,15 +1612,21 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                         x_t_1=chains_next_eval,
                         timesteps=recorded_timesteps[d_inds],
                     )
-                    old_logprobs_k[inds] = logprobs
+                    for head in enabled_heads:
+                        old_logprobs_k[head][inds] = logprobs[head]
         else:
             logging.info("  本轮只训练 Critic，跳过旧策略概率预计算以加速。")
         post_probe_n = 0
-        post_probe_corr = float("nan")
-        post_probe_pos_delta = float("nan")
-        post_probe_neg_delta = float("nan")
-        post_probe_sign_agreement = float("nan")
-        post_probe_mean_delta = float("nan")
+        post_probe_metrics = {
+            head: {
+                "corr": float("nan"),
+                "pos_delta": float("nan"),
+                "neg_delta": float("nan"),
+                "sign_agreement": float("nan"),
+                "mean_delta": float("nan"),
+            }
+            for head in ("arm", "view")
+        }
         probe_inds = None
         probe_logprobs_before = None
         probe_advantages = None
@@ -1739,7 +1641,10 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             probe_discount = gamma_denoising ** (denoising_steps - probe_denoising_inds - 1)
             probe_advantages = normalize_clip_minibatch_advantage(advantages_k[probe_batch_inds]) * probe_discount
             probe_advantages = probe_advantages.detach().clone()
-            probe_logprobs_before = old_logprobs_k[probe_inds].detach().clone()
+            probe_logprobs_before = {
+                head: old_logprobs_k[head][probe_inds].detach().clone()
+                for head in enabled_heads
+            }
             logging.info(f"🧪 已固定 Post-update probe 样本: {post_probe_n}")
 
         bc_coef = float(getattr(cfg.training, "bc_coef", getattr(cfg.training, "bc_loss_coef", 0.0)))
@@ -1772,9 +1677,14 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
 
         running_v_loss = []
         running_pg_loss = []
+        running_pg_loss_by_head = {head: [] for head in ("arm", "view")}
         running_kl = []
+        running_kl_by_head = {head: [] for head in ("arm", "view")}
         running_bc_loss = []
-        logprob_adv_stats = init_logprob_advantage_stats()
+        logprob_adv_stats = {
+            head: init_logprob_advantage_stats()
+            for head in ("arm", "view")
+        }
 
         # 2. 开始 Epoch 循环，PPO的数据集可以训练多轮，数据利用率高
         # PPO 的 old/new logprob 必须使用同一种观测预处理模式。
@@ -1847,17 +1757,16 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 # 🌟 网络 Loss 计算区 (共享计算底座)
                 # ----------------------------------------------------
                 new_logprobs_b = None
-                raw_log_ratio = None
-                log_ratio = None
-                ratio = None
-                surr1 = None
-                surr2 = None
+                head_pg_losses = {
+                    head: torch.zeros((), device=device)
+                    for head in ("arm", "view")
+                }
+                head_approx_kl = {head: 0.0 for head in ("arm", "view")}
                 clip_coef_b = None
                 approx_kl = 0.0
 
                 # 1. 计算当前网络对动作的新概率预测；Critic warmup 时跳过这部分
                 if actor_update_enabled:
-                    old_logprobs_b = old_logprobs_k[inds_b]
                     obs_actor_b = None
                     if train_vision_encoder:
                         obs_actor_b = make_obs_batch_from_flat(b_inds_np)
@@ -1875,15 +1784,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                             timesteps=timesteps_b,
                         )
 
-                    # 2. PPO 概率比截断：对齐原版 DPPO，先限幅 new/old logprob，再计算 ratio 和 KL。
-                    new_logprobs_b = torch.clamp(new_logprobs_b, min=-5.0, max=2.0)
-                    old_logprobs_b = torch.clamp(old_logprobs_b, min=-5.0, max=2.0)
-                    raw_log_ratio = new_logprobs_b - old_logprobs_b
-                    update_logprob_advantage_stats(logprob_adv_stats, raw_log_ratio, advantages_b)
-                    log_ratio = raw_log_ratio
-                    ratio = torch.exp(log_ratio)
-
-                    # 3. PPO 截断代理损失：对齐原版 DPPO，clip 系数随去噪步递增。
+                    # PPO clip系数随去噪步递增，两个头使用相同时间轴。
                     denoising_t = denoising_inds_b.float()
                     if denoising_steps > 1:
                         denoising_t = denoising_t / float(denoising_steps - 1)
@@ -1895,12 +1796,54 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                     else:
                         clip_coef_b = torch.full_like(denoising_t, clip_ploss_coef)
 
-                    surr1 = ratio * advantages_b
-                    surr2 = torch.clamp(ratio, 1.0 - clip_coef_b, 1.0 + clip_coef_b) * advantages_b
-                    pg_loss = -torch.min(surr1, surr2).mean()
+                    for head in enabled_heads:
+                        new_head_logprob = torch.clamp(
+                            new_logprobs_b[head],
+                            min=-5.0,
+                            max=2.0,
+                        )
+                        old_head_logprob = torch.clamp(
+                            old_logprobs_k[head][inds_b],
+                            min=-5.0,
+                            max=2.0,
+                        )
+                        head_log_ratio = new_head_logprob - old_head_logprob
+                        update_logprob_advantage_stats(
+                            logprob_adv_stats[head],
+                            head_log_ratio,
+                            advantages_b,
+                        )
+                        head_ratio = torch.exp(head_log_ratio)
+                        head_surr1 = head_ratio * advantages_b
+                        head_surr2 = torch.clamp(
+                            head_ratio,
+                            1.0 - clip_coef_b,
+                            1.0 + clip_coef_b,
+                        ) * advantages_b
+                        head_pg_losses[head] = -torch.min(
+                            head_surr1,
+                            head_surr2,
+                        ).mean()
+                        with torch.no_grad():
+                            head_approx_kl[head] = float(
+                                ((head_ratio - 1.0) - head_log_ratio).mean().item()
+                            )
 
-                    with torch.no_grad():
-                        approx_kl = ((ratio - 1.0) - log_ratio).mean().item()
+                    pg_loss = head_pg_losses["arm"]
+                    if "view" in enabled_heads:
+                        pg_loss = pg_loss + view_loss_coef * head_pg_losses["view"]
+                    kl_weight_sum = (
+                        (1.0 if "arm" in enabled_heads else 0.0)
+                        + (view_loss_coef if "view" in enabled_heads else 0.0)
+                    )
+                    approx_kl = (
+                        (head_approx_kl["arm"] if "arm" in enabled_heads else 0.0)
+                        + (
+                            view_loss_coef * head_approx_kl["view"]
+                            if "view" in enabled_heads
+                            else 0.0
+                        )
+                    ) / kl_weight_sum
                 else:
                     pg_loss = torch.zeros((), device=device)
 
@@ -1928,7 +1871,15 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                             x_t_1=teacher_next_b,
                             timesteps=timesteps_b,
                         )
-                    bc_loss = -teacher_logprobs_b.mean()
+                    head_bc_losses = {
+                        head: -teacher_logprobs_b[head].mean()
+                        for head in enabled_heads
+                    }
+                    bc_loss = (
+                        head_bc_losses.get("arm", torch.zeros((), device=device))
+                        + view_loss_coef
+                        * head_bc_losses.get("view", torch.zeros((), device=device))
+                    )
                 else:
                     bc_loss = torch.zeros((), device=device)
                 # 5. 总 Loss 汇总, 反向传播时，pg_loss流向策略网络，v_loss流向价值网络
@@ -1942,6 +1893,9 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 running_bc_loss.append(bc_loss.item())
 
                 running_kl.append(approx_kl)
+                for head in enabled_heads:
+                    running_pg_loss_by_head[head].append(head_pg_losses[head].item())
+                    running_kl_by_head[head].append(head_approx_kl[head])
                 # 早期熔断 (Early Stopping)，把控整体策略偏移量
                 ref_bc_early_stop = getattr(cfg.training, "ref_bc_early_stop", None)
                 bc_too_large = (
@@ -1950,10 +1904,21 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                     and ref_bc_early_stop > 0
                     and bc_loss.item() > ref_bc_early_stop
                 )
-                kl_too_large = actor_update_enabled and approx_kl > target_kl
+                exceeded_kl_heads = [
+                    head
+                    for head in enabled_heads
+                    if head_approx_kl[head] > target_kl
+                ]
+                kl_too_large = actor_update_enabled and bool(exceeded_kl_heads)
                 if kl_too_large or bc_too_large:
                     if kl_too_large:
-                        logging.warning(f"⚠️ 策略偏离过大 (KL: {approx_kl:.4f} > {target_kl})，触发早期熔断！")
+                        kl_details = ", ".join(
+                            f"{head}={head_approx_kl[head]:.4f}"
+                            for head in exceeded_kl_heads
+                        )
+                        logging.warning(
+                            f"⚠️ 双头策略偏离过大 ({kl_details} > {target_kl})，触发早期熔断！"
+                        )
                     if bc_too_large:
                         logging.warning(
                             f"⚠️ Actor偏离预训练参考模型过大 "
@@ -1963,7 +1928,8 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
 
                     # 🌟 修复 2：极其重要！必须手动销毁所有带梯度的局部变量，释放几 GB 的计算图！
                     try:
-                        del loss, pg_loss, v_loss, new_logprobs_b, raw_log_ratio, log_ratio, ratio, surr1, surr2, clip_coef_b, newvalues
+                        del loss, pg_loss, v_loss, new_logprobs_b, head_pg_losses
+                        del clip_coef_b, newvalues
                     except Exception:
                         pass
 
@@ -2002,7 +1968,10 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         # 这比训练过程中的 minibatch 统计更直接，用来确认 actor 是否真的按 advantage 方向改变概率。
         if probe_inds is not None and probe_logprobs_before is not None and probe_advantages is not None:
             actor.eval()
-            probe_logprobs_after = torch.empty_like(probe_logprobs_before)
+            probe_logprobs_after = {
+                head: torch.empty_like(probe_logprobs_before[head])
+                for head in enabled_heads
+            }
             probe_batch_size = max(1, int(getattr(cfg.training, "batch_size", 32)))
             with torch.no_grad():
                 for i in range(0, post_probe_n, probe_batch_size):
@@ -2019,7 +1988,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                     chains_next_probe = torch.from_numpy(chains_flat[b_inds_np, d_inds_np + 1]).float().to(device)
                     if train_vision_encoder:
                         obs_probe = make_obs_batch_from_flat(b_inds_np)
-                        probe_logprobs_after[i:end_i] = actor.get_logprobs(
+                        probe_logprobs_batch = actor.get_logprobs(
                             obs_probe,
                             chains_prev_probe,
                             chains_next_probe,
@@ -2028,23 +1997,38 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                         del obs_probe
                     else:
                         global_cond_probe = torch.from_numpy(global_cond_flat[b_inds_np]).float().to(device)
-                        probe_logprobs_after[i:end_i] = actor.get_logprobs_from_global_cond(
+                        probe_logprobs_batch = actor.get_logprobs_from_global_cond(
                             global_cond=global_cond_probe,
                             x_t=chains_prev_probe,
                             x_t_1=chains_next_probe,
                             timesteps=recorded_timesteps[probe_denoising_inds],
                         )
                         del global_cond_probe
+                    for head in enabled_heads:
+                        probe_logprobs_after[head][i:end_i] = probe_logprobs_batch[head]
 
                     del chains_prev_probe, chains_next_probe
 
-            probe_delta = probe_logprobs_after - probe_logprobs_before
-            probe_stats = init_logprob_advantage_stats()
-            update_logprob_advantage_stats(probe_stats, probe_delta, probe_advantages)
-            post_probe_corr, post_probe_pos_delta, post_probe_neg_delta, post_probe_sign_agreement = (
-                finalize_logprob_advantage_stats(probe_stats)
-            )
-            post_probe_mean_delta = float(probe_delta.mean().item())
+            for head in enabled_heads:
+                probe_delta = (
+                    probe_logprobs_after[head] - probe_logprobs_before[head]
+                )
+                probe_stats = init_logprob_advantage_stats()
+                update_logprob_advantage_stats(
+                    probe_stats,
+                    probe_delta,
+                    probe_advantages,
+                )
+                corr, pos_delta, neg_delta, sign_agreement = (
+                    finalize_logprob_advantage_stats(probe_stats)
+                )
+                post_probe_metrics[head] = {
+                    "corr": corr,
+                    "pos_delta": pos_delta,
+                    "neg_delta": neg_delta,
+                    "sign_agreement": sign_agreement,
+                    "mean_delta": float(probe_delta.mean().item()),
+                }
             del probe_logprobs_after, probe_delta, probe_stats
         # 跑完一整轮环境交互 (Iteration)，让学习率步进一次
         if update_actor and itr >= critic_warmup_iters:
@@ -2056,22 +2040,19 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         # =========================================================
         # 🌟 修复 4：PPO 阶段结束，清扫全部巨大的训练经验张量，让显存归还给评估和下一次 Rollout
         # =========================================================
-        try:
-            del loss, pg_loss, v_loss, new_logprobs_b, raw_log_ratio, log_ratio, ratio, surr1, surr2, clip_coef_b, newvalues
-
-            # 🌟 终极修复：把本轮所有的巨型 Buffer 全部粉碎！释放物理内存与文件读写锁！
-            del chains_flat, obs_flat, chains_trajs, obs_trajs, global_cond_flat, returns_k, advantages_k, old_logprobs_k
-            if probe_inds is not None:
-                del probe_inds, probe_logprobs_before, probe_advantages
-            if teacher_chains_flat is not None:
-                del teacher_chains_flat
-            import gc
-            gc.collect()
-            # 必须在底层文件锁 (memmap) 被 del 释放之后，清理临时文件夹才能真正生效
-            if use_disk_cache and temp_buffer_dir is not None:
-                temp_buffer_dir.cleanup() # 如果开启了硬盘缓存，必须显式调用 cleanup() 删除物理文件
-        except Exception:
-            pass
+        # 释放本轮经验和计算图，避免双头链在下一轮继续占用内存。
+        loss = pg_loss = v_loss = new_logprobs_b = None
+        head_pg_losses = clip_coef_b = newvalues = None
+        del chains_flat, obs_flat, chains_trajs, obs_trajs
+        del global_cond_flat, returns_k, advantages_k, old_logprobs_k
+        if probe_inds is not None:
+            del probe_inds, probe_logprobs_before, probe_advantages
+        if teacher_chains_flat is not None:
+            del teacher_chains_flat
+        import gc
+        gc.collect()
+        if use_disk_cache and temp_buffer_dir is not None:
+            temp_buffer_dir.cleanup()
         torch.cuda.empty_cache()
 
         # ------------------------------------------
@@ -2086,8 +2067,74 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         avg_kl = float(np.mean(running_kl)) if running_kl else 0.0
         max_kl = float(np.max(running_kl)) if running_kl else 0.0
         avg_bc_loss = float(np.mean(running_bc_loss)) if running_bc_loss else 0.0
-        logprob_adv_corr, pos_adv_logratio, neg_adv_logratio, adv_sign_agreement = (
-            finalize_logprob_advantage_stats(logprob_adv_stats)
+        avg_pg_loss_by_head = {
+            head: (
+                float(np.mean(running_pg_loss_by_head[head]))
+                if running_pg_loss_by_head[head]
+                else 0.0
+            )
+            for head in ("arm", "view")
+        }
+        avg_kl_by_head = {
+            head: (
+                float(np.mean(running_kl_by_head[head]))
+                if running_kl_by_head[head]
+                else 0.0
+            )
+            for head in ("arm", "view")
+        }
+        max_kl_by_head = {
+            head: (
+                float(np.max(running_kl_by_head[head]))
+                if running_kl_by_head[head]
+                else 0.0
+            )
+            for head in ("arm", "view")
+        }
+        head_direction_metrics = {}
+        for head in ("arm", "view"):
+            corr, pos_delta, neg_delta, sign_agreement = (
+                finalize_logprob_advantage_stats(logprob_adv_stats[head])
+            )
+            head_direction_metrics[head] = {
+                "corr": corr,
+                "pos_delta": pos_delta,
+                "neg_delta": neg_delta,
+                "sign_agreement": sign_agreement,
+            }
+
+        def weighted_head_metric(metrics, key):
+            weighted_values = []
+            weights = []
+            for head in enabled_heads:
+                value = float(metrics[head][key])
+                if math.isfinite(value):
+                    weight = 1.0 if head == "arm" else view_loss_coef
+                    weighted_values.append(weight * value)
+                    weights.append(weight)
+            return (
+                float(sum(weighted_values) / sum(weights))
+                if weights
+                else float("nan")
+            )
+
+        logprob_adv_corr = weighted_head_metric(head_direction_metrics, "corr")
+        pos_adv_logratio = weighted_head_metric(head_direction_metrics, "pos_delta")
+        neg_adv_logratio = weighted_head_metric(head_direction_metrics, "neg_delta")
+        adv_sign_agreement = weighted_head_metric(
+            head_direction_metrics,
+            "sign_agreement",
+        )
+        post_probe_corr = weighted_head_metric(post_probe_metrics, "corr")
+        post_probe_pos_delta = weighted_head_metric(post_probe_metrics, "pos_delta")
+        post_probe_neg_delta = weighted_head_metric(post_probe_metrics, "neg_delta")
+        post_probe_sign_agreement = weighted_head_metric(
+            post_probe_metrics,
+            "sign_agreement",
+        )
+        post_probe_mean_delta = weighted_head_metric(
+            post_probe_metrics,
+            "mean_delta",
         )
 
         #上传到wandb的数据字典
@@ -2121,6 +2168,20 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 "post_update_probe_logprob_advantage_sign_agreement": float(post_probe_sign_agreement),  # 更新后符号一致率
                 "actor_update_enabled": int(actor_update_this_itr),  # 本轮是否更新Actor
                 "early_stop": int(early_stop),  # 本轮是否触发KL提前停止
+                "combined/train_head": train_head,
+                "combined/view_loss_coef": float(view_loss_coef),
+                "arm/update_enabled": int(actor_update_this_itr and "arm" in enabled_heads),
+                "arm/loss_actor": float(avg_pg_loss_by_head["arm"]),
+                "arm/ppo_avg_kl": float(avg_kl_by_head["arm"]),
+                "arm/ppo_max_kl": float(max_kl_by_head["arm"]),
+                "arm/logprob_advantage_correlation": float(head_direction_metrics["arm"]["corr"]),
+                "arm/post_update_probe_correlation": float(post_probe_metrics["arm"]["corr"]),
+                "view/update_enabled": int(actor_update_this_itr and "view" in enabled_heads),
+                "view/loss_actor": float(avg_pg_loss_by_head["view"]),
+                "view/ppo_avg_kl": float(avg_kl_by_head["view"]),
+                "view/ppo_max_kl": float(max_kl_by_head["view"]),
+                "view/logprob_advantage_correlation": float(head_direction_metrics["view"]["corr"]),
+                "view/post_update_probe_correlation": float(post_probe_metrics["view"]["corr"]),
             },
             step=itr + 1,
             mode="train",   #放到训练模块
@@ -2276,16 +2337,12 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             runtime_policy_overrides = {
                 "ft_denoising_steps": int(getattr(actor.config, "ft_denoising_steps", getattr(cfg.policy, "ft_denoising_steps", 10))),
                 "n_action_steps": int(getattr(actor.config, "n_action_steps", getattr(cfg.policy, "n_action_steps", 8))),
+                "arm_action_dim": int(actor.diffusion.arm_action_dim),
+                "view_action_dim": int(actor.diffusion.view_action_dim),
                 "min_sampling_denoising_std": float(getattr(actor.config, "min_sampling_denoising_std", getattr(cfg.training, "min_sampling_denoising_std", 0.02))),
                 "min_logprob_denoising_std": float(getattr(actor.config, "min_logprob_denoising_std", getattr(cfg.training, "min_logprob_denoising_std", 0.02))),
                 "logprob_reduction": str(getattr(actor.config, "logprob_reduction", getattr(cfg.training, "logprob_reduction", "mean"))),
-                "ddim_eta": float(getattr(actor.config, "ddim_eta", getattr(cfg.training, "ddim_eta", 1.0))),
-                "randn_clip_value": _optional_float(getattr(actor.config, "randn_clip_value", getattr(cfg.training, "randn_clip_value", 3.0))),
             }
-            for optional_name in ("denoised_clip_value", "eps_clip_value", "final_action_clip_value"):
-                optional_value = _optional_float(getattr(actor.config, optional_name, getattr(cfg.training, optional_name, None)))
-                if optional_value is not None:
-                    runtime_policy_overrides[optional_name] = optional_value
             if hasattr(actor.config, "do_mask_loss_for_padding"):
                 runtime_policy_overrides["do_mask_loss_for_padding"] = bool(actor.config.do_mask_loss_for_padding)
 
@@ -2300,6 +2357,12 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 "success_rate": float(sr),
                 "average_reward": float(ar),
                 "avg_policy_loss": float(avg_pg_loss),
+                "train_head": train_head,
+                "view_loss_coef": float(view_loss_coef),
+                "arm_policy_loss": float(avg_pg_loss_by_head["arm"]),
+                "view_policy_loss": float(avg_pg_loss_by_head["view"]),
+                "arm_avg_kl": float(avg_kl_by_head["arm"]),
+                "view_avg_kl": float(avg_kl_by_head["view"]),
                 "avg_value_loss": float(avg_v_loss),
                 "critic_explained_variance": float(critic_explained_variance),
                 "critic_value_return_correlation": float(critic_value_return_corr),
@@ -2353,12 +2416,11 @@ def train_cli(cfg: DictConfig):
 if __name__ == "__main__":
     # 命令行参数注入
     default_args = [
-        "policy=ft_zed_diffusion",
-        "training.pretrained_ckpt_path='outputs/2_pretrain/train/2026-07-07/10-06-08_InsertCylinder-3Arms-v0_pre_zed_diffusion/checkpoints/186000_loss=0.0009_sr=50.0_ar=569.03'",
+        "policy=ft_zed_dual_head_diffusion",
         "env.n_envs=15",
         "training.rollout_steps=150",
         "training.batch_size=16",
-        "training.update_epochs=20",
+        "training.update_epochs=10",
         "wandb.enable=true",
         "training.skip_update=false",
         "training.rollout_policy=dppo",

@@ -20,8 +20,12 @@ training:
   critic_hidden_dims: [256, 256, 256] # 对齐原版DPPO critic head
   critic_activation: Mish             # 原版DPPO MLP默认激活
   critic_use_layernorm: false         # 原版ResidualMLP默认不使用LayerNorm
+  actor_weight_decay: 0.0             # 原版DPPO Actor AdamW weight_decay
+  critic_weight_decay: 0.0            # 原版DPPO Critic AdamW weight_decay
   min_sampling_denoising_std: 0.02  # DDIM采样探索标准差；视觉机器人任务建议保持小而非0
   min_logprob_denoising_std: 0.02   # 与采样标准差保持一致，避免old/new logprob尺度不匹配
+  ddim_eta: 1.0                     # 原版DPPO DDIM随机性系数，mu中会使用sigma项
+  randn_clip_value: 3.0             # 原版DPPO采样噪声裁剪范围
   logprob_reduction: mean           # 原版DPPO口径：对动作块内logprob取均值
   reward_scale_running: true        # 使用RunningRewardScaler按折扣回报运行方差缩放reward
   reward_scale_const: 1.0           # reward额外常数倍率，默认不额外放大/缩小
@@ -52,7 +56,7 @@ eval:
   seed: 100            # 评估时的随机种子
   batch_size: 10        # 并行评估环境数，最多不会超过 n_episodes
   use_async_envs: true # true 使用多进程 AsyncVectorEnv，false 使用单进程 SyncVectorEnv
-  checkpoint_metric: "reward" # 筛选指标：可选 'loss' 或 'reward'
+  checkpoint_metric: "success" # 筛选指标：可选 'loss'、'reward'、'success'
   max_checkpoints: 20  # 最多保存loss最小的几个模型快照
   n_episodes: 100             # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 1   # 最多保存前几个 episode 的录像视频

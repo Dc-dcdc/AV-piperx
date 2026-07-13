@@ -6,7 +6,7 @@
 3. ``left_teleop``：左臂由 Quest 左手柄遥操，其他机械臂仍由策略控制。
 4. ``head_teleop``：头部/中间臂由 Quest 头显遥操，左右臂仍由策略控制。
 
-A/X/B 可以叠加接管右臂、左臂和头部，Y 会清空接管并恢复全部策略推理。
+A/X/B 可以独立切换右臂、左臂和头部接管，Y 会丢弃当前轨迹并重置环境。
 每一步都会先计算完整的 policy action，再用 QuestControl + IK 计算被接管机械臂的候选动作，
 最终通过分臂 blend 权重平滑混合，避免接管和恢复策略时出现大的动作跳变。
 """
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -24,11 +25,12 @@ from pathlib import Path
 
 import cv2
 import gymnasium as gym
+import hydra
 import numpy as np
 import torch
 import yaml
 from lerobot.common.envs.utils import preprocess_observation
-from omegaconf import open_dict
+from omegaconf import DictConfig, open_dict
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -45,11 +47,23 @@ from quest_control import QuestControl
 from quest_receive import QuestReceive
 from quest_send import UnityImageStreamer
 from data_collect.robot_ik_solver import PoseActionIKSolver
+from data_collect.quest_teleop_collect import (
+    AsyncEpisodeVideoWriter,
+    flatten_numeric_obs,
+    json_safe,
+    list_existing_episode_dirs,
+    load_existing_episode_infos,
+    replay_episode_videos,
+    save_episode_reward_debug,
+    stack_trace,
+    write_metadata,
+)
 
 
 ARM_LEFT = "left"
 ARM_RIGHT = "right"
 ARM_MIDDLE = "middle"
+ARM_ORDER = (ARM_LEFT, ARM_RIGHT, ARM_MIDDLE)
 
 MODE_POLICY = "policy"
 MODE_RIGHT_TELEOP = "right_teleop"
@@ -71,6 +85,7 @@ MODE_ACTIVE_ARMS = {
     MODE_ALL_TELEOP: (ARM_LEFT, ARM_RIGHT, ARM_MIDDLE),
 }
 MODE_CODE = {mode: code for code, mode in enumerate(MODE_ACTIVE_ARMS)}
+CODE_MODE = {code: mode for mode, code in MODE_CODE.items()}
 ACTIVE_ARMS_TO_MODE = {tuple(sorted(active_arms)): mode for mode, active_arms in MODE_ACTIVE_ARMS.items()}
 MODE_LABEL = {
     MODE_POLICY: "策略自主推理",
@@ -85,53 +100,6 @@ MODE_LABEL = {
 
 
 @dataclass
-class PolicyTeleopConfig:
-    ckpt_path: str
-    output_dir: str = "outputs/4_data_collect/policy_teleop_takeover"
-    run_name: str | None = None
-    device: str = "cuda"
-    initial_mode: str = MODE_POLICY
-    max_steps_per_episode: int = 400
-    control_hz: float = 25.0
-    takeover_blend_steps: int = 15
-    random_seed: int | None = 100
-
-    host: str = "0.0.0.0"
-    port: int = 5005
-    quest_timeout: float = 0.0
-
-    head_control: bool = True
-    lock_roll: bool = True
-    lock_pitch: bool = True
-    hand_position_scale: float = 1.0
-    hand_max_delta: float = 1.0
-    head_position_scale: float = 1.0
-    head_max_delta: float = 1.0
-
-    show_mujoco_viewer: bool = True
-    print_hz: float = 2.0
-
-    render_width: int = 640
-    render_height: int = 480
-    display_camera: str = "zed_cam_left"
-    camera_window: bool = True
-    window_name: str = "ZED Camera Monitor"
-    unity_image_stream: bool = True
-    unity_image_source: str = "rgb"
-    unity_image_stereo: bool = False
-    unity_left_camera: str = "zed_cam_left"
-    unity_right_camera: str = "zed_cam_right"
-    unity_image_host: str = "auto"
-    unity_image_port: int = 5010
-    unity_image_hz: float = 25.0
-    unity_image_jpeg_quality: int = 55
-    unity_image_chunk_size: int = 1000
-    unity_image_log_interval: float = 2.0
-    depth_vis_min: float = 0.0
-    depth_vis_max: float = 2.0
-
-
-@dataclass
 class EpisodeBuffer:
     index: int
     tmp_dir: Path
@@ -143,10 +111,11 @@ class EpisodeBuffer:
     initial_act: np.ndarray | None = None
     initial_mocap_pos: np.ndarray | None = None
     initial_mocap_quat: np.ndarray | None = None
+    obs_traces: dict[str, list[np.ndarray]] = field(default_factory=dict)
+    depth_traces: dict[str, list[np.ndarray]] = field(default_factory=dict)
     joint_actions: list[np.ndarray] = field(default_factory=list)
     policy_actions: list[np.ndarray] = field(default_factory=list)
     pose_actions: list[np.ndarray] = field(default_factory=list)
-    observation_states: list[np.ndarray] = field(default_factory=list)
     control_modes: list[int] = field(default_factory=list)
     teleop_applied: list[bool] = field(default_factory=list)
     blend_weights: list[np.ndarray] = field(default_factory=list)
@@ -156,6 +125,10 @@ class EpisodeBuffer:
     terminated: list[bool] = field(default_factory=list)
     truncated: list[bool] = field(default_factory=list)
     infos: list[dict] = field(default_factory=list)
+    reward_debug: list[dict] = field(default_factory=list)
+    video_writer: AsyncEpisodeVideoWriter | None = None
+    video_paths: dict[str, Path] = field(default_factory=dict)
+    final_info: dict = field(default_factory=dict)
 
     @property
     def steps(self) -> int:
@@ -273,7 +246,7 @@ def resolve_checkpoint_dirs(ckpt_path: str | Path) -> tuple[Path, Path, Path]:
 
 
 # 加载策略，并把 checkpoint 中的 device 覆盖为当前脚本配置。
-def load_policy(cfg: PolicyTeleopConfig):
+def load_policy(cfg: DictConfig):
     from lerobot.common.policies.factory import make_policy
     from lerobot.common.utils.utils import init_hydra_config
 
@@ -296,7 +269,7 @@ def load_policy(cfg: PolicyTeleopConfig):
 
 
 # 根据策略输入相机和 checkpoint 环境配置创建 Gym 环境。
-def make_env(policy, full_cfg: dict, cfg: PolicyTeleopConfig):
+def make_env(policy, full_cfg: dict, cfg: DictConfig):
     input_keys = policy.config.input_shapes.keys()
     cameras = [
         key.removeprefix("observation.images.")
@@ -306,16 +279,21 @@ def make_env(policy, full_cfg: dict, cfg: PolicyTeleopConfig):
     cameras = list(dict.fromkeys(cameras))
 
     env_cfg = full_cfg.get("env", {})
-    env_id = f"{env_cfg.get('name', 'guided_vision')}/{env_cfg.get('task', 'InsertCylinder-3Arms-v0')}"
+    checkpoint_env_id = f"{env_cfg.get('name', 'guided_vision')}/{env_cfg.get('task', 'InsertCylinder-3Arms-v0')}"
+    env_id = str(cfg.env_id) if cfg.get("env_id") else checkpoint_env_id
     print(f"初始化环境: {env_id}")
     print(f"策略观测相机: {cameras}")
 
-    env = gym.make(
-        id=env_id,
-        disable_env_checker=True,
-        cameras=cameras,
-        episode_length=cfg.max_steps_per_episode,
-    )
+    env_kwargs = {
+        "disable_env_checker": True,
+        "cameras": cameras,
+        "episode_length": int(cfg.episode_length),
+        "observation_height": int(cfg.render_height),
+        "observation_width": int(cfg.render_width),
+    }
+    if env_id == "guided_vision/InsertCylinder-3Arms-v0":
+        env_kwargs["enable_reward_debug"] = bool(cfg.get("save_reward_debug", False))
+    env = gym.make(id=env_id, **env_kwargs)
     return env, cameras, env_id
 
 
@@ -385,7 +363,7 @@ def mode_from_active_arms(active_arms) -> str:
     return ACTIVE_ARMS_TO_MODE[tuple(sorted(set(active_arms)))]
 
 
-# 根据 Quest 按键边沿选择接管部位；A+X 仍用于完成后的保存确认。
+# 根据 Quest 按键边沿切换接管部位；A+X 仍用于完成后的保存确认。
 def quest_button_request(
     data,
     prev_buttons: dict[str, bool],
@@ -397,8 +375,8 @@ def quest_button_request(
     buttons = {
         "a": bool(data.r_button_one),       # 右手 A: 右臂接管；完成后与 X 同按保存
         "x": bool(data.l_button_one),       # 左手 X: 左臂接管；完成后与 A 同按保存
-        "b": bool(data.r_button_two),       # 右手 B: 头部/中间臂接管；与 Y 同按重置
-        "y": bool(data.l_button_two),       # 左手 Y: 全部恢复策略推理；与 B 同按重置
+        "b": bool(data.r_button_two),       # 右手 B: 切换头部/中间臂接管
+        "y": bool(data.l_button_two),       # 左手 Y: 丢弃当前 episode 并重置环境
     }
     edges = {name: pressed and not prev_buttons.get(name, False) for name, pressed in buttons.items()}
 
@@ -406,23 +384,28 @@ def quest_button_request(
     prev_both_ax = prev_buttons.get("a", False) and prev_buttons.get("x", False)
     save_confirm = bool(both_ax and not prev_both_ax)
 
-    both_by = buttons["b"] and buttons["y"]
-    prev_both_by = prev_buttons.get("b", False) and prev_buttons.get("y", False)
-    reset_requested = bool(both_by and not prev_both_by)
+    reset_requested = edges["y"]
 
     requested_mode = None
     if reset_requested:
         pass
-    elif edges["y"]:
-        requested_mode = MODE_POLICY
     else:
         active_arms = set(MODE_ACTIVE_ARMS.get(current_mode, ()))
         if edges["a"]:
-            active_arms.add(ARM_RIGHT)
+            if ARM_RIGHT in active_arms:
+                active_arms.remove(ARM_RIGHT)
+            else:
+                active_arms.add(ARM_RIGHT)
         if edges["x"]:
-            active_arms.add(ARM_LEFT)
+            if ARM_LEFT in active_arms:
+                active_arms.remove(ARM_LEFT)
+            else:
+                active_arms.add(ARM_LEFT)
         if edges["b"]:
-            active_arms.add(ARM_MIDDLE)
+            if ARM_MIDDLE in active_arms:
+                active_arms.remove(ARM_MIDDLE)
+            else:
+                active_arms.add(ARM_MIDDLE)
         if edges["a"] or edges["x"] or edges["b"]:
             requested_mode = mode_from_active_arms(active_arms)
 
@@ -452,7 +435,7 @@ def launch_viewer(sim_env, state: RunState, enabled: bool):
         elif keycode == ord("6"):
             state.requested_mode = MODE_ALL_TELEOP
         elif keycode in (ord("y"), ord("Y")):
-            state.requested_mode = MODE_POLICY
+            state.reset = True
         elif keycode == 32:
             state.reset = True
         elif keycode in (ord("q"), ord("Q"), 27):
@@ -505,8 +488,20 @@ def record_step(
     terminated: bool,
     truncated: bool,
     info: dict,
+    record_cameras: list[str],
+    depth_frames: dict[str, np.ndarray] | None,
+    save_reward_debug: bool,
 ) -> None:
-    buffer.observation_states.append(np.asarray(obs_before["agent_pos"], dtype=np.float32).copy())
+    step_index = buffer.steps
+    for raw_key, value in flatten_numeric_obs(obs_before).items():
+        buffer.obs_traces.setdefault(raw_key, []).append(np.asarray(value).copy())
+    if depth_frames:
+        for camera in record_cameras:
+            if camera in depth_frames:
+                buffer.depth_traces.setdefault(camera, []).append(
+                    np.asarray(depth_frames[camera], dtype=np.float32).copy()
+                )
+
     buffer.joint_actions.append(np.asarray(joint_action, dtype=np.float32).copy())
     buffer.policy_actions.append(np.asarray(policy_joint_action, dtype=np.float32).copy())
     buffer.pose_actions.append(np.asarray(pose_action, dtype=np.float32).copy())
@@ -528,29 +523,40 @@ def record_step(
             "teleop_mask": np.asarray(teleop_mask, dtype=np.bool_).tolist(),
         }
     )
+    buffer.final_info = dict(info or {})
+    if save_reward_debug:
+        reward_item = {
+            "step": int(step_index),
+            "reward": float(reward),
+            "cumulative_reward": float(cumulative_reward),
+            "is_success": bool(info.get("is_success", False)),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+        }
+        env_reward_debug = info.get("reward_debug")
+        if isinstance(env_reward_debug, dict):
+            reward_item.update(json_safe(env_reward_debug))
+        buffer.reward_debug.append(reward_item)
 
 
-# 保存 episode 数组和说明文件。
-def save_episode(buffer: EpisodeBuffer, metadata: dict, *, reason: str) -> dict | None:
-    if buffer.steps <= 0:
-        shutil.rmtree(buffer.tmp_dir, ignore_errors=True)
-        return None
-
+# 将标准轨迹字段和策略接管扩展字段写入 arrays.npz。
+def save_episode_arrays(buffer: EpisodeBuffer, cfg: DictConfig) -> dict[str, dict[str, str]]:
     mode_arr = np.asarray(buffer.control_modes, dtype=np.int8)
     arrays = {
         "joint_action": np.asarray(buffer.joint_actions, dtype=np.float32),
         "policy_action": np.asarray(buffer.policy_actions, dtype=np.float32),
-        "pose_action": np.asarray(buffer.pose_actions, dtype=np.float32),
         "control_mode": mode_arr,
         "teleop_applied": np.asarray(buffer.teleop_applied, dtype=np.bool_),
         "blend_weight": np.asarray(buffer.blend_weights, dtype=np.float32),
         "teleop_mask": np.asarray(buffer.teleop_masks, dtype=np.bool_),
-        "observation_state": np.asarray(buffer.observation_states, dtype=np.float32),
         "reward": np.asarray(buffer.rewards, dtype=np.float32),
         "cumulative_reward": np.asarray(buffer.cumulative_rewards, dtype=np.float32),
         "terminated": np.asarray(buffer.terminated, dtype=np.bool_),
         "truncated": np.asarray(buffer.truncated, dtype=np.bool_),
     }
+    if cfg.save_pose_action:
+        arrays["pose_action"] = np.asarray(buffer.pose_actions, dtype=np.float32)
+
     optional_arrays = {
         "initial_qpos": buffer.initial_qpos,
         "initial_qvel": buffer.initial_qvel,
@@ -563,60 +569,241 @@ def save_episode(buffer: EpisodeBuffer, metadata: dict, *, reason: str) -> dict 
         if value is not None:
             arrays[key] = np.asarray(value)
     if buffer.initial_time is not None:
-        arrays["initial_time"] = np.asarray([buffer.initial_time], dtype=np.float64)
+        arrays["initial_time"] = np.asarray(buffer.initial_time, dtype=np.float64)
+
+    depth_key_map = {}
+    for camera, values in sorted(buffer.depth_traces.items()):
+        if values:
+            npz_key = f"depth__{camera}"
+            depth_key_map[camera] = npz_key
+            arrays[npz_key] = stack_trace(values).astype(np.float32, copy=False)
+
+    obs_key_map = {}
+    for raw_key, values in sorted(buffer.obs_traces.items()):
+        if not values:
+            continue
+        if raw_key in ("agent_pos", "observation.state"):
+            npz_key = "observation_state"
+        else:
+            npz_key = f"obs__{raw_key.replace('.', '__').replace('/', '__')}"
+        obs_key_map[raw_key] = npz_key
+        arrays[npz_key] = stack_trace(values)
 
     np.savez_compressed(buffer.tmp_dir / "arrays.npz", **arrays)
+    return {"observation": obs_key_map, "depth": depth_key_map}
+
+
+# 从当前 episode 中生成轻量的人类干预片段索引。
+def build_intervention_index(buffer: EpisodeBuffer, cfg: DictConfig) -> dict:
+    steps = int(buffer.steps)
+    fps = int(cfg.fps)
+    arm_order = list(ARM_ORDER)
+
+    teleop_applied = np.asarray(buffer.teleop_applied, dtype=np.bool_)
+    if teleop_applied.shape[0] != steps:
+        teleop_applied = np.zeros(steps, dtype=np.bool_)
+
+    teleop_mask = np.asarray(buffer.teleop_masks, dtype=np.bool_)
+    if teleop_mask.ndim != 2 or teleop_mask.shape[0] != steps:
+        teleop_mask = np.zeros((steps, len(arm_order)), dtype=np.bool_)
+
+    blend_weight = np.asarray(buffer.blend_weights, dtype=np.float32)
+    if blend_weight.ndim != 2 or blend_weight.shape[0] != steps:
+        blend_weight = np.zeros((steps, len(arm_order)), dtype=np.float32)
+
+    control_modes = np.asarray(buffer.control_modes, dtype=np.int64)
+    if control_modes.shape[0] != steps:
+        control_modes = np.zeros(steps, dtype=np.int64)
+
+    segments = []
+    start = None
+    for idx, active in enumerate(teleop_applied.tolist()):
+        if active and start is None:
+            start = idx
+        elif not active and start is not None:
+            segments.append((start, idx))
+            start = None
+    if start is not None:
+        segments.append((start, steps))
+
+    segment_items = []
+    for segment_id, (start_frame, stop_frame) in enumerate(segments):
+        segment_mask = teleop_mask[start_frame:stop_frame]
+        segment_blend = blend_weight[start_frame:stop_frame]
+        if segment_mask.size:
+            target_arm_flags = np.any(segment_mask, axis=0)
+        else:
+            target_arm_flags = np.zeros(len(arm_order), dtype=np.bool_)
+        if segment_blend.size:
+            blend_arm_flags = np.max(segment_blend, axis=0) > 1.0e-6
+            max_blend_weight = np.max(segment_blend, axis=0)
+            mean_blend_weight = np.mean(segment_blend, axis=0)
+        else:
+            blend_arm_flags = np.zeros(len(arm_order), dtype=np.bool_)
+            max_blend_weight = np.zeros(len(arm_order), dtype=np.float32)
+            mean_blend_weight = np.zeros(len(arm_order), dtype=np.float32)
+
+        mode_slice = control_modes[start_frame:stop_frame]
+        mode_steps = {}
+        if mode_slice.size:
+            unique_modes, counts = np.unique(mode_slice, return_counts=True)
+            mode_steps = {
+                CODE_MODE.get(int(mode_code), str(int(mode_code))): int(count)
+                for mode_code, count in zip(unique_modes, counts)
+            }
+
+        target_arms = [
+            arm for arm, active in zip(arm_order, target_arm_flags.tolist()) if bool(active)
+        ]
+        influenced_arms = [
+            arm
+            for arm, active in zip(arm_order, np.logical_or(target_arm_flags, blend_arm_flags).tolist())
+            if bool(active)
+        ]
+
+        segment_items.append(
+            {
+                "id": int(segment_id),
+                "start_frame": int(start_frame),
+                "stop_frame": int(stop_frame),
+                "num_frames": int(stop_frame - start_frame),
+                "start_timestamp": float(start_frame / fps),
+                "stop_timestamp_exclusive": float(stop_frame / fps),
+                "target_arms": target_arms,
+                "influenced_arms": influenced_arms,
+                "mode_steps": mode_steps,
+                "max_blend_weight": max_blend_weight.astype(np.float32).round(6).tolist(),
+                "mean_blend_weight": mean_blend_weight.astype(np.float32).round(6).tolist(),
+            }
+        )
+
+    return {
+        "schema": "av_piper_intervention_segments_v1",
+        "episode": int(buffer.index),
+        "fps": fps,
+        "steps": steps,
+        "mask_source": "teleop_applied",
+        "arm_order": arm_order,
+        "segment_count": int(len(segment_items)),
+        "intervention_frames": int(np.sum(teleop_applied)),
+        "segments": segment_items,
+    }
+
+
+# 将人类干预片段索引写入单独 JSON；完整训练数据仍以 arrays.npz 为准。
+def save_intervention_index(buffer: EpisodeBuffer, cfg: DictConfig) -> dict:
+    index = build_intervention_index(buffer, cfg)
+    path = buffer.tmp_dir / "intervention_segments.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(index, f, indent=2, ensure_ascii=False)
+    return index
+
+
+# 按标准成功确认规则保存或丢弃 episode。
+def finish_episode(
+    *,
+    buffer: EpisodeBuffer,
+    cfg: DictConfig,
+    metadata: dict,
+    keep: bool = True,
+    reason: str = "",
+) -> dict | None:
+    success = bool(buffer.final_info.get("is_success", False))
+    confirmed = bool(buffer.final_info.get("success_confirmed", False))
+    if buffer.steps < int(cfg.min_steps_to_save) or not success or not confirmed:
+        keep = False
+
+    if not keep:
+        shutil.rmtree(buffer.tmp_dir, ignore_errors=True)
+        discard_reasons = []
+        if buffer.steps < int(cfg.min_steps_to_save):
+            discard_reasons.append(f"steps<{cfg.min_steps_to_save}")
+        if not success:
+            discard_reasons.append("not_success")
+        if not confirmed:
+            discard_reasons.append("not_confirmed")
+        print(
+            f"Discarded episode {buffer.index:06d}: steps={buffer.steps}, "
+            f"reason={','.join(discard_reasons) or reason or 'discarded'}"
+        )
+        return None
+
+    array_key_maps = save_episode_arrays(buffer, cfg)
+    intervention_index = save_intervention_index(buffer, cfg)
+    reward_debug_path = save_episode_reward_debug(buffer, cfg)
+    mode_arr = np.asarray(buffer.control_modes, dtype=np.int8)
     info = {
         "episode": int(buffer.index),
         "steps": int(buffer.steps),
         "reason": reason,
-        "success": bool(buffer.infos[-1].get("is_success", False)) if buffer.infos else False,
+        "success": success,
+        "fps": int(cfg.fps),
+        "save_rgb": bool(cfg.save_rgb),
+        "save_videos": bool(cfg.save_rgb and cfg.save_videos and buffer.video_paths),
+        "save_depth": bool(cfg.save_depth),
+        "save_reward_debug": bool(cfg.get("save_reward_debug", False)),
+        "reward_debug_path": reward_debug_path,
+        "observation_npz_keys": array_key_maps["observation"],
+        "depth_npz_keys": array_key_maps["depth"],
+        "video_paths": {
+            f"pixels.{camera}": f"videos/{camera}.mp4"
+            for camera in sorted(buffer.video_paths)
+        },
+        "intervention_segments_path": "intervention_segments.json",
+        "intervention_segment_count": int(intervention_index["segment_count"]),
+        "intervention_frames": int(intervention_index["intervention_frames"]),
         "control_mode_map": {str(code): mode for mode, code in MODE_CODE.items()},
-        "blend_weight_order": [ARM_LEFT, ARM_RIGHT, ARM_MIDDLE],
+        "blend_weight_order": list(ARM_ORDER),
         "mode_steps": {mode: int(np.sum(mode_arr == code)) for mode, code in MODE_CODE.items()},
         "final_cumulative_reward": float(buffer.cumulative_rewards[-1]) if buffer.cumulative_rewards else 0.0,
+        "final_info": json_safe(buffer.final_info),
     }
     with open(buffer.tmp_dir / "info.json", "w", encoding="utf-8") as f:
         json.dump(info, f, indent=2, ensure_ascii=False)
 
     if buffer.final_dir.exists():
-        shutil.rmtree(buffer.final_dir)
+        raise FileExistsError(f"Episode already exists: {buffer.final_dir}")
     buffer.tmp_dir.rename(buffer.final_dir)
 
     info["path"] = str(buffer.final_dir.relative_to(Path(metadata["run_dir"])))
     metadata["episodes"].append(info)
     metadata["saved_episodes"] = len(metadata["episodes"])
-    with open(Path(metadata["run_dir"]) / "metadata.json", "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    metadata["successful_episodes"] = sum(
+        1 for episode_info in metadata["episodes"] if bool(episode_info.get("success", False))
+    )
+    write_metadata(Path(metadata["run_dir"]), metadata)
 
-    print(f"Saved episode {buffer.index:06d}: steps={buffer.steps}, reason={reason}, modes={info['mode_steps']}")
+    print(f"Saved episode {buffer.index:06d}: steps={buffer.steps}, success={success}, modes={info['mode_steps']}")
     return info
 
 
 # 根据已有 episode 计算下一个编号。
 def next_episode_index(run_dir: Path) -> int:
-    episodes_dir = run_dir / "episodes"
-    if not episodes_dir.exists():
-        return 0
     indices = []
-    for path in episodes_dir.glob("episode_*"):
-        if path.is_dir() and path.name.startswith("episode_") and not path.name.endswith(".tmp"):
-            try:
-                indices.append(int(path.name.split("_")[-1]))
-            except ValueError:
-                pass
+    for path in list_existing_episode_dirs(run_dir):
+        match = re.search(r"episode_(\d+)$", path.name)
+        if match:
+            indices.append(int(match.group(1)))
     return max(indices, default=-1) + 1
 
 
-# 构建 run 输出目录。
-def make_run_dir(cfg: PolicyTeleopConfig, env_id: str) -> Path:
-    if cfg.run_name:
-        run_name = cfg.run_name
+# 按任务和数据模态创建或复用 run 输出目录。
+def make_run_dir(cfg: DictConfig, env_id: str) -> Path:
+    modes = []
+    if cfg.save_rgb:
+        modes.append("rgb")
+    if cfg.save_depth:
+        modes.append("depth")
+    suffix = "_".join(modes) if modes else "state"
+    if cfg.run_name is not None:
+        base_run_name = str(cfg.run_name)
+        run_name = base_run_name if base_run_name.endswith(f"_{suffix}") else f"{base_run_name}_{suffix}"
     else:
-        task_name = env_id.split("/")[-1]
-        run_name = f"policy_teleop_{task_name}_mixed"
+        task_name = re.sub(r"[^A-Za-z0-9._=-]+", "_", env_id.split("/")[-1]).strip("_")
+        run_name = f"quest_policy_{task_name}_{suffix}"
     run_dir = resolve_path(cfg.output_dir) / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if run_dir.exists() and not cfg.append:
+        raise FileExistsError(f"Run directory already exists: {run_dir}. Set append=true or change run_name.")
     (run_dir / "episodes").mkdir(parents=True, exist_ok=True)
     return run_dir
 
@@ -790,7 +977,7 @@ def handle_camera_window_key(key: int, state: RunState) -> None:
     elif key == ord("6"):
         state.requested_mode = MODE_ALL_TELEOP
     elif key in (ord("y"), ord("Y")):
-        state.requested_mode = MODE_POLICY
+        state.reset = True
     elif key in (ord(" "), ord("r"), ord("R")):
         state.reset = True
     elif key in (ord("q"), ord("Q"), 27):
@@ -801,7 +988,7 @@ def handle_camera_window_key(key: int, state: RunState) -> None:
 def show_camera_window(
     *,
     physics,
-    cfg: PolicyTeleopConfig,
+    cfg: DictConfig,
     state: RunState,
     overlay_lines: list[str],
 ) -> None:
@@ -817,7 +1004,7 @@ def show_camera_window(
 def send_unity_image(
     *,
     physics,
-    cfg: PolicyTeleopConfig,
+    cfg: DictConfig,
     image_streamer: UnityImageStreamer | None,
     overlay_lines: list[str],
 ) -> None:
@@ -854,45 +1041,65 @@ def send_unity_image(
 
 
 # 主循环：每步先算策略动作，再按模式覆盖头部或双臂。
-def run(cfg: PolicyTeleopConfig) -> None:
+def run(cfg: DictConfig) -> None:
+    if float(cfg.fps) <= 0:
+        raise ValueError(f"fps must be positive, got {cfg.fps}.")
+    if cfg.unity_image_source not in ("rgb", "depth"):
+        raise ValueError(f"unity_image_source must be rgb or depth, got {cfg.unity_image_source!r}.")
+    if not cfg.ckpt_path:
+        raise ValueError("ckpt_path must point to a pretrained policy checkpoint.")
+
+    if cfg.mujoco_gl != "auto":
+        os.environ["MUJOCO_GL"] = str(cfg.mujoco_gl)
+    elif cfg.viewer and os.environ.get("DISPLAY"):
+        os.environ["MUJOCO_GL"] = "glfw"
+    elif not cfg.viewer and not cfg.camera_window and not os.environ.get("DISPLAY"):
+        os.environ.setdefault("MUJOCO_GL", "egl")
+
     set_random_seed(cfg.random_seed)
     policy, full_cfg, device, _root_dir, load_dir = load_policy(cfg)
-    env, _policy_cameras, env_id = make_env(policy, full_cfg, cfg)
+    env, policy_cameras, env_id = make_env(policy, full_cfg, cfg)
     sim_env = env.unwrapped
     physics = sim_env._physics
+    record_cameras = list(cfg.record_cameras)
 
     run_dir = make_run_dir(cfg, env_id)
+    existing_infos = load_existing_episode_infos(run_dir) if cfg.append else []
     episode_index = next_episode_index(run_dir)
     metadata = {
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "run_dir": str(run_dir),
         "ckpt_path": str(resolve_path(cfg.ckpt_path)),
         "load_dir": str(load_dir),
         "env_id": env_id,
-        "control_hz": float(cfg.control_hz),
+        "fps": int(cfg.fps),
+        "policy_cameras": policy_cameras,
+        "record_cameras": record_cameras,
+        "save_rgb": bool(cfg.save_rgb),
+        "save_videos": bool(cfg.save_rgb and cfg.save_videos),
+        "save_depth": bool(cfg.save_depth),
+        "save_reward_debug": bool(cfg.get("save_reward_debug", False)),
+        "video_save_mode": "replay_after_success_confirm",
+        "render_width": int(cfg.render_width),
+        "render_height": int(cfg.render_height),
         "takeover_blend_steps": int(cfg.takeover_blend_steps),
-        "blend_weight_order": [ARM_LEFT, ARM_RIGHT, ARM_MIDDLE],
+        "blend_weight_order": list(ARM_ORDER),
         "random_seed": None if cfg.random_seed is None else int(cfg.random_seed),
         "fixed_reset_seed": cfg.random_seed is not None,
+        "episode_initial_mode": MODE_POLICY,
         "control_mode_map": {str(code): mode for mode, code in MODE_CODE.items()},
         "camera_window": bool(cfg.camera_window),
         "display_camera": str(cfg.display_camera),
         "unity_image_stream": bool(cfg.unity_image_stream),
         "unity_image_source": str(cfg.unity_image_source),
         "unity_image_stereo": bool(cfg.unity_image_stereo),
-        "saved_episodes": episode_index,
-        "episodes": [],
+        "saved_episodes": len(existing_infos),
+        "successful_episodes": sum(1 for info in existing_infos if bool(info.get("success", False))),
+        "episodes": existing_infos,
     }
-    metadata_path = run_dir / "metadata.json"
-    if metadata_path.exists():
-        try:
-            with open(metadata_path, "r", encoding="utf-8") as f:
-                old_metadata = json.load(f)
-            metadata["episodes"] = old_metadata.get("episodes", [])
-            metadata["saved_episodes"] = len(metadata["episodes"])
-        except Exception:
-            pass
+    write_metadata(run_dir, metadata)
 
-    receiver = QuestReceive(host=cfg.host, port=cfg.port, timeout=cfg.quest_timeout)
+    receiver = QuestReceive(host=cfg.host, port=cfg.port, timeout=cfg.timeout)
     image_streamer = (
         UnityImageStreamer(
             host=cfg.unity_image_host,
@@ -905,7 +1112,7 @@ def run(cfg: PolicyTeleopConfig) -> None:
         if cfg.unity_image_stream
         else None
     )
-    if image_streamer is not None:
+    if cfg.save_depth or cfg.camera_window or image_streamer is not None:
         warmup_camera = cfg.unity_left_camera if cfg.unity_image_stereo else cfg.display_camera
         physics.render(
             height=cfg.render_height,
@@ -916,7 +1123,10 @@ def run(cfg: PolicyTeleopConfig) -> None:
     if cfg.camera_window:
         cv2.namedWindow(cfg.window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(cfg.window_name, cfg.render_width, cfg.render_height)
-    quest_control = QuestControl(use_head_control=cfg.head_control, use_individual_hand_anchors=True)
+    quest_control = QuestControl(
+        use_head_control=cfg.head_control,
+        use_individual_hand_anchors=cfg.individual_hand_anchors,
+    )
     ik_solver = PoseActionIKSolver(
         sim_env,
         head_control=cfg.head_control,
@@ -926,6 +1136,8 @@ def run(cfg: PolicyTeleopConfig) -> None:
         hand_max_delta=cfg.hand_max_delta,
         head_position_scale=cfg.head_position_scale,
         head_max_delta=cfg.head_max_delta,
+        workspace_low=cfg.workspace_low,
+        workspace_high=cfg.workspace_high,
     )
 
     print("预热 IK/Numba，避免第一次接管时卡顿...")
@@ -944,35 +1156,37 @@ def run(cfg: PolicyTeleopConfig) -> None:
     waiting_save_confirm = False
     completion_reason = ""
 
-    control_mode = cfg.initial_mode if cfg.initial_mode in MODE_ACTIVE_ARMS else MODE_POLICY
+    control_mode = MODE_POLICY
     state = RunState()
-    viewer = launch_viewer(sim_env, state, cfg.show_mujoco_viewer)
-    dt = 1.0 / float(cfg.control_hz)
+    viewer = launch_viewer(sim_env, state, cfg.viewer)
+    dt = 1.0 / float(cfg.fps)
 
     print("\n" + "=" * 78)
     print("Policy + partitioned Quest teleop takeover")
     print("Quest 按键:")
-    print("  A: 右臂接管控制")
-    print("  X: 左臂接管控制")
-    print("  B: 头部/中间臂接管控制")
-    print("  Y: 全部恢复策略推理")
-    print("  B+Y: 放弃当前 episode 并重置环境")
+    print("  A: 切换右臂接管/策略控制")
+    print("  X: 切换左臂接管/策略控制")
+    print("  B: 切换头部/中间臂接管/策略控制")
+    print("  Y: 放弃当前 episode 并重置环境")
     print("  A+X: 轨迹完成后确认保存")
     print("本地窗口/Viewer 快捷键:")
     print("  1: 全部策略 | 2: 右臂接管 | 3: 左臂接管 | 4: 头部接管 | 5: 双臂接管 | 6: 全部接管")
     print("  Space/R: 放弃当前 episode 并重置 | Q/Esc: 退出")
     print(f"固定随机种子: {cfg.random_seed if cfg.random_seed is not None else '关闭'}")
+    print(f"记录相机: {record_cameras}")
+    print(f"保存 RGB 视频: {'开启' if cfg.save_rgb and cfg.save_videos else '关闭'}")
+    print(f"保存深度: {'开启' if cfg.save_depth else '关闭'}")
     print(f"输出目录: {run_dir}")
     print("=" * 78 + "\n")
 
-    initial_mode = switch_control_mode(
-        control_mode,
+    switch_control_mode(
+        MODE_POLICY,
         latest_data=latest_data,
         policy=policy,
         quest_control=quest_control,
         ik_solver=ik_solver,
     )
-    control_mode = initial_mode or MODE_POLICY
+    control_mode = MODE_POLICY
     takeover_blender.set_mode(control_mode, current_action=last_joint_action)
 
     try:
@@ -986,8 +1200,30 @@ def run(cfg: PolicyTeleopConfig) -> None:
             requested_mode = state.requested_mode or quest_mode_request
             state.requested_mode = None
             if save_confirm and waiting_save_confirm:
-                save_episode(buffer, metadata, reason=completion_reason or "confirmed")
-                episode_index += 1
+                buffer.final_info["is_success"] = True
+                buffer.final_info["success_confirmed"] = True
+                buffer.final_info["success_confirm_method"] = "A+X"
+                if cfg.save_rgb and cfg.save_videos:
+                    print(f"Replaying episode {buffer.index:06d} to render videos...")
+                    try:
+                        replay_episode_videos(
+                            buffer=buffer,
+                            env_obj=env,
+                            physics=physics,
+                            cfg=cfg,
+                            record_cameras=record_cameras,
+                        )
+                    except Exception as exc:
+                        buffer.final_info["video_replay_error"] = repr(exc)
+                        print(f"Episode {buffer.index:06d} video replay failed; arrays will still be saved: {exc}")
+                saved_info = finish_episode(
+                    buffer=buffer,
+                    cfg=cfg,
+                    metadata=metadata,
+                    keep=True,
+                    reason=completion_reason or "success_confirmed",
+                )
+                episode_index = next_episode_index(run_dir)
                 obs = reset_control_state(env, policy, quest_control, ik_solver, seed=cfg.random_seed)
                 takeover_blender.reset()
                 last_joint_action = np.asarray(obs["agent_pos"], dtype=np.float32).copy()
@@ -995,19 +1231,17 @@ def run(cfg: PolicyTeleopConfig) -> None:
                 cumulative_reward = 0.0
                 waiting_save_confirm = False
                 completion_reason = ""
-                switched = switch_control_mode(
-                    control_mode,
+                switch_control_mode(
+                    MODE_POLICY,
                     latest_data=latest_data,
                     policy=policy,
                     quest_control=quest_control,
                     ik_solver=ik_solver,
                 )
-                if switched is None:
-                    control_mode = MODE_POLICY
-                else:
-                    control_mode = switched
+                control_mode = MODE_POLICY
                 takeover_blender.set_mode(control_mode, current_action=last_joint_action)
-                print(f"A+X confirmed. Saved and started episode {episode_index:06d}.")
+                result = "saved" if saved_info is not None else "not saved"
+                print(f"A+X confirmed. Episode {result}; started episode {episode_index:06d}.")
                 continue
 
             if requested_mode is not None and not waiting_save_confirm:
@@ -1023,8 +1257,14 @@ def run(cfg: PolicyTeleopConfig) -> None:
                     takeover_blender.set_mode(control_mode, current_action=last_joint_action)
 
             if state.reset or quest_reset:
-                if buffer.tmp_dir.exists():
-                    shutil.rmtree(buffer.tmp_dir, ignore_errors=True)
+                buffer.final_info.setdefault("manual_abort", True)
+                finish_episode(
+                    buffer=buffer,
+                    cfg=cfg,
+                    metadata=metadata,
+                    keep=False,
+                    reason="manual_reset",
+                )
                 episode_index = next_episode_index(run_dir)
                 obs = reset_control_state(env, policy, quest_control, ik_solver, seed=cfg.random_seed)
                 takeover_blender.reset()
@@ -1034,17 +1274,14 @@ def run(cfg: PolicyTeleopConfig) -> None:
                 waiting_save_confirm = False
                 completion_reason = ""
                 state.reset = False
-                switched = switch_control_mode(
-                    control_mode,
+                switch_control_mode(
+                    MODE_POLICY,
                     latest_data=latest_data,
                     policy=policy,
                     quest_control=quest_control,
                     ik_solver=ik_solver,
                 )
-                if switched is None:
-                    control_mode = MODE_POLICY
-                else:
-                    control_mode = switched
+                control_mode = MODE_POLICY
                 takeover_blender.set_mode(control_mode, current_action=last_joint_action)
                 print(f"Discarded current episode. Started episode {episode_index:06d}.")
                 continue
@@ -1095,6 +1332,18 @@ def run(cfg: PolicyTeleopConfig) -> None:
             )
             teleop_applied = bool(teleop_target_ready or np.any(blend_weights > 1.0e-6))
 
+            depth_frames = None
+            if cfg.save_depth and record_cameras:
+                depth_frames = {
+                    camera: physics.render(
+                        height=int(cfg.render_height),
+                        width=int(cfg.render_width),
+                        camera_id=camera,
+                        depth=True,
+                    ).astype(np.float32, copy=False)
+                    for camera in record_cameras
+                }
+
             obs, reward, terminated, truncated, info = env.step(joint_action)
             last_joint_action = np.asarray(joint_action, dtype=np.float32).copy()
             cumulative_reward += float(reward)
@@ -1113,22 +1362,53 @@ def run(cfg: PolicyTeleopConfig) -> None:
                 terminated=bool(terminated),
                 truncated=bool(truncated),
                 info=info,
+                record_cameras=record_cameras,
+                depth_frames=depth_frames,
+                save_reward_debug=bool(cfg.get("save_reward_debug", False)),
             )
 
-            if terminated or truncated or buffer.steps >= cfg.max_steps_per_episode or bool(info.get("is_success", False)):
-                if bool(info.get("is_success", False)):
-                    completion_reason = "success"
-                elif terminated:
+            if bool(info.get("is_success", False)):
+                completion_reason = "success"
+                buffer.final_info["is_success"] = True
+                waiting_save_confirm = True
+                print("Task success detected. Paused. Press A+X together to save, or Y/Space/R to discard.")
+            elif terminated or truncated or buffer.steps >= cfg.max_steps_per_episode:
+                if terminated:
                     completion_reason = "terminated"
                 elif truncated:
                     completion_reason = "truncated"
                 else:
                     completion_reason = "max_steps"
-                waiting_save_confirm = True
-                print(f"Episode complete ({completion_reason}). Press A+X together to save, or Space/R to discard.")
+                buffer.final_info["completion_reason"] = completion_reason
+                finish_episode(
+                    buffer=buffer,
+                    cfg=cfg,
+                    metadata=metadata,
+                    keep=False,
+                    reason=completion_reason,
+                )
+                episode_index = next_episode_index(run_dir)
+                obs = reset_control_state(env, policy, quest_control, ik_solver, seed=cfg.random_seed)
+                takeover_blender.reset()
+                last_joint_action = np.asarray(obs["agent_pos"], dtype=np.float32).copy()
+                buffer = start_episode(run_dir, episode_index, physics)
+                cumulative_reward = 0.0
+                waiting_save_confirm = False
+                completion_reason = ""
+                switch_control_mode(
+                    MODE_POLICY,
+                    latest_data=latest_data,
+                    policy=policy,
+                    quest_control=quest_control,
+                    ik_solver=ik_solver,
+                )
+                control_mode = MODE_POLICY
+                takeover_blender.set_mode(control_mode, current_action=last_joint_action)
+                print(f"Episode ended without success. Started episode {episode_index:06d}.")
+                continue
 
             now = time.time()
-            if cfg.print_hz > 0 and now - last_print >= 1.0 / cfg.print_hz:
+            if cfg.status_hz_interval > 0 and now - last_print >= float(cfg.status_hz_interval):
                 print(
                     f"[{control_mode}] episode={buffer.index:06d} steps={buffer.steps} "
                     f"saved={metadata['saved_episodes']} reward={cumulative_reward:.2f} "
@@ -1181,28 +1461,41 @@ def run(cfg: PolicyTeleopConfig) -> None:
         env.close()
 
 
+# Hydra 命令行入口，配置格式与 quest_teleop_collect.py 保持一致。
+@hydra.main(version_base="1.2", config_name="quest_policy_collect", config_path="../configs/data_collect")
+def quest_policy_collect_cli(cfg: DictConfig) -> None:
+    run(cfg)
+
+
 if __name__ == "__main__":
-    CONFIG = PolicyTeleopConfig(
-        ckpt_path=(
-            "outputs/2_pretrain/train/2026-06-30/23-42-18_InsertCylinder-3Arms-v0_pre_zed_two_model_diffusion/checkpoints/176000_loss=0.0031_sr=60.0_ar=577.94"
-        ),
-        initial_mode=MODE_POLICY,
-        max_steps_per_episode=400,
-        control_hz=25.0,
-        takeover_blend_steps=15,
-        random_seed=100,
-        device="cuda",
-        show_mujoco_viewer=True,
-        head_control=True,
-        lock_roll=True,
-        lock_pitch=True,
-        camera_window=True,
-        display_camera="zed_cam_left",
-        unity_image_stream=True,
-        unity_image_source="rgb",
-        unity_image_stereo=True,
-        unity_image_host="auto",
-        unity_image_port=5010,
-        unity_image_hz=25.0,
-    )
-    run(CONFIG)
+    default_args = [
+        (
+            "ckpt_path='outputs/2_pretrain/train/2026-06-30/"
+            "23-42-18_InsertCylinder-3Arms-v0_pre_zed_two_model_diffusion/"
+            "checkpoints/176000_loss=0.0031_sr=60.0_ar=577.94'"
+        ),                                                  # 预训练策略 checkpoint
+        "device=cuda",                                      # 策略推理设备
+        "env_id=guided_vision/InsertCylinder-3Arms-v0",     # 仿真任务；设为 null 时读取 checkpoint 配置
+        "max_steps_per_episode=600",                        # 单条轨迹最大步数
+        "fps=25",                                           # 控制、记录与视频帧率
+        "takeover_blend_steps=15",                          # 策略与人工接管的平滑过渡步数
+        "head_control=true",                                # 是否允许头显接管中间臂
+        "lock_pitch=false",                                 # 是否锁定中间臂 pitch
+        "lock_roll=true",                                   # 是否锁定中间臂 roll
+        "save_pose_action=true",                            # 是否保存 Quest 末端位姿动作
+        "save_rgb=true",                                    # 成功确认后是否回放并渲染 RGB
+        "save_videos=true",                                 # 是否将回放 RGB 保存为 mp4
+        "save_depth=false",                                 # 是否保存各记录相机的逐像素深度
+        "camera_window=false",                              # 是否打开本地 RGB 窗口
+        "viewer=true",                                      # 是否打开 MuJoCo viewer
+        "unity_image_stream=true",                          # 是否向 Quest/Unity 发送画面
+        "unity_image_source=rgb",                           # Quest/Unity 画面类型：rgb/depth
+        "unity_image_stereo=true",                          # 是否发送左右眼 side-by-side 画面
+    ]
+
+    for arg in default_args:
+        arg_key = arg.split("=", 1)[0]
+        if not any(sys_arg.split("=", 1)[0] == arg_key for sys_arg in sys.argv):
+            sys.argv.append(arg)
+
+    quest_policy_collect_cli()

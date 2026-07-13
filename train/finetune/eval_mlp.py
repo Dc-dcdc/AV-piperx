@@ -193,8 +193,8 @@ class TopKCheckpointManager:
         self.checkpoints_dir = self.out_dir / "checkpoints"  # 模型快照存放的总目录 
         self.eval_dir = self.out_dir / "eval"  # 评估视频存放的总目录
         self.max_keep = max_keep
-        self.metric = metric  # 记录筛选指标：'loss' 或 'reward'
-        self.top_k = []       # 数据结构: [{"step": int, "loss": float, "path": Path}]
+        self.metric = str(metric).lower()  # 记录筛选指标：'loss'、'reward' 或 'success'
+        self.top_k = []       # 数据结构: [{"step": int, "loss": float, "reward": float, "success_rate": float, "path": Path}]
         self.latest_path = None
         self.records_file = self.checkpoints_dir / "top_k_records.json"
         self.records_resume = records_resume
@@ -205,23 +205,47 @@ class TopKCheckpointManager:
                     data = json.load(f)
                     self.latest_path = Path(data.get("latest")) if data.get("latest") else None
                     self.top_k = [
-                        {"step": item["step"], "loss": item["loss"], "reward": item["reward"], "path": Path(item["path"])} 
+                        {
+                            "step": item["step"],
+                            "loss": item["loss"],
+                            "reward": item.get("reward", -float("inf")),
+                            "success_rate": item.get("success_rate", item.get("success", -float("inf"))),
+                            "path": Path(item["path"]),
+                        }
                         for item in data.get("top_k", [])
                     ]
             except Exception as e:
                 logging.warning(f"⚠️ 无法读取 Top-K 记录，将重新开始统计: {e}")
 
-    def update(self, step: int, loss: float, ckpt_path: Path,reward: float = -float('inf')):
+    def update(
+        self,
+        step: int,
+        loss: float,
+        ckpt_path: Path,
+        reward: float = -float("inf"),
+        success_rate: float = -float("inf"),
+    ):
         self.latest_path = ckpt_path
         # 防重入：如果当前路径已经在记录里了，先剔除旧的
         self.top_k = [item for item in self.top_k if item["path"].name != ckpt_path.name]
         # 将新的 checkpoint 加入 top-k 候选并排序
-        self.top_k.append({"step": step, "loss": loss, "reward": reward, "path": ckpt_path})
+        self.top_k.append(
+            {
+                "step": step,
+                "loss": loss,
+                "reward": reward,
+                "success_rate": success_rate,
+                "path": ckpt_path,
+            }
+        )
         
         # 🌟 4. 根据配置进行排序
         if self.metric == "reward":
             # Reward 越大越好，使用 reverse=True
             self.top_k.sort(key=lambda x: x["reward"], reverse=True)
+        elif self.metric in {"success", "success_rate", "sr"}:
+            # 成功率越大越好；成功率相同时用平均奖励作为次级排序。
+            self.top_k.sort(key=lambda x: (x["success_rate"], x["reward"]), reverse=True)
         else:
             # Loss 越小越好
             self.top_k.sort(key=lambda x: x["loss"])
@@ -267,7 +291,16 @@ class TopKCheckpointManager:
         with open(self.records_file, "w", encoding="utf-8") as f:
             json.dump({
                 "latest": str(self.latest_path) if self.latest_path else None,
-                "top_k": [{"step": i["step"], "loss": i["loss"], "reward": i["reward"], "path": str(i["path"])} for i in self.top_k]
+                "top_k": [
+                    {
+                        "step": i["step"],
+                        "loss": i["loss"],
+                        "reward": i["reward"],
+                        "success_rate": i["success_rate"],
+                        "path": str(i["path"]),
+                    }
+                    for i in self.top_k
+                ]
             }, f, indent=4, ensure_ascii=False)
 
 def seed_runtime(seed: int):
@@ -576,7 +609,7 @@ def evaluate_and_checkpoint_if_needed(
         # 触发 Top-K 筛选与清理
         if train_loss is not None:
             if ckpt_path.exists():
-                manager.update(step, train_loss, ckpt_path, reward=ar)
+                manager.update(step, train_loss, ckpt_path, reward=ar, success_rate=sr)
         else:
             logging.warning("⚠️ 警告: 未传入 train_loss，跳过 Top-K 模型清理逻辑，将保留所有权重。")
 

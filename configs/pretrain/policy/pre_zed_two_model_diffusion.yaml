@@ -17,10 +17,10 @@ override_dataset_stats:
 training:
   lr_scheduler: "cosine"    # 调度器策略：强烈推荐 "cosine" (余弦衰减)，让模型在末期平滑落地
   lr_warmup_steps: 5000      # 预热步数：模型刚开始是白纸，用 500 步慢慢把学习率升到 1e-4，防止梯度爆炸，一般设置为总步数的1-5%
-  offline_steps: 500000      # 离线训练总步数
+  offline_steps: 200000      # 离线训练总步数
   online_steps: 0
-  save_freq: 100         # 每 5000 步保存一次模型快照
-  eval_freq: 100         # 每 5000 步评估一次
+  save_freq: 2000         # 每 5000 步保存一次模型快照
+  eval_freq: 2000         # 每 5000 步评估一次
   save_checkpoint: true
   num_workers: 4   # Number of workers for the offline training dataloader.
   batch_size: 32

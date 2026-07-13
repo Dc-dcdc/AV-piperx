@@ -52,6 +52,122 @@ from lerobot.common.utils.utils import (
 )
 
 
+PRETRAIN_WANDB_PARAMETER_TAGS = (
+    ("device", "device"),                                  # 训练设备
+    ("batch", "training.batch_size"),                     # 训练批大小
+    ("lr", "training.lr"),                                # 主网络学习率
+    ("backbone_lr", "training.lr_backbone"),              # 视觉底座学习率
+    ("steps", "training.offline_steps"),                  # 预训练总步数
+    ("lr_scheduler", "training.lr_scheduler"),            # 学习率调度器
+    ("lr_warmup", "training.lr_warmup_steps"),            # 学习率预热步数
+    ("weight_decay", "training.weight_decay"),            # 权重衰减
+    ("grad_clip", "training.grad_clip_norm"),             # 梯度裁剪阈值
+    ("amp", "use_amp"),                                   # 是否使用混合精度
+    ("image_aug", "training.image_transforms.enable"),    # 是否启用图像增强
+    ("obs_steps", "policy.n_obs_steps"),                  # 历史观测步数
+    ("horizon", "policy.horizon"),                        # 动作预测长度
+    ("act_steps", "policy.n_action_steps"),               # 动作块执行长度
+    ("down_dims", "policy.down_dims"),                    # U-Net通道结构
+    ("n_groups", "policy.n_groups"),                      # GroupNorm组数
+    ("noise_scheduler", "policy.noise_scheduler_type"),   # 扩散噪声调度器
+    ("train_noise_steps", "policy.num_train_timesteps"),  # 训练加噪步数
+    ("infer_steps", "policy.num_inference_steps"),        # 推理去噪步数
+    ("prediction", "policy.prediction_type"),             # 扩散预测目标
+    ("ema", "policy.use_ema"),                            # 是否使用EMA
+    ("ema_decay", "policy.ema_decay"),                    # EMA衰减系数
+    ("arm_dim", "policy.arm_action_dim"),                 # 双臂动作维度
+    ("view_dim", "policy.view_action_dim"),               # 视角动作维度
+    ("view_weight", "policy.view_loss_weight"),           # 视角损失权重
+)
+
+
+def _format_wandb_tag_value(value) -> str:
+    """将配置值转换为简短稳定的 W&B 标签文本。"""
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, float):
+        return f"{value:g}"
+    if OmegaConf.is_list(value) or isinstance(value, (list, tuple)):
+        return "-".join(_format_wandb_tag_value(item) for item in value)
+    return str(value).replace(" ", "_")
+
+
+def add_wandb_parameter_tags(logger: Logger, cfg: DictConfig) -> None:
+    """把实际生效的预训练关键配置追加到当前 W&B run 标签。"""
+    wandb_module = getattr(logger, "_wandb", None)
+    wandb_run = getattr(wandb_module, "run", None)
+    if wandb_run is None:
+        return
+
+    configured_tags = OmegaConf.select(cfg, "wandb.tags", default=[])
+    if configured_tags is None:
+        configured_tags = []
+    elif isinstance(configured_tags, str):
+        configured_tags = [configured_tags]
+    else:
+        configured_tags = list(configured_tags)
+
+    parameter_tags = []
+    for tag_name, config_path in PRETRAIN_WANDB_PARAMETER_TAGS:
+        value = OmegaConf.select(cfg, config_path, default=None)
+        if value is not None:
+            parameter_tags.append(f"{tag_name}:{_format_wandb_tag_value(value)}")
+
+    existing_tags = list(wandb_run.tags or ())
+    wandb_run.tags = tuple(
+        dict.fromkeys([*existing_tags, *map(str, configured_tags), *parameter_tags])
+    )
+
+
+def count_trainable_parameters_by_component(policy):
+    """按视觉编码器、扩散 U-Net 和其他模块统计可学习参数，参数只计一次。"""
+    trainable_params = {id(param): param for param in policy.parameters() if param.requires_grad}
+    visual_param_ids = set()
+    diffusion_param_ids = set()
+
+    visual_module_names = {"rgb_encoder", "image_encoder", "visual_encoders", "backbone"}
+    diffusion_module_names = {"unet", "arm_unet", "view_unet"}
+    for module_name, module in policy.named_modules():
+        leaf_name = module_name.rsplit(".", 1)[-1]
+        if leaf_name in visual_module_names:
+            visual_param_ids.update(
+                id(param) for param in module.parameters() if param.requires_grad
+            )
+        if leaf_name in diffusion_module_names:
+            diffusion_param_ids.update(
+                id(param) for param in module.parameters() if param.requires_grad
+            )
+
+    # 若模块存在嵌套，视觉部分优先归类，避免同一个参数重复计数。
+    visual_param_ids &= trainable_params.keys()
+    diffusion_param_ids &= trainable_params.keys()
+    diffusion_param_ids -= visual_param_ids
+    categorized_param_ids = visual_param_ids | diffusion_param_ids
+    other_param_ids = trainable_params.keys() - categorized_param_ids
+
+    def count(param_ids):
+        return sum(trainable_params[param_id].numel() for param_id in param_ids)
+
+    return {
+        "vision": count(visual_param_ids),
+        "diffusion": count(diffusion_param_ids),
+        "other": count(other_param_ids),
+        "total": count(trainable_params.keys()),
+    }
+
+
+def log_trainable_parameter_counts(policy):
+    """输出模型各主要部分及总计的可学习参数量。"""
+    counts = count_trainable_parameters_by_component(policy)
+    logging.info(
+        f"模型可学习参数量: "
+        f"视觉部分={counts['vision']} ({format_big_number(counts['vision'])}), "
+        f"扩散模型部分={counts['diffusion']} ({format_big_number(counts['diffusion'])}), "
+        f"其他={counts['other']} ({format_big_number(counts['other'])}), "
+        f"总计={counts['total']} ({format_big_number(counts['total'])})"
+    )
+
+
 
 def make_optimizer_and_scheduler(cfg, policy):
     if cfg.policy.name == "act":
@@ -441,6 +557,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
             f"disable_machine_info={disable_machine_info}"
         )
     logger = Logger(cfg, out_dir, wandb_job_name=job_name)
+    add_wandb_parameter_tags(logger, cfg)
     set_global_seed(cfg.seed)
     device = get_safe_torch_device(cfg.device, log=True)
 
@@ -628,9 +745,8 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # 使用 Python 内置的 cycle 将其变为无限迭代器，使用 next(dl_iter) 进行取出一个batch的数据
     # dl_iter = cycle(dataloader) #会存有历史数据，导致显存溢出
     dl_iter = iter(get_infinite_dataloader(dataloader)) 
-    num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    logging.info(f"📐 模型可学习参数量: {num_learnable_params} ({format_big_number(num_learnable_params)})")
-    logging.info(f"🎯 预训练目标步数: {cfg.training.offline_steps}")
+    log_trainable_parameter_counts(policy)
+    logging.info(f"预训练目标步数: {cfg.training.offline_steps}")
 
     # ==========================================
     # 🌟 5. 动态拼接环境 ID 并创建环境
@@ -652,7 +768,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     logging.info(f"✅ 环境加载成功！最终挂载的相机: {obs_cameras}")
 
     # ==========================================
-    # 🌟 6. DPPO 预训练主循环
+    # 🌟 6. DP 预训练主循环
     # ==========================================
     max_checkpoints = getattr(cfg.eval, "max_checkpoints", 5)
     records_resume = getattr(cfg.eval, "records_resume", True)
@@ -662,7 +778,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
                                     records_resume=records_resume, 
                                     metric=checkpoint_metric)
     policy.train()
-    logging.info("🔥 开始 DPPO 预训练 (模仿学习阶段)...")
+    logging.info("🔥 开始预训练 (模仿学习阶段)...")
     
     # 从 start_step 开始，避免覆盖之前的进度！
     for step in range(start_step, cfg.training.offline_steps):
@@ -729,7 +845,7 @@ if __name__ == "__main__":
         "dataset_local_dir=outputs/5_hf_datasets/quest_teleop_insert_cylinder_3arms_rgb_joint",
         "dataset_repo_id=Dc-dc/quest_teleop_insert_cylinder_3arms_rgb_joint",
         "env=sim_insert_cylinder_3arms", # 环境，这俩定义在default文件中
-        "policy=pre_zed_dual_head_diffusion", # 策略
+        "policy=pre_zed_diffusion", # 策略
         "resume=false",
         "resume_path='outputs/2_pretrain/train/2026-05-19/00-57-05_InsertCylinder-3Arms-v0_pre_zed_static_wrist_diffusion/checkpoints/108000_loss=0.0111_sr=0.0_ar=-64.33'",
         "training.batch_size=16",

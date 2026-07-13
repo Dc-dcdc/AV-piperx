@@ -29,7 +29,8 @@ training:
   clip_ratio: 0.05             # PPO 截断范围
 
   gamma_denoising: 0.8        #每个动作的去噪步获得的优势值是一样的，但是这里加上了一个折扣因子，距离最终动作越远的优势值越小
-  weight_decay: 1e-6
+  actor_weight_decay: 0.0
+  critic_weight_decay: 0.0
 
 
 eval:

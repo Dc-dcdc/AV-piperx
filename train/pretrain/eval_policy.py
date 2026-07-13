@@ -1281,7 +1281,7 @@ if __name__ == "__main__":
     eval_cfg = SimpleNamespace(
         seed=100,
         # 可以指向单个 checkpoint，也可以指向整次训练 run 目录或 run/checkpoints 目录。
-        ckpt_path="outputs/3_finetune/train/2026-07-09/13-18-11_InsertCylinder-3Arms-v0_ft_zed_diffusion/checkpoints/000004_sr=0.00_reward=327.67_Ploss=-0.0029_Vloss=0.0053",
+        ckpt_path="outputs/3_finetune/train/2026-07-09/22-26-00_InsertCylinder-3Arms-v0_ft_zed_diffusion/checkpoints/000120_sr=0.79_reward=716.63_Ploss=-0.0067_Vloss=0.0058",
         checkpoint_source="all",  # all: 读取目录下 checkpoint全部文件；   top_k/latest: 读取 checkpoints/top_k_records.json中记录的模型
         max_checkpoints=None,     # 调试时可设为 1/2，正式评估保持 None
         eval_output_dir=None,     # None 时自动保存到 run_dir/policy_eval/固定配置名，方便断点续评
