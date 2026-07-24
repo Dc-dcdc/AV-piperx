@@ -1,0 +1,85 @@
+# @package _global_
+# SewNeedle ZED-only Diffusion checkpoint 的 DPPO 微调配置。
+
+seed: 1000
+dataset_repo_id: "av_piper_dppo_sew_needle_zed_rollout"
+
+env:
+  name: guided_vision
+  task: SewNeedle-3Arms-v0
+  n_envs: 2
+
+training:
+  # 启动时必须覆盖为 SewNeedle 预训练 checkpoint。
+  pretrained_ckpt_path: null
+  n_train_itr: 1000
+  n_critic_warmup_itr: 2
+  rollout_steps: 800
+  batch_size: 32
+  update_epochs: 10
+
+  actor_lr: 1e-7
+  critic_lr: 5e-5
+  critic_hidden_dims: [256, 256, 256]
+  critic_activation: Mish
+  critic_use_layernorm: false
+  actor_weight_decay: 0.0
+  critic_weight_decay: 0.0
+  train_vision_encoder: false
+  lr_backbone: 1e-5
+  actor_lr_warmup_iters: 5
+
+  gamma: 0.999
+  gae_lambda: 0.95
+  clip_ploss_coef: 0.01
+  clip_ploss_coef_base: 0.001
+  clip_ploss_coef_rate: 3.0
+  gamma_denoising: 0.99
+  target_kl: 1e-4
+  bc_coef: 0.0
+
+  reward_source: "binary_success_label"
+  reward_scale_running: false
+  reward_scale_const: 1.0
+  norm_adv: true
+  clip_advantage_lower_quantile: 0.05
+  clip_advantage_upper_quantile: 0.95
+
+  min_sampling_denoising_std: 0.01
+  min_logprob_denoising_std: 0.01
+  ddim_eta: 0.0
+  randn_clip_value: 3.0
+  logprob_reduction: mean
+  use_disk_cache: true
+  disk_cache_dir: "outputs/buffer/finetune_dppo_sew_needle"
+  grad_accumulate: 32
+  post_update_probe_size: 256
+  rollout_policy: dppo
+  skip_update: false
+  update_actor: true
+  ref_bc_early_stop: 4.0
+
+  min_actor_update_success_rate: 0.0
+  min_actor_update_avg_return: -100.0
+  rollback_on_eval_collapse: true
+  rollback_success_rate: 0.1
+  rollback_reward: -100.0
+  rollback_patience: 1
+
+eval:
+  eval_freq: 2
+  render_camera: ["zed_cam_left"]
+  checkpoint_metric: "success"
+
+
+wandb:
+  enable: false
+  disable_artifact: true
+  project: ${env.task}_finetune
+  notes: ""
+  save_code: false
+
+policy:
+  name: diffusion
+  n_action_steps: 8
+  ft_denoising_steps: 5

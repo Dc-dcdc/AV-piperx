@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 # import os
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com" # 强行指向国内镜像站
+import copy
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -20,7 +22,16 @@ import time
 from contextlib import nullcontext
 from pprint import pformat
 
-from train.pretrain.eval_train import evaluate_and_checkpoint_if_needed, TopKCheckpointManager, make_eval_env
+from train.pretrain.async_eval import (
+    AsyncEvalController,
+    finalize_async_eval_result,
+)
+from train.pretrain.eval_train import (
+    TopKCheckpointManager,
+    evaluate_and_checkpoint_if_needed,
+    make_checkpoint_identifier,
+    make_eval_env,
+)
 
 import hydra
 import datasets
@@ -44,6 +55,8 @@ from lerobot.common.logger import Logger
 from lerobot.common.policies.factory import make_policy # 用于获取训练策略模型
 from lerobot.common.policies.utils import get_device_from_parameters
 from lerobot.common.policies.policy_protocol import PolicyWithUpdate
+from train.pretrain.optimizer_utils import partition_optimizer_parameters
+from train.pretrain.scid_transform import initialize_scid_transform_from_dataset
 from lerobot.common.utils.utils import (
     format_big_number,
     get_safe_torch_device,
@@ -78,6 +91,14 @@ PRETRAIN_WANDB_PARAMETER_TAGS = (
     ("arm_dim", "policy.arm_action_dim"),                 # 双臂动作维度
     ("view_dim", "policy.view_action_dim"),               # 视角动作维度
     ("view_weight", "policy.view_loss_weight"),           # 视角损失权重
+    ("coupling", "policy.coupling_mode"),                 # full、RBAC或balanced lookahead耦合
+    ("coupling_block", "policy.coupling_block_type"),    # scalar gate或role adaLN-Zero
+    ("coupling_pos", "policy.coupling_use_temporal_pos_emb"),
+    ("coupling_ffn", "policy.coupling_use_ffn"),
+    ("coupling_ffn_ratio", "policy.coupling_ffn_ratio"),
+    ("v2a_scale", "policy.view_to_arm_coupling_scale"),   # View上下文注入Arm的外部缩放
+    ("a2v_scale", "policy.arm_to_view_coupling_scale"),   # Arm上下文注入View的外部缩放
+    ("scid_ridge", "policy.scid_ridge"),                 # SCID闭式Arm->View映射的岭正则
 )
 
 
@@ -126,7 +147,17 @@ def count_trainable_parameters_by_component(policy):
     diffusion_param_ids = set()
 
     visual_module_names = {"rgb_encoder", "image_encoder", "visual_encoders", "backbone"}
-    diffusion_module_names = {"unet", "arm_unet", "view_unet"}
+    diffusion_module_names = {
+        "unet",
+        "arm_unet",
+        "view_unet",
+        "view_to_arm_attention",
+        "arm_to_view_attention",
+        "arm_coupling_norm",
+        "view_coupling_norm",
+        "coupling_timestep_encoder",
+        "role_adaln_coupling",
+    }
     for module_name, module in policy.named_modules():
         leaf_name = module_name.rsplit(".", 1)[-1]
         if leaf_name in visual_module_names:
@@ -168,6 +199,136 @@ def log_trainable_parameter_counts(policy):
     )
 
 
+def resolve_amp_dtype(cfg: DictConfig) -> torch.dtype:
+    """解析训练用 autocast dtype。默认沿用当前配置的 bfloat16。"""
+    dtype_name = str(getattr(cfg, "amp_dtype", "bfloat16")).lower()
+    if dtype_name in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if dtype_name in {"fp16", "float16", "half"}:
+        return torch.float16
+    raise ValueError(f"不支持的 amp_dtype={dtype_name!r}，可选 bfloat16 或 float16。")
+
+
+def resolve_grad_scaler_enabled(cfg: DictConfig, device: torch.device, amp_dtype: torch.dtype) -> bool:
+    """GradScaler 默认只在 CUDA fp16 AMP 下启用，必要时可用 use_grad_scaler 覆盖。"""
+    mode = str(getattr(cfg, "use_grad_scaler", "auto")).lower()
+    if mode == "auto":
+        return bool(cfg.use_amp and device.type == "cuda" and amp_dtype == torch.float16)
+    if mode in {"true", "1", "yes", "on"}:
+        return bool(cfg.use_amp and device.type == "cuda")
+    if mode in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError("use_grad_scaler 只能是 auto/true/false。")
+
+
+def should_run_periodic_step(step: int, total_steps: int, freq: int | None) -> bool:
+    """训练最后一步也执行周期任务，避免尾部 checkpoint/eval 被漏掉。"""
+    is_last_step = step == total_steps - 1
+    if is_last_step:
+        return True
+    return bool(freq and freq > 0 and step > 0 and step % freq == 0)
+
+
+def should_checkpoint_or_eval(step: int, cfg: DictConfig) -> bool:
+    """提前判断本 step 是否真的需要进入较重的评估/保存逻辑。"""
+    total_steps = int(cfg.training.offline_steps)
+    should_eval = should_run_periodic_step(
+        step,
+        total_steps,
+        int(getattr(cfg.training, "eval_freq", 0)),
+    )
+    save_freq = int(getattr(cfg.training, "save_freq", 10000))
+    should_checkpoint = bool(getattr(cfg.training, "save_checkpoint", False)) and (
+        should_run_periodic_step(step, total_steps, save_freq)
+    )
+    return should_eval or should_checkpoint
+
+
+def process_async_eval_results(
+    evaluator: AsyncEvalController,
+    *,
+    logger,
+    cfg: DictConfig,
+    manager: TopKCheckpointManager,
+    logging_step: int,
+) -> int:
+    """非阻塞收集已完成评估；所有日志和Top-K文件操作只在主进程执行。"""
+    results = evaluator.poll()
+    for result in results:
+        try:
+            finalize_async_eval_result(
+                result,
+                logger=logger,
+                cfg=cfg,
+                manager=manager,
+                logging_step=logging_step,
+            )
+        finally:
+            evaluator.cleanup_result_snapshot(result)
+    return len(results)
+
+
+def wait_for_async_eval_capacity(
+    evaluator: AsyncEvalController,
+    *,
+    logger,
+    cfg: DictConfig,
+    manager: TopKCheckpointManager,
+    logging_step: int,
+):
+    """等待一个队列槽位，同时持续消费结果，主要用于最终step或禁止跳过时。"""
+    while not evaluator.has_capacity:
+        completed = process_async_eval_results(
+            evaluator,
+            logger=logger,
+            cfg=cfg,
+            manager=manager,
+            logging_step=logging_step,
+        )
+        if completed == 0:
+            time.sleep(0.1)
+
+
+def make_train_dataloader_kwargs(
+    cfg: DictConfig,
+    device: torch.device,
+    shuffle: bool,
+    sampler,
+) -> dict:
+    """构建 DataLoader 参数；多 worker 时保持 worker 常驻并允许配置预取深度。"""
+    num_workers = int(cfg.training.num_workers)
+    dataloader_kwargs = {
+        "num_workers": num_workers,
+        "batch_size": int(cfg.training.batch_size),
+        "shuffle": shuffle,
+        "sampler": sampler,
+        "pin_memory": (device.type != "cpu"),
+        "drop_last": True,
+    }
+    if num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = bool(
+            cfg.training.get("persistent_workers", True)
+        )
+        prefetch_factor = cfg.training.get("prefetch_factor", None)
+        if prefetch_factor is not None:
+            prefetch_factor = int(prefetch_factor)
+            if prefetch_factor > 0:
+                dataloader_kwargs["prefetch_factor"] = prefetch_factor
+    return dataloader_kwargs
+
+
+def tensor_to_float(value) -> float:
+    """只在日志/保存需要数值时把 Tensor 同步到 Python float。"""
+    if isinstance(value, torch.Tensor):
+        return float(value.detach())
+    return float(value)
+
+
+def is_visual_backbone_parameter(parameter_name: str) -> bool:
+    """沿用现有训练脚本对视觉Backbone参数的识别规则。"""
+    return parameter_name.startswith(
+        ("model.backbone", "image_encoder", "visual_encoders")
+    )
 
 def make_optimizer_and_scheduler(cfg, policy):
     if cfg.policy.name == "act":
@@ -192,28 +353,60 @@ def make_optimizer_and_scheduler(cfg, policy):
             optimizer_params_dicts, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
         )
         lr_scheduler = None
-    elif cfg.policy.name in ["diffusion", "dual_head_diffusion", "two_model_diffusion"]:
-        # 🌟 修复：分离视觉 Backbone 和 U-Net 的学习率，并将所有参数纳入优化器
+    elif cfg.policy.name in [
+        "diffusion",
+        "dual_head_diffusion",
+        "scid_dual_head_diffusion",
+        "coupled_dual_head_diffusion",
+        "two_model_diffusion",
+    ]:
+        # 分离主网络、零门控耦合分支和视觉Backbone。耦合分支在gate=0时
+        # 暂时没有任务梯度，必须关闭Adam的耦合式weight decay，避免其
+        # Attention/AdaLN/FFN/时间编码器在gate打开前被压缩为零。
+        trainable_named_parameters = [
+            (name, parameter)
+            for name, parameter in policy.named_parameters()
+            if parameter.requires_grad
+        ]
+        main_parameters, coupling_parameters, backbone_parameters = (
+            partition_optimizer_parameters(
+                trainable_named_parameters,
+                is_backbone_parameter=is_visual_backbone_parameter,
+            )
+        )
         optimizer_params_dicts = [
             {
-                "params": [
-                    p
-                    for n, p in policy.named_parameters()
-                    # 假设非 backbone 的参数（即 UNet 和相关投影层）
-                    if not n.startswith("model.backbone") and not n.startswith("image_encoder") and p.requires_grad
-                ]
-            },
-            {
-                "params": [
-                    p
-                    for n, p in policy.named_parameters()
-                    # 抓取视觉编码器的参数
-                    if (n.startswith("model.backbone") or n.startswith("image_encoder") or n.startswith("visual_encoders")) and p.requires_grad
-                ],
-                # 视觉网络给予 10 倍小的学习率，保护预训练特征
-                "lr": getattr(cfg.training, "lr_backbone", 1e-5), 
+                "name": "main",
+                "params": main_parameters,
             },
         ]
+        if coupling_parameters:
+            optimizer_params_dicts.append(
+                {
+                    "name": "coupling",
+                    "params": coupling_parameters,
+                    "weight_decay": 0.0,
+                }
+            )
+        optimizer_params_dicts.append(
+            {
+                "name": "backbone",
+                "params": backbone_parameters,
+                # 视觉网络给予 10 倍小的学习率，保护预训练特征
+                "lr": getattr(cfg.training, "lr_backbone", 1e-5),
+            }
+        )
+        logging.info(
+            "优化器参数组: main=%d tensors (weight_decay=%g), "
+            "coupling=%d tensors (weight_decay=0), "
+            "backbone=%d tensors (lr=%g, weight_decay=%g)",
+            len(main_parameters),
+            float(cfg.training.weight_decay),
+            len(coupling_parameters),
+            len(backbone_parameters),
+            float(getattr(cfg.training, "lr_backbone", 1e-5)),
+            float(cfg.training.weight_decay),
+        )
 
         #对于扩散模型（diffusion model），我们使用了Adam优化器来更新模型的参数
         optimizer = torch.optim.Adam(
@@ -260,16 +453,17 @@ def update_policy(
     grad_scaler: GradScaler,
     lr_scheduler=None,
     use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
+    collect_metrics: bool = True,
     lock=None,
 ):
     """进行一次训练更新，计算损失，反向传播，更新模型参数，并返回一个包含训练信息的字典."""
     start_time = time.perf_counter()
     device = get_device_from_parameters(policy)
-    policy.train() # 设置模型为训练模式激活模型里的 Dropout和BatchNorm等操作
     # ==========================================
     # 1. 向前传播计算loss
     # ==========================================
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16) if use_amp else nullcontext(): # 如果 use_amp = True，它会开启 torch.autocast，意味着接下来的计算会自动在 Float32 和 Float16 之间切换，省显存且加速
+    with torch.autocast(device_type=device.type, dtype=amp_dtype) if use_amp else nullcontext(): # 如果 use_amp = True，它会开启 torch.autocast，意味着接下来的计算会自动在 Float32 和 Float16 之间切换，省显存且加速
         output_dict = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
         loss = output_dict["loss"]
@@ -312,10 +506,13 @@ def update_policy(
                 policy.update()# 模型平滑处理（EMA）
     else:
         print("Warning: Gradient overflow, skipping LR and EMA update.")
+
+    if not collect_metrics:
+        return {}
     
     info = {
-        "loss": loss.item(),
-        "grad_norm": float(grad_norm),
+        "loss": tensor_to_float(loss),
+        "grad_norm": tensor_to_float(grad_norm),
         "lr": optimizer.param_groups[0]["lr"],
         "update_s": time.perf_counter() - start_time,
     }
@@ -326,7 +523,7 @@ def update_policy(
         if isinstance(v, torch.Tensor):
             # 如果是标量（单值 Tensor），直接取 .item() 转为普通的 Python float
             if v.numel() == 1:
-                info[k] = v.item()
+                info[k] = tensor_to_float(v)
             # 如果是多维张量，必须把它从计算图剥离并转移到 CPU 内存
             else:
                 info[k] = v.detach().cpu()
@@ -447,7 +644,13 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
         raise ValueError("配置文件`delta_timestamps` 中缺失了最核心的 `action` 时间轴！\n")
         
     # ⚠️ 软警告（可选）：Diffusion 通常还需要历史视觉帧，如果没写，可以给个黄字警告
-    if cfg.policy.name in ["diffusion", "dual_head_diffusion", "two_model_diffusion"] and not any("images" in k for k in delta_timestamps_dict.keys()):
+    if cfg.policy.name in [
+        "diffusion",
+        "dual_head_diffusion",
+        "scid_dual_head_diffusion",
+        "coupled_dual_head_diffusion",
+        "two_model_diffusion",
+    ] and not any("images" in k for k in delta_timestamps_dict.keys()):
         import logging
         logging.warning("警告: 你的 `delta_timestamps` 中没有包含任何图片的过去时间帧。\n")
 
@@ -462,6 +665,298 @@ def clean_optional_path(value) -> str | None:
     if text.lower() in {"", "none", "null"}:
         return None
     return text
+
+
+# 严格断点续训时，快照配置是训练语义的基线。这里只允许当前运行覆盖与
+# 运行资源、训练时长/记录频率和评估吞吐相关的字段。
+RESUME_CURRENT_CONFIG_PATHS = (
+    "device",                         # 当前训练使用的计算设备，如 cuda:0
+    "use_amp",                        # 是否启用自动混合精度训练
+    "training.offline_steps",         # 本次训练计划达到的总离线训练步数
+    "training.eval_freq",             # 每隔多少训练步执行一次评估
+    "training.save_freq",             # 每隔多少训练步保存一次快照
+    "training.log_freq",              # 每隔多少训练步记录一次训练日志
+    "training.num_workers",           # DataLoader 并行加载数据的进程数
+    "training.persistent_workers",    # 是否让 DataLoader worker 跨轮次常驻
+    "training.prefetch_factor",       # 每个 DataLoader worker 预取的 batch 数
+    "eval.device",                    # 模型评估使用的计算设备
+    "eval.batch_size",                # 并行评估时同时运行的环境数量
+    "eval.n_episodes",                # 每次评估执行的 episode 总数
+    "eval.max_episodes_rendered",     # 每次评估最多保存录像的 episode 数
+    "eval.use_async_envs",            # 是否使用异步向量环境进行并行评估
+    "wandb",                          # 当前实验的完整 W&B 日志配置
+)
+
+# 这些字段负责发起本次恢复，不能被快照中保存的旧 resume 状态覆盖。
+RESUME_CONTROL_CONFIG_PATHS = (
+    "resume",
+    "resume_path",
+    "init_policy_path",
+)
+
+
+def get_resume_checkpoint_dir(resume_path: str | Path) -> Path:
+    """将 checkpoint 或 pretrained_model 路径统一转换为 checkpoint 目录。"""
+    checkpoint_dir = Path(resume_path).expanduser()
+    if checkpoint_dir.name == "pretrained_model":
+        checkpoint_dir = checkpoint_dir.parent
+    return checkpoint_dir
+
+
+def get_resume_run_dir(resume_path: str | Path) -> Path | None:
+    """从 checkpoint 路径向上查找包含 .hydra 的原实验目录。"""
+    checkpoint_dir = get_resume_checkpoint_dir(resume_path)
+    for candidate in (checkpoint_dir, *checkpoint_dir.parents):
+        if (candidate / ".hydra").is_dir():
+            return candidate
+    if checkpoint_dir.parent.name == "checkpoints":
+        return checkpoint_dir.parent.parent
+    return None
+
+
+def load_resume_snapshot_config(resume_path: str | Path) -> tuple[DictConfig, Path]:
+    """读取 checkpoint 中 Logger 保存的完整 Hydra 配置。"""
+    checkpoint_dir = get_resume_checkpoint_dir(resume_path)
+    snapshot_config_path = checkpoint_dir / "pretrained_model" / "config.yaml"
+    if not checkpoint_dir.is_dir():
+        raise FileNotFoundError(f"断点续训目录不存在: {checkpoint_dir}")
+    if not snapshot_config_path.is_file():
+        raise FileNotFoundError(
+            "断点续训必须读取快照配置，但未找到: "
+            f"{snapshot_config_path}"
+        )
+
+    snapshot_cfg = OmegaConf.load(snapshot_config_path)
+    if not isinstance(snapshot_cfg, DictConfig):
+        raise TypeError(f"快照配置不是 DictConfig: {snapshot_config_path}")
+    return snapshot_cfg, snapshot_config_path
+
+
+def _copy_config_value(value):
+    """复制 OmegaConf 节点，避免把当前配置节点直接挂到合并配置中。"""
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=False)
+    return copy.deepcopy(value)
+
+
+def build_resume_config(cfg: DictConfig) -> tuple[DictConfig, Path | None]:
+    """
+    构造实际训练配置。
+
+    resume=false 时原样返回当前 Hydra 配置；resume=true 时以当前配置补齐
+    新版本缺省字段，再让快照覆盖训练语义，最后恢复运行字段白名单。
+    """
+    if not bool(OmegaConf.select(cfg, "resume", default=False)):
+        return cfg, None
+
+    resume_path = clean_optional_path(OmegaConf.select(cfg, "resume_path", default=None))
+    if resume_path is None:
+        raise ValueError("resume=true 时必须提供有效的 resume_path。")
+
+    snapshot_cfg, snapshot_config_path = load_resume_snapshot_config(resume_path)
+
+    # 当前配置放在前面，只负责给旧快照补充后来新增且快照中不存在的字段；
+    # 对于双方都存在的字段，快照配置优先。先转成普通的非struct配置，
+    # 否则从普通dual-head恢复coupled策略时，coupling_*新增键会被拒绝。
+    current_cfg_copy = OmegaConf.create(
+        OmegaConf.to_container(cfg, resolve=False)
+    )
+    snapshot_cfg_copy = OmegaConf.create(
+        OmegaConf.to_container(snapshot_cfg, resolve=False)
+    )
+    effective_cfg = OmegaConf.merge(current_cfg_copy, snapshot_cfg_copy)
+    for config_path in (
+        *RESUME_CONTROL_CONFIG_PATHS,
+        *RESUME_CURRENT_CONFIG_PATHS,
+    ):
+        current_value = OmegaConf.select(cfg, config_path, default=None)
+        OmegaConf.update(
+            effective_cfg,
+            config_path,
+            _copy_config_value(current_value),
+            merge=False,
+            force_add=True,
+        )
+
+    return effective_cfg, snapshot_config_path
+
+
+RESUME_CONFIG_GROUP_IDENTITY_PATHS = {
+    "env": (
+        "env.name",
+        "env.task",
+        "env.state_dim",
+        "env.action_dim",
+    ),
+    "policy": ("policy.name",),
+}
+
+
+def _flatten_config_leaves(value, prefix: str = "") -> dict[str, object]:
+    """把配置展开成叶子路径，用于从完整快照反查最匹配的配置组文件。"""
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=False)
+
+    if isinstance(value, dict):
+        flattened = {}
+        for key, child in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            flattened.update(_flatten_config_leaves(child, child_prefix))
+        return flattened
+    if isinstance(value, list):
+        return {prefix: value}
+    return {prefix: value}
+
+
+def _matching_snapshot_group_candidates(
+    snapshot_cfg: DictConfig,
+    group_name: str,
+) -> list[tuple[str, int]]:
+    """返回身份字段一致的配置组候选及其与快照叶子字段的匹配分数。"""
+    group_dir = ROOT_DIR / "configs" / "pretrain" / group_name
+    identity_paths = RESUME_CONFIG_GROUP_IDENTITY_PATHS[group_name]
+    snapshot_leaves = _flatten_config_leaves(snapshot_cfg)
+    candidates = []
+
+    for config_path in sorted(group_dir.glob("*.yaml")):
+        candidate_cfg = OmegaConf.load(config_path)
+        identity_matches = all(
+            OmegaConf.select(candidate_cfg, path, default=None)
+            == OmegaConf.select(snapshot_cfg, path, default=None)
+            for path in identity_paths
+        )
+        if not identity_matches:
+            continue
+
+        candidate_leaves = _flatten_config_leaves(candidate_cfg)
+        match_score = sum(
+            snapshot_leaves.get(path, object()) == value
+            for path, value in candidate_leaves.items()
+        )
+        candidates.append((config_path.stem, match_score))
+
+    return candidates
+
+
+def infer_resume_hydra_choice(
+    resume_path: str | Path,
+    snapshot_cfg: DictConfig,
+    group_name: str,
+    recorded_choice: str | None,
+) -> str | None:
+    """
+    从checkpoint内容校验或反推配置组。
+
+    `.hydra/hydra.yaml` 会在重用原输出目录时被后续启动覆盖，因此它只能
+    作为候选；checkpoint内的完整config.yaml才是最终权威来源。
+    """
+    candidates_with_scores = _matching_snapshot_group_candidates(
+        snapshot_cfg,
+        group_name,
+    )
+    candidate_names = [name for name, _ in candidates_with_scores]
+
+    # 原Hydra记录只有在身份字段仍与checkpoint一致时才可信。
+    if recorded_choice in candidate_names:
+        return recorded_choice
+    if len(candidate_names) == 1:
+        return candidate_names[0]
+    if not candidate_names:
+        return None
+
+    # 多个配置文件可能使用同一种policy.name；优先参考原实验目录名称。
+    run_dir = get_resume_run_dir(resume_path)
+    if run_dir is not None:
+        path_matches = [
+            name for name in candidate_names if run_dir.name.endswith(f"_{name}")
+        ]
+        if len(path_matches) == 1:
+            return path_matches[0]
+
+    # 最后选择与完整快照静态字段匹配数最高且没有并列的配置文件。
+    best_score = max(score for _, score in candidates_with_scores)
+    best_matches = [
+        name for name, score in candidates_with_scores if score == best_score
+    ]
+    if len(best_matches) == 1:
+        return best_matches[0]
+    return None
+
+
+def load_resume_hydra_choices(resume_path: str | Path) -> dict[str, str]:
+    """以checkpoint配置为权威来源，恢复env/policy Hydra配置组名称。"""
+    snapshot_cfg, _ = load_resume_snapshot_config(resume_path)
+    run_dir = get_resume_run_dir(resume_path)
+    recorded_choices = {}
+    if run_dir is not None:
+        hydra_config_path = run_dir / ".hydra" / "hydra.yaml"
+        if hydra_config_path.is_file():
+            hydra_cfg = OmegaConf.load(hydra_config_path)
+            for group_name in ("env", "policy"):
+                value = OmegaConf.select(
+                    hydra_cfg,
+                    f"hydra.runtime.choices.{group_name}",
+                    default=None,
+                )
+                if value is not None:
+                    recorded_choices[group_name] = str(value)
+
+    restored_choices = {}
+    for group_name in ("env", "policy"):
+        inferred_choice = infer_resume_hydra_choice(
+            resume_path,
+            snapshot_cfg,
+            group_name,
+            recorded_choices.get(group_name),
+        )
+        if inferred_choice is not None:
+            restored_choices[group_name] = inferred_choice
+    return restored_choices
+
+
+def get_cli_override_value(args: list[str] | tuple[str, ...], key: str) -> str | None:
+    """读取一个精确匹配的 Hydra 命令行覆盖值。"""
+    for arg in reversed(args):
+        if "=" not in arg:
+            continue
+        arg_key, value = arg.split("=", 1)
+        if arg_key.lstrip("+") == key:
+            return value.strip().strip("'\"")
+    return None
+
+
+def replace_cli_override(args: list[str], key: str, value: str) -> None:
+    """替换同名 Hydra 覆盖，避免默认参数与恢复参数重复。"""
+    args[:] = [
+        arg
+        for arg in args
+        if "=" not in arg or arg.split("=", 1)[0].lstrip("+") != key
+    ]
+    args.append(f"{key}={value}")
+
+
+def restore_resume_hydra_choices(
+    args: list[str],
+    user_cli_args: tuple[str, ...],
+    resume_path: str | Path,
+) -> dict[str, str]:
+    """
+    在 Hydra 组合配置前恢复原实验的 env/policy 配置组。
+
+    用户若显式请求不同配置组则拒绝严格续训，避免模型结构或环境语义被
+    悄悄改变；需要迁移到新配置时应改用 init_policy_path。
+    """
+    snapshot_choices = load_resume_hydra_choices(resume_path)
+    for group_name, snapshot_choice in snapshot_choices.items():
+        explicit_choice = get_cli_override_value(user_cli_args, group_name)
+        if explicit_choice is not None and explicit_choice != snapshot_choice:
+            raise ValueError(
+                f"严格断点续训不允许修改 {group_name} 配置组: "
+                f"快照={snapshot_choice!r}, 当前命令行={explicit_choice!r}。"
+                "如需切换策略或环境，请使用 resume=false 和 init_policy_path。"
+            )
+        replace_cli_override(args, group_name, snapshot_choice)
+    return snapshot_choices
 
 
 def load_local_lerobot_dataset(
@@ -565,6 +1060,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision('high')
+    amp_dtype = resolve_amp_dtype(cfg)
     # ==========================================
     # 🌟 1. 动态构建时间戳与挂载数据集
     # ==========================================
@@ -618,11 +1114,18 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # # 必须使用 make_dataset 以激活 ACT 依赖的 image_transforms
     # offline_dataset = make_dataset(cfg)
     # ==========================================
-    # 🌟 2. 断点续训：路径校验与防雷处理
+    # 🌟 2. 断点续训或仅权重初始化：路径校验与防雷处理
     # ==========================================
     start_step = 0
     policy_load_path = None
     training_state_file = None
+    init_policy_path = clean_optional_path(cfg.get("init_policy_path", None))
+
+    if cfg.resume and init_policy_path is not None:
+        raise ValueError(
+            "resume=true 与 init_policy_path 不能同时使用：前者恢复完整训练状态，"
+            "后者只加载模型权重并重置优化器、调度器和训练步数。"
+        )
 
     if cfg.resume:
         # 将配置获取的内容强制转为字符串并小写，防范 "none", "null", NoneType 导致崩溃
@@ -641,22 +1144,71 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 policy_load_path = chkpt_dir / "pretrained_model"
                 training_state_file = chkpt_dir / "training_state.pth"
 
+    if not cfg.resume and init_policy_path is not None:
+        init_path = Path(init_policy_path).expanduser()
+        if (init_path / "pretrained_model").is_dir():
+            init_path = init_path / "pretrained_model"
+        if not init_path.is_dir():
+            raise FileNotFoundError(f"init_policy_path不存在或不是目录: {init_path}")
+        policy_load_path = init_path
+        logging.info(
+            "🌱 从基线权重创建独立实验，不恢复optimizer/scheduler/step: "
+            f"{policy_load_path}"
+        )
+
     # ==========================================
     # 🌟 3. 初始化模型与优化器 (顺序极其重要！)
     # ==========================================
     logging.info("🧠 正在初始化 Diffusion Policy...")
     
-    # 3.1 先创建模型 (如果 cfg.resume 为 True，底层会自动从 policy_load_path 加载旧权重)
+    # 3.1 resume和init_policy_path都会加载模型权重；只有resume会在后面恢复训练状态。
     policy = make_policy(
         hydra_cfg=cfg,
-        dataset_stats=offline_dataset.stats if not cfg.resume else None, 
-        pretrained_policy_name_or_path=str(policy_load_path) if cfg.resume else None, 
+        dataset_stats=offline_dataset.stats if policy_load_path is None else None,
+        pretrained_policy_name_or_path=(
+            str(policy_load_path) if policy_load_path is not None else None
+        ),
+        allow_scid_dual_init=(
+            cfg.policy.name == "scid_dual_head_diffusion"
+            and not cfg.resume
+            and init_policy_path is not None
+        ),
     )
     policy.to(device)
 
+    if cfg.policy.name == "scid_dual_head_diffusion":
+        scid_fit = initialize_scid_transform_from_dataset(
+            policy,
+            offline_dataset,
+            resume=bool(cfg.resume),
+        )
+        if scid_fit is None:
+            logging.info("SCID变换已从checkpoint严格恢复，跳过重新拟合。")
+        else:
+            diagnostics = scid_fit.diagnostics
+            logging.info(
+                "SCID变换拟合完成: frames=%d, mean_R2=%.4f, "
+                "cross_corr=%.4f->%.4f, condition=%.3e, scale=%s",
+                diagnostics["num_frames"],
+                diagnostics["view_r2_mean"],
+                diagnostics["raw_cross_corr_norm"],
+                diagnostics["residual_cross_corr_norm"],
+                diagnostics["condition_number"],
+                [round(value, 6) for value in diagnostics["residual_scale"]],
+            )
+
     # 3.2 无论是不是 resume，都必须先根据模型初始化出全新的优化器！
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
-    grad_scaler = GradScaler(enabled=cfg.use_amp) # 用于自动计算梯度缩放因子
+    # bfloat16 拥有接近 fp32 的指数范围，训练时不需要 GradScaler；fp16 才启用。
+    grad_scaler = GradScaler(
+        enabled=resolve_grad_scaler_enabled(cfg, device, amp_dtype)
+    )
+    logging.info(
+        "AMP: enabled=%s, dtype=%s, grad_scaler=%s",
+        bool(cfg.use_amp),
+        str(amp_dtype).replace("torch.", ""),
+        grad_scaler.is_enabled(),
+    )
 
     # ==========================================
     # 🌟 4. 恢复优化器与步数状态
@@ -687,12 +1239,14 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
                     logging.info("✅ LR Scheduler (调度器) 状态已恢复")
                 else:
                     logging.warning("⚠️ 存档中未找到 lr_scheduler 状态，学习率将重置！")
-            # 4. 恢复 GradScaler (只有在使用混合精度时才需要)
-            if cfg.use_amp and "grad_scaler" in checkpoint_dict:
+            # 4. 恢复 GradScaler (只有 fp16 混合精度时才需要)
+            if grad_scaler.is_enabled() and "grad_scaler" in checkpoint_dict:
                 grad_scaler.load_state_dict(checkpoint_dict["grad_scaler"])
                 logging.info("✅ GradScaler 状态已恢复")
-            else:
+            elif grad_scaler.is_enabled():
                 logging.warning("⚠️ 存档中未找到 grad_scaler 状态，梯度缩放因子将重置！")
+            else:
+                logging.info("当前 AMP dtype 不需要 GradScaler，跳过 scaler 状态恢复。")
 
             # 5. 恢复 Step 步数
             if "step" in checkpoint_dict:
@@ -732,14 +1286,14 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         shuffle = True
         sampler = None
 
-    dataloader = DataLoader(
-        offline_dataset,
-        num_workers=cfg.training.num_workers,
-        batch_size=cfg.training.batch_size,
-        shuffle=shuffle,         # 开启全局打乱
-        sampler=sampler,                   
-        pin_memory=(device.type != "cpu"),
-        drop_last=True, # 开启丢弃最后一个不完整的批次
+    dataloader_kwargs = make_train_dataloader_kwargs(cfg, device, shuffle, sampler)
+    dataloader = DataLoader(offline_dataset, **dataloader_kwargs)
+    logging.info(
+        "DataLoader: workers=%s, persistent_workers=%s, prefetch_factor=%s, pin_memory=%s",
+        dataloader_kwargs["num_workers"],
+        dataloader_kwargs.get("persistent_workers", False),
+        dataloader_kwargs.get("prefetch_factor", "default"),
+        dataloader_kwargs["pin_memory"],
     )
     
     # 使用 Python 内置的 cycle 将其变为无限迭代器，使用 next(dl_iter) 进行取出一个batch的数据
@@ -756,16 +1310,54 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     ref_cams = [k.replace("observation.images.", "") for k in all_obs_keys if "observation.images." in k]
     if not ref_cams:
         raise ValueError(f"❌ 严重冲突：模型中未找到相机相关参数。请检查模型输入是否正确。")
-    obs_cameras = list(dict.fromkeys(ref_cams + cfg.eval.render_camera))
+    configured_render_cameras = cfg.eval.render_camera
+    if isinstance(configured_render_cameras, str):
+        configured_render_cameras = [configured_render_cameras]
+    obs_cameras = list(dict.fromkeys(ref_cams + list(configured_render_cameras)))
 
     # 读取 YAML 中的 name ("guided_vision") 和 task ("InsertCylinder-3Arms-v0")
     # 拼接出 "guided_vision/InsertCylinder-3Arms-v0"
     env_id = f"{cfg.env.name}/{cfg.env.task}" 
     
-    logging.info(f"正在通过 Gym 注册表构建环境: {env_id}")
-
-    eval_env = make_eval_env(env_id, obs_cameras, cfg.eval)
-    logging.info(f"✅ 环境加载成功！最终挂载的相机: {obs_cameras}")
+    async_eval_enabled = bool(getattr(cfg.eval, "async_enabled", False))
+    async_evaluator = None
+    eval_env = None
+    if async_eval_enabled:
+        eval_device = str(getattr(cfg.eval, "device", cfg.device))
+        if eval_device == str(cfg.device):
+            logging.warning(
+                "异步训练和评估使用同一设备%s，将竞争GPU算力；"
+                "双GPU服务器建议设置device=cuda:0、eval.device=cuda:1。",
+                eval_device,
+            )
+        async_evaluator = AsyncEvalController(
+            policy_name=cfg.policy.name,
+            env_id=env_id,
+            obs_cameras=obs_cameras,
+            eval_cfg=cfg.eval,
+            eval_device=eval_device,
+            use_amp=cfg.use_amp,
+            amp_dtype=str(getattr(cfg, "amp_dtype", "bfloat16")),
+            out_dir=out_dir,
+            max_pending=int(getattr(cfg.eval, "max_pending", 1)),
+            startup_timeout_s=float(
+                getattr(cfg.eval, "startup_timeout_s", 180.0)
+            ),
+            shutdown_timeout_s=float(
+                getattr(cfg.eval, "shutdown_timeout_s", 30.0)
+            ),
+        )
+        async_evaluator.start()
+        logging.info(
+            "训练/评估并行模式已启用: train_device=%s, eval_device=%s, cameras=%s",
+            device,
+            eval_device,
+            obs_cameras,
+        )
+    else:
+        logging.info(f"正在通过 Gym 注册表构建环境: {env_id}")
+        eval_env = make_eval_env(env_id, obs_cameras, cfg.eval)
+        logging.info(f"✅ 环境加载成功！最终挂载的相机: {obs_cameras}")
 
     # ==========================================
     # 🌟 6. DP 预训练主循环
@@ -780,6 +1372,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     policy.train()
     logging.info("🔥 开始预训练 (模仿学习阶段)...")
     
+    log_freq = int(getattr(cfg.training, "log_freq", 0))
     # 从 start_step 开始，避免覆盖之前的进度！
     for step in range(start_step, cfg.training.offline_steps):
         start_time = time.perf_counter()
@@ -792,6 +1385,10 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 # 最好加上非阻塞传输non_blocking，并确保原有的引用随着循环覆盖而消失
                 batch[key] = batch[key].to(device, non_blocking=True)
 
+        should_log = bool(log_freq and log_freq > 0 and step % log_freq == 0)
+        should_run_eval_or_checkpoint = should_checkpoint_or_eval(step, cfg)
+        collect_metrics = should_log or should_run_eval_or_checkpoint
+
         # 前向传播、Loss 计算、反向传播与 EMA 更新
         train_info = update_policy(
             policy,
@@ -801,29 +1398,178 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
             grad_scaler=grad_scaler,
             lr_scheduler=lr_scheduler,
             use_amp=cfg.use_amp, # 是否使用混合精度训练，把部分计算从 float32 改成 float16，速度快 30%~100%
+            amp_dtype=amp_dtype,
+            collect_metrics=collect_metrics,
         )
-        train_info["dataloading_s"] = dataloading_s
+        if collect_metrics:
+            train_info["dataloading_s"] = dataloading_s
+
+        if async_evaluator is not None:
+            process_async_eval_results(
+                async_evaluator,
+                logger=logger,
+                cfg=cfg,
+                manager=manager,
+                logging_step=step,
+            )
 
         # 日志记录
-        if step % cfg.training.log_freq == 0:
+        if should_log:
             log_train_info(logger, train_info, step, cfg, offline_dataset)
 
         # ==========================================
         # 评估和保存函数
         # ==========================================
-        evaluate_and_checkpoint_if_needed(
-            step=step,
-            policy=policy,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            logger=logger,
-            cfg=cfg,
-            device=device,
-            out_dir=out_dir,
-            eval_env=eval_env,        # 预训练阶段如果没有验证环境，直接传 None
-            train_loss=train_info["loss"],
-            manager=manager,
-        )
+        if should_run_eval_or_checkpoint:
+            if async_evaluator is None:
+                evaluate_and_checkpoint_if_needed(
+                    step=step,
+                    policy=policy,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    logger=logger,
+                    cfg=cfg,
+                    device=device,
+                    out_dir=out_dir,
+                    eval_env=eval_env,
+                    train_loss=train_info["loss"],
+                    manager=manager,
+                )
+            else:
+                total_steps = int(cfg.training.offline_steps)
+                is_last_step = step == total_steps - 1
+                eval_due = should_run_periodic_step(
+                    step,
+                    total_steps,
+                    int(getattr(cfg.training, "eval_freq", 0)),
+                )
+                save_due = bool(
+                    getattr(cfg.training, "save_checkpoint", False)
+                ) and should_run_periodic_step(
+                    step,
+                    total_steps,
+                    int(getattr(cfg.training, "save_freq", 10000)),
+                )
+
+                if eval_due and not async_evaluator.has_capacity:
+                    skip_if_busy = bool(
+                        getattr(cfg.eval, "skip_if_busy", True)
+                    )
+                    if is_last_step or not skip_if_busy:
+                        logging.info(
+                            "异步评估队列已满，等待空闲槽位: step=%d",
+                            step,
+                        )
+                        wait_for_async_eval_capacity(
+                            async_evaluator,
+                            logger=logger,
+                            cfg=cfg,
+                            manager=manager,
+                            logging_step=step,
+                        )
+                    else:
+                        logging.warning(
+                            "异步评估仍在运行，跳过step=%d的评估请求；训练继续。",
+                            step,
+                        )
+                        eval_due = False
+
+                base_identifier = make_checkpoint_identifier(
+                    step,
+                    total_steps,
+                    train_info["loss"],
+                )
+                checkpoint_path = None
+                if save_due:
+                    logger.save_checkpoint(
+                        step,
+                        policy,
+                        optimizer,
+                        lr_scheduler,
+                        identifier=base_identifier,
+                    )
+                    checkpoint_path = (
+                        Path(out_dir) / "checkpoints" / base_identifier
+                    )
+
+                if eval_due:
+                    cleanup_snapshot_dir = None
+                    if checkpoint_path is not None:
+                        snapshot_path = checkpoint_path / "pretrained_model"
+                        manager.protect(checkpoint_path)
+                    else:
+                        (
+                            snapshot_path,
+                            cleanup_snapshot_dir,
+                        ) = async_evaluator.save_temporary_snapshot(
+                            policy,
+                            step=step,
+                        )
+
+                    videos_dir = (
+                        Path(out_dir) / "eval" / f"videos_{base_identifier}"
+                    )
+                    submitted = async_evaluator.submit(
+                        step=step,
+                        train_loss=train_info["loss"],
+                        base_identifier=base_identifier,
+                        snapshot_path=snapshot_path,
+                        videos_dir=videos_dir,
+                        checkpoint_path=checkpoint_path,
+                        cleanup_snapshot_dir=cleanup_snapshot_dir,
+                    )
+                    if not submitted:
+                        if checkpoint_path is not None:
+                            manager.release(checkpoint_path)
+                            manager.update(
+                                step,
+                                train_info["loss"],
+                                checkpoint_path,
+                            )
+                        if cleanup_snapshot_dir is not None:
+                            shutil.rmtree(
+                                cleanup_snapshot_dir,
+                                ignore_errors=True,
+                            )
+                        logging.warning(
+                            "异步评估任务提交失败，已跳过step=%d。",
+                            step,
+                        )
+                    else:
+                        logging.info(
+                            "已提交异步评估: step=%d, snapshot=%s, pending=%d",
+                            step,
+                            snapshot_path,
+                            async_evaluator.pending_count,
+                        )
+                elif checkpoint_path is not None:
+                    # 未安排环境评估时，仍按现有指标登记并清理checkpoint。
+                    manager.update(
+                        step,
+                        train_info["loss"],
+                        checkpoint_path,
+                    )
+
+    if async_evaluator is not None:
+        if bool(getattr(cfg.eval, "wait_at_end", True)):
+            while async_evaluator.pending_count > 0:
+                completed = process_async_eval_results(
+                    async_evaluator,
+                    logger=logger,
+                    cfg=cfg,
+                    manager=manager,
+                    logging_step=int(cfg.training.offline_steps) - 1,
+                )
+                if completed == 0:
+                    time.sleep(0.1)
+            async_evaluator.close()
+        else:
+            logging.warning(
+                "eval.wait_at_end=false，将终止尚未完成的异步评估任务。"
+            )
+            async_evaluator.close(force=True)
+    elif eval_env is not None and hasattr(eval_env, "close"):
+        eval_env.close()
     logging.info("DPPO 预训练结束！")
 
 # ==========================================
@@ -831,51 +1577,96 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
 # ==========================================
 @hydra.main(version_base="1.2", config_name="pre_default", config_path="../../configs/pretrain") #配置文件存放位置
 def train_cli(cfg: DictConfig):
+    hydra_runtime = hydra.core.hydra_config.HydraConfig.get()
+    out_dir = hydra_runtime.run.dir
+    cfg, snapshot_config_path = build_resume_config(cfg)
+    if snapshot_config_path is not None:
+        # Hydra 在进入函数前保存的是“组合后、快照合并前”的配置。用实际
+        # 生效配置覆盖它，确保原运行目录和后续排查记录与真实训练一致。
+        effective_config_path = Path(out_dir) / ".hydra" / "config.yaml"
+        effective_config_path.parent.mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(cfg, effective_config_path)
+        print(
+            "🔒 [配置恢复] 已使用快照配置作为训练基线，并仅保留当前运行字段白名单:\n"
+            f"   👉 {snapshot_config_path}\n"
+            f"   👉 实际配置已记录到 {effective_config_path}\n"
+            f"   👉 env={cfg.env.name}/{cfg.env.task}, policy={cfg.policy.name}"
+        )
 
     train_dppo_pretrain(
         cfg,
-        out_dir=hydra.core.hydra_config.HydraConfig.get().run.dir,  # 获取当前训练运行的输出目录，用于保存训练输出的数据
-        job_name=hydra.core.hydra_config.HydraConfig.get().job.name, # 获取当前训练运行的作业名称，用于wandb
+        out_dir=out_dir,  # 获取当前训练运行的输出目录，用于保存训练输出的数据
+        job_name=hydra_runtime.job.name, # 获取当前训练运行的作业名称，用于wandb
     )
 
 if __name__ == "__main__":
+    # 区分用户显式命令行覆盖与下面自动注入的本地默认值。严格续训时，
+    # 用户显式指定且与快照冲突的 env/policy 会被拒绝。
+    user_cli_args = tuple(sys.argv[1:])
+
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
         "dataset_local_dir=outputs/5_hf_datasets/quest_teleop_insert_cylinder_3arms_rgb_joint",
-        "dataset_repo_id=Dc-dc/quest_teleop_insert_cylinder_3arms_rgb_joint",
-        "env=sim_insert_cylinder_3arms", # 环境，这俩定义在default文件中
-        "policy=pre_zed_diffusion", # 策略
+        "dataset_repo_id=Dc-dc/quest_teleop_SewNeedle-3Arms-v0_rgb_joint",
+        # 全新训练时使用下面的默认配置组；resume=true 时会在 Hydra 启动前
+        # 自动替换为原实验 .hydra/hydra.yaml 中记录的 env/policy。
+        "env=sim_insert_cylinder_3arms",
+        "policy=pre_zed_dual_head_diffusion",
+        # 耦合路由由policy.coupling_mode显式记录到运行配置与checkpoint中。
+        # 需要从同一基线权重分叉时，使用 resume=false init_policy_path=<checkpoint目录>。
         "resume=false",
-        "resume_path='outputs/2_pretrain/train/2026-05-19/00-57-05_InsertCylinder-3Arms-v0_pre_zed_static_wrist_diffusion/checkpoints/108000_loss=0.0111_sr=0.0_ar=-64.33'",
-        "training.batch_size=16",
-        "training.num_workers=8",
-        "wandb.enable=false",
+        "resume_path='outputs/2_pretrain/train/2026-07-21/23-22-46_InsertCylinder-3Arms-v0_pre_zed_coupled_dual_head_diffusion/checkpoints/100000_loss=0.0087_sr=53.0_ar=556.51'",
+        "training.num_workers=4",
+        "wandb.enable=true",
     ]
     
     for arg in default_args:
         arg_key = arg.split("=")[0]
-        if not any(arg_key in sys_arg for sys_arg in sys.argv):
+        if get_cli_override_value(sys.argv, arg_key) is None:
             sys.argv.append(arg)
 
     # ==========================================
     # 🌟 核心修复：在 Hydra 启动前截胡！强行修改底层输出目录
     # ==========================================
     # 使用 replace(" ", "") 过滤掉所有可能的空格干扰
-    is_resume = any(arg.lower().replace(" ", "") == "resume=true" for arg in sys.argv)
-    resume_path_arg = next((arg for arg in sys.argv if arg.startswith("resume_path=")), None)
+    is_resume = str(get_cli_override_value(sys.argv, "resume")).lower() == "true"
+    resume_path = get_cli_override_value(sys.argv, "resume_path")
 
-    if is_resume and resume_path_arg:
-        resume_path = resume_path_arg.split("=", 1)[1].strip("'\"")
-        
+    if is_resume and resume_path:
         # 只要路径有效，就强行重定向
         if resume_path.lower() not in ["none", "null", ""]:
-            ckpt_path = Path(resume_path)
-            # checkpoints/last 的上一级的上一级，就是原本的训练根目录
-            original_out_dir = str(ckpt_path.parent.parent.absolute())
+            snapshot_choices = restore_resume_hydra_choices(
+                sys.argv,
+                user_cli_args,
+                resume_path,
+            )
+            if snapshot_choices:
+                print(
+                    "🔄 [预处理] 已从原实验恢复 Hydra 配置组: "
+                    + ", ".join(
+                        f"{name}={choice}"
+                        for name, choice in snapshot_choices.items()
+                    )
+                )
+            else:
+                print(
+                    "⚠️ [预处理] 原实验未保存 Hydra 配置组名称；"
+                    "训练函数仍会从 checkpoint 的完整 config.yaml 恢复实际配置。"
+                )
+
+            original_run_dir = get_resume_run_dir(resume_path)
+            if original_run_dir is None:
+                checkpoint_dir = get_resume_checkpoint_dir(resume_path)
+                original_run_dir = checkpoint_dir.parent.parent
+            original_out_dir = str(original_run_dir.absolute())
             
             # 告诉 Hydra：不要建新文件夹了，日志、配置、视频统统给我存进这个老目录！
-            sys.argv.append(f'hydra.run.dir="{original_out_dir}"')
+            replace_cli_override(
+                sys.argv,
+                "hydra.run.dir",
+                f'"{original_out_dir}"',
+            )
             print(f"🔄 [预处理] 检测到断点续训，已强制重定向所有输出至旧目录:\n   👉 {original_out_dir}")
     
     train_cli()

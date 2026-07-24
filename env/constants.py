@@ -48,6 +48,14 @@ ROBOT_INIT_CONFIGS = {
         "right_base_pos": RIGHT_BASE_POS,
         "middle_base_pos": MIDDLE_BASE_POS,
     },
+    "sew_needle": {
+        "left_arm_pose": LEFT_ARM_POSE,
+        "right_arm_pose": RIGHT_ARM_POSE,
+        "middle_arm_pose": [0.0, 1.7, -1.4, 0.37, 0.0, 0.0],
+        "left_base_pos": LEFT_BASE_POS,
+        "right_base_pos": RIGHT_BASE_POS,
+        "middle_base_pos": MIDDLE_BASE_POS,
+    },
 }
 LEFT_JOINT_NAMES = [
     "left_waist",

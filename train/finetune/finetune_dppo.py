@@ -34,72 +34,30 @@ from lerobot.common.policies.utils import (
     get_dtype_from_parameters,
 )
 from train.finetune.critic import ImageCritic, SharedFeatureCritic
+from train.finetune.dppo_math import (
+    dppo_ddim_mean_std as shared_dppo_ddim_mean_std,
+    finalize_ppo_ratio_stats,
+    init_ppo_ratio_stats,
+    resolve_action_slice,
+    summarize_ppo_ratio,
+    update_ppo_ratio_stats,
+)
+from train.finetune.eval_selection import (
+    canonical_checkpoint_metric,
+    is_better_eval_candidate,
+    is_eval_candidate_eligible,
+    update_historical_eval_best,
+)
+from train.finetune.dppo_logging import (
+    add_wandb_parameter_tags,
+    build_dppo_eval_metrics,
+    build_dppo_train_metrics,
+)
 from train.pretrain.eval_train import custom_eval_policy, make_eval_env, TopKCheckpointManager
 from contextlib import nullcontext
 
 import torch
 from types import MethodType
-
-
-WANDB_PARAMETER_TAGS = (
-    ("device", "device"),                                      # 训练设备
-    ("n_envs", "env.n_envs"),                                 # 并行环境数
-    ("rollout", "training.rollout_steps"),                     # 每轮采集步数
-    ("batch", "training.batch_size"),                          # PPO批大小
-    ("epochs", "training.update_epochs"),                      # 每轮更新次数
-    ("grad_acc", "training.grad_accumulate"),                  # 梯度累计步数
-    ("actor_lr", "training.actor_lr"),                         # Actor学习率
-    ("critic_lr", "training.critic_lr"),                       # Critic学习率
-    ("gamma", "training.gamma"),                               # 回报折扣因子
-    ("gae", "training.gae_lambda"),                            # GAE衰减系数
-    ("clip", "training.clip_ploss_coef"),                      # PPO裁剪系数
-    ("target_kl", "training.target_kl"),                       # KL早停阈值
-    ("reward", "training.reward_source"),                      # 训练奖励来源
-    ("rollout_policy", "training.rollout_policy"),             # 数据采集策略
-    ("sample_std", "training.min_sampling_denoising_std"),     # 去噪采样噪声
-    ("logprob_std", "training.min_logprob_denoising_std"),     # 概率计算噪声
-    ("ddim_eta", "training.ddim_eta"),                         # DDIM随机强度
-    ("act_steps", "policy.n_action_steps"),                    # 动作块执行长度
-    ("denoise_steps", "policy.ft_denoising_steps"),            # 微调去噪步数
-    ("train_vision", "training.train_vision_encoder"),         # 是否训练视觉底座
-)
-
-
-def _format_wandb_tag_value(value) -> str:
-    """Format config values into compact, stable W&B tag text."""
-    if isinstance(value, bool):
-        return str(value).lower()
-    if isinstance(value, float):
-        return f"{value:g}"
-    if isinstance(value, (list, tuple)):
-        return "-".join(_format_wandb_tag_value(item) for item in value)
-    return str(value).replace(" ", "_")
-
-
-def add_wandb_parameter_tags(logger: Logger, cfg: DictConfig) -> None:
-    """Append effective DPPO config values to the active W&B run tags."""
-    wandb_module = getattr(logger, "_wandb", None)
-    wandb_run = getattr(wandb_module, "run", None)
-    if wandb_run is None:
-        return
-
-    configured_tags = OmegaConf.select(cfg, "wandb.tags", default=[])
-    if configured_tags is None:
-        configured_tags = []
-    elif isinstance(configured_tags, str):
-        configured_tags = [configured_tags]
-    else:
-        configured_tags = list(configured_tags)
-
-    parameter_tags = []
-    for tag_name, config_path in WANDB_PARAMETER_TAGS:
-        value = OmegaConf.select(cfg, config_path, default=None)
-        if value is not None:
-            parameter_tags.append(f"{tag_name}:{_format_wandb_tag_value(value)}")
-
-    wandb_run.tags = tuple(
-        dict.fromkeys([*wandb_run.tags, *map(str, configured_tags), *parameter_tags])
-    )
 
 
 class InterpolatingLogFormatter(logging.Formatter):
@@ -358,51 +316,18 @@ def _dppo_ddim_mean_std(self, sample: torch.Tensor, model_output: torch.Tensor, 
     scheduler = self.diffusion.noise_scheduler
     if scheduler.num_inference_steps is None:
         scheduler.set_timesteps(self.diffusion.num_inference_steps)
-
-    if torch.is_tensor(timesteps):
-        timesteps = timesteps.to(device=sample.device, dtype=torch.long)
-    else:
-        timesteps = torch.as_tensor(timesteps, device=sample.device, dtype=torch.long)
-
-    alphas_cumprod = scheduler.alphas_cumprod.to(device=sample.device, dtype=sample.dtype)
-    alpha_prod_t = alphas_cumprod[timesteps].view(-1, 1, 1)
-
-    step_ratio = scheduler.config.num_train_timesteps // scheduler.num_inference_steps
-    prev_timesteps = timesteps - step_ratio
-    alpha_prod_t_prev = torch.where(
-        prev_timesteps >= 0,
-        alphas_cumprod[torch.clamp(prev_timesteps, min=0)],
-        torch.ones_like(prev_timesteps, device=sample.device, dtype=sample.dtype),
-    ).view(-1, 1, 1)
-
-    sqrt_alpha_prod_t = torch.sqrt(alpha_prod_t.clamp(min=1e-12))
-    sqrt_one_minus_alpha_prod_t = torch.sqrt((1 - alpha_prod_t).clamp(min=1e-12))
-    pred_original_sample = (sample - sqrt_one_minus_alpha_prod_t * model_output) / sqrt_alpha_prod_t
-
-    denoised_clip_value = _optional_float(getattr(self.config, "denoised_clip_value", None))
-    if denoised_clip_value is not None:
-        pred_original_sample = pred_original_sample.clamp(-denoised_clip_value, denoised_clip_value)
-        model_output = (sample - sqrt_alpha_prod_t * pred_original_sample) / sqrt_one_minus_alpha_prod_t
-
-    eps_clip_value = _optional_float(getattr(self.config, "eps_clip_value", None))
-    if eps_clip_value is not None:
-        model_output = model_output.clamp(-eps_clip_value, eps_clip_value)
-
-    eta = float(getattr(self.config, "ddim_eta", 1.0))
-    sigma = eta * torch.sqrt(
-        (
-            ((1 - alpha_prod_t_prev) / (1 - alpha_prod_t).clamp(min=1e-12))
-            * (1 - alpha_prod_t / alpha_prod_t_prev.clamp(min=1e-12))
-        ).clamp(min=0)
+    return shared_dppo_ddim_mean_std(
+        sample,
+        model_output,
+        timesteps,
+        scheduler,
+        eta=float(getattr(self.config, "ddim_eta", 1.0)),
+        min_std=float(getattr(self.config, std_attr, 0.04)),
+        denoised_clip_value=_optional_float(
+            getattr(self.config, "denoised_clip_value", None)
+        ),
+        eps_clip_value=_optional_float(getattr(self.config, "eps_clip_value", None)),
     )
-    sigma = sigma.clamp(min=1e-10)
-
-    dir_xt_coef = torch.sqrt((1 - alpha_prod_t_prev - sigma ** 2).clamp(min=0))
-    mu = torch.sqrt(alpha_prod_t_prev.clamp(min=0)) * pred_original_sample + dir_xt_coef * model_output
-
-    min_std = float(getattr(self.config, std_attr, 0.04))
-    std = torch.clamp(sigma, min=min_std)
-    return mu, std
 
 
 @torch.no_grad()
@@ -558,6 +483,23 @@ def forward_dppo_from_global_cond(self, global_cond: torch.Tensor, return_chain=
     }
 
 
+@torch.no_grad()
+def generate_actions_with_original_slice(self, batch: dict) -> torch.Tensor:
+    """让select_action按原版规则从最后一帧历史观测对应的动作开始执行。"""
+    batch_size, n_obs_steps = batch["observation.state"].shape[:2]
+    if n_obs_steps != self.config.n_obs_steps:
+        raise ValueError(
+            f"观测历史长度不一致: 输入={n_obs_steps}, 配置={self.config.n_obs_steps}"
+        )
+    global_cond = self._prepare_global_conditioning(batch)
+    actions = self.conditional_sample(batch_size, global_cond=global_cond)
+    action_start, action_end = resolve_action_slice(
+        self.config,
+        horizon=actions.shape[1],
+    )
+    return actions[:, action_start:action_end]
+
+
 # ==========================================
 # 🌟  定义 PPO 概率计算函数
 # ==========================================
@@ -588,10 +530,10 @@ def get_logprobs(self, cond: dict, x_t: torch.Tensor, x_t_1: torch.Tensor, times
     # ==========================================
     # 🌟 官方对齐 1：Action Chunking 真实执行步数截断
     # ==========================================
-    act_steps = getattr(self.config, "n_action_steps", 8)
-    n_obs_steps = getattr(self.config, "n_obs_steps", 2)
-    action_start = n_obs_steps - 1
-    action_end = action_start + act_steps
+    action_start, action_end = resolve_action_slice(
+        self.config,
+        horizon=log_prob.shape[1],
+    )
 
     log_prob = log_prob[:, action_start:action_end, :]
 
@@ -632,10 +574,10 @@ def get_logprobs_from_global_cond(
     var = std ** 2
     log_prob = -0.5 * ((x_t_1 - mu) ** 2) / var - torch.log(std) - 0.5 * math.log(2 * math.pi)
 
-    act_steps = getattr(self.config, "n_action_steps", 8)
-    n_obs_steps = getattr(self.config, "n_obs_steps", 2)
-    action_start = n_obs_steps - 1
-    action_end = action_start + act_steps
+    action_start, action_end = resolve_action_slice(
+        self.config,
+        horizon=log_prob.shape[1],
+    )
     log_prob = log_prob[:, action_start:action_end, :]
 
     log_prob = torch.clamp(log_prob, min=-5.0, max=2.0)
@@ -767,6 +709,10 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         actor.forward_dppo_from_global_cond = MethodType(forward_dppo_from_global_cond, actor)
         actor.get_logprobs = MethodType(get_logprobs, actor) # 将get_logprobs绑定到实例中
         actor.get_logprobs_from_global_cond = MethodType(get_logprobs_from_global_cond, actor)
+        actor.diffusion.generate_actions = MethodType(
+            generate_actions_with_original_slice,
+            actor.diffusion,
+        )
         logging.info("成功加载 Actor (DiffusionPolicy) 并挂载 DPPO 专用接口！")
         for module in actor.modules():
             if "RgbEncoder" in module.__class__.__name__:
@@ -896,7 +842,9 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # 初始化 Top-K 快照管理器 (比如最多保留表现最好的 3 个模型)
     max_checkpoints = getattr(cfg.eval, "max_checkpoints", 5)
     records_resume = getattr(cfg.eval, "records_resume", True)
-    checkpoint_metric = getattr(cfg.eval, "checkpoint_metric", "loss")
+    checkpoint_metric = canonical_checkpoint_metric(
+        getattr(cfg.eval, "checkpoint_metric", "loss")
+    )
     manager = TopKCheckpointManager(out_dir=out_dir,
                                     max_keep=max_checkpoints,
                                     records_resume=records_resume,
@@ -985,9 +933,16 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         actor.reset()
         actor_optimizer.state.clear()
 
-    best_actor_state = snapshot_actor_state()
+    # 历史最高评估值只用于统计，必须分别保持单调不降。
     best_eval_reward = float("-inf")
     best_eval_success_rate = 0.0
+
+    # 回滚快照及其评估指标独立维护，并按 checkpoint_metric 选择。
+    best_actor_state = snapshot_actor_state()
+    best_actor_loss = float("inf")
+    best_actor_reward = float("-inf")
+    best_actor_success_rate = float("-inf")
+    best_actor_has_eval = False
     eval_collapse_count = 0
 
     # 在下方新增学习率热身调度器 (Warmup)
@@ -1005,12 +960,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     act_steps = getattr(cfg.policy, "n_action_steps", 8)
     denoising_steps = getattr(cfg.policy, "ft_denoising_steps", 10)
     n_obs_steps = getattr(actor.config, "n_obs_steps", 2)
-    action_start = n_obs_steps - 1
-    action_end = action_start + act_steps
-    if action_end > horizon_steps:
-        raise ValueError(
-            f"动作切片越界: n_obs_steps={n_obs_steps}, act_steps={act_steps}, horizon={horizon_steps}"
-        )
+    action_start, action_end = resolve_action_slice(actor.config, horizon=horizon_steps)
     critic_warmup_iters = getattr(cfg.training, "n_critic_warmup_itr", 5) # critic网络先默认热身 5 轮
     reward_scale_running = bool(getattr(cfg.training, "reward_scale_running", True))
     reward_scale_const = float(getattr(cfg.training, "reward_scale_const", 1.0))
@@ -1375,8 +1325,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 output_venv = samples["actions"].cpu().numpy()  # shape: [n_envs, horizon, action_dim]
                 chains_venv = samples["chains"].cpu().numpy()   # shape: [n_envs, denoising_steps+1, horizon, action_dim]
 
-            # 截取实际执行的动作长度 (Action Chunking)，与 LeRobot select_action 完全一致：
-            # horizon 是从第一帧历史观测开始计数，当前观测对应 n_obs_steps - 1。
+            # 原版Diffusion Policy从最后一帧历史观测对应的动作开始执行。
             # [B, act_steps, action_dim]
             action_venv = output_venv[:, action_start:action_end]
 
@@ -1725,9 +1674,16 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         post_probe_neg_delta = float("nan")
         post_probe_sign_agreement = float("nan")
         post_probe_mean_delta = float("nan")
+        post_probe_ratio_summary = finalize_ppo_ratio_stats(
+            init_ppo_ratio_stats(denoising_steps)
+        )
+        post_probe_ratio_summary.update(
+            {"p05": float("nan"), "p50": float("nan"), "p95": float("nan")}
+        )
         probe_inds = None
         probe_logprobs_before = None
         probe_advantages = None
+        probe_denoising_indices = None
         probe_size = int(getattr(cfg.training, "post_update_probe_size", 256))
         if actor_update_this_itr and probe_size > 0:
             post_probe_n = min(probe_size, total_steps)
@@ -1739,6 +1695,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             probe_discount = gamma_denoising ** (denoising_steps - probe_denoising_inds - 1)
             probe_advantages = normalize_clip_minibatch_advantage(advantages_k[probe_batch_inds]) * probe_discount
             probe_advantages = probe_advantages.detach().clone()
+            probe_denoising_indices = probe_denoising_inds.detach().clone()
             probe_logprobs_before = old_logprobs_k[probe_inds].detach().clone()
             logging.info(f"🧪 已固定 Post-update probe 样本: {post_probe_n}")
 
@@ -1775,6 +1732,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         running_kl = []
         running_bc_loss = []
         logprob_adv_stats = init_logprob_advantage_stats()
+        ppo_ratio_stats = init_ppo_ratio_stats(denoising_steps)
 
         # 2. 开始 Epoch 循环，PPO的数据集可以训练多轮，数据利用率高
         # PPO 的 old/new logprob 必须使用同一种观测预处理模式。
@@ -1895,6 +1853,13 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                     else:
                         clip_coef_b = torch.full_like(denoising_t, clip_ploss_coef)
 
+                    update_ppo_ratio_stats(
+                        ppo_ratio_stats,
+                        ratio,
+                        clip_coef_b,
+                        advantages_b,
+                        denoising_inds_b,
+                    )
                     surr1 = ratio * advantages_b
                     surr2 = torch.clamp(ratio, 1.0 - clip_coef_b, 1.0 + clip_coef_b) * advantages_b
                     pg_loss = -torch.min(surr1, surr2).mean()
@@ -2045,7 +2010,42 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 finalize_logprob_advantage_stats(probe_stats)
             )
             post_probe_mean_delta = float(probe_delta.mean().item())
-            del probe_logprobs_after, probe_delta, probe_stats
+            # ratio 诊断必须复用 PPO loss 的 logprob 限幅口径，并按 probe 对应的
+            # 去噪步生成逐样本 clip 系数，才能正确判断动态 clip 是否真正介入。
+            probe_loss_log_ratio = (
+                torch.clamp(probe_logprobs_after, min=-5.0, max=2.0)
+                - torch.clamp(probe_logprobs_before, min=-5.0, max=2.0)
+            )
+            probe_ratio = torch.exp(probe_loss_log_ratio)
+            probe_denoising_t = probe_denoising_indices.float()
+            if denoising_steps > 1:
+                probe_denoising_t = probe_denoising_t / float(denoising_steps - 1)
+                probe_clip_coef = clip_ploss_coef_base + (
+                    clip_ploss_coef - clip_ploss_coef_base
+                ) * (torch.exp(clip_ploss_coef_rate * probe_denoising_t) - 1.0) / (
+                    math.exp(clip_ploss_coef_rate) - 1.0
+                )
+            else:
+                probe_clip_coef = torch.full_like(
+                    probe_denoising_t,
+                    clip_ploss_coef,
+                )
+            post_probe_ratio_summary = summarize_ppo_ratio(
+                probe_ratio,
+                probe_clip_coef,
+                probe_advantages,
+                probe_denoising_indices,
+                denoising_steps,
+            )
+            del (
+                probe_logprobs_after,
+                probe_delta,
+                probe_stats,
+                probe_loss_log_ratio,
+                probe_ratio,
+                probe_denoising_t,
+                probe_clip_coef,
+            )
         # 跑完一整轮环境交互 (Iteration)，让学习率步进一次
         if update_actor and itr >= critic_warmup_iters:
             actor_scheduler.step()
@@ -2062,7 +2062,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             # 🌟 终极修复：把本轮所有的巨型 Buffer 全部粉碎！释放物理内存与文件读写锁！
             del chains_flat, obs_flat, chains_trajs, obs_trajs, global_cond_flat, returns_k, advantages_k, old_logprobs_k
             if probe_inds is not None:
-                del probe_inds, probe_logprobs_before, probe_advantages
+                del probe_inds, probe_logprobs_before, probe_advantages, probe_denoising_indices
             if teacher_chains_flat is not None:
                 del teacher_chains_flat
             import gc
@@ -2089,39 +2089,42 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         logprob_adv_corr, pos_adv_logratio, neg_adv_logratio, adv_sign_agreement = (
             finalize_logprob_advantage_stats(logprob_adv_stats)
         )
+        ppo_ratio_summary = finalize_ppo_ratio_stats(ppo_ratio_stats)
 
-        #上传到wandb的数据字典
+        # 指标字段由独立模块统一维护；训练循环只决定数据和上传时机。
+        # 下列参数是构造函数的必填输入，不能直接注释；若不想上传某项，
+        # 应在 dppo_logging.py 的 metrics 字典中注释对应的 W&B 字段。
+        train_log_metrics = build_dppo_train_metrics(
+            completed_episode_count=completed_episode_count,                          # 本轮完成的 episode 数量
+            rollout_success_rate=success_rate,                                        # 本轮 rollout 成功率
+            rollout_average_return=avg_ep_return,                                     # 本轮平均回报
+            rollout_action_chunks=n_steps * n_envs,                                   # 本轮采集的动作块数量
+            rollout_env_steps=n_steps * act_steps * n_envs,                           # 本轮执行的环境步数量
+            critic_loss=avg_v_loss,                                                   # Critic 平均损失
+            actor_loss=avg_pg_loss,                                                   # Actor 平均策略损失
+            bc_loss=avg_bc_loss,                                                      # 行为克隆正则损失
+            avg_kl=avg_kl,                                                            # PPO 平均 KL 散度
+            max_kl=max_kl,                                                            # PPO 最大 KL 散度
+            ratio_summary=ppo_ratio_summary,                                          # 训练期 ratio 汇总结果
+            critic_explained_variance=critic_explained_variance,                      # Critic 解释方差
+            critic_value_return_correlation=critic_value_return_corr,                 # Value 与 Return 相关性
+            logprob_advantage_correlation=logprob_adv_corr,                           # logprob 变化与优势相关性
+            positive_advantage_mean_logprob_delta=pos_adv_logratio,                   # 正优势平均 logprob 变化
+            negative_advantage_mean_logprob_delta=neg_adv_logratio,                   # 负优势平均 logprob 变化
+            logprob_advantage_sign_agreement=adv_sign_agreement,                      # logprob 变化与优势符号一致率
+            post_probe_size=post_probe_n,                                             # 更新后固定 probe 样本数
+            post_probe_logprob_delta_mean=post_probe_mean_delta,                      # probe 平均 logprob 变化
+            post_probe_logprob_advantage_correlation=post_probe_corr,                 # probe 变化与优势相关性
+            post_probe_positive_advantage_mean_logprob_delta=post_probe_pos_delta,    # probe 正优势平均变化
+            post_probe_negative_advantage_mean_logprob_delta=post_probe_neg_delta,    # probe 负优势平均变化
+            post_probe_logprob_advantage_sign_agreement=post_probe_sign_agreement,    # probe 符号一致率
+            post_probe_ratio_summary=post_probe_ratio_summary,                        # 更新后 probe ratio 汇总结果
+            actor_update_enabled=actor_update_this_itr,                               # 本轮是否更新 Actor
+            early_stop=early_stop,                                                    # 本轮是否触发 KL 早停
+            denoising_steps=denoising_steps,                                          # 微调使用的去噪步数量
+        )
         logger.log_dict(
-            {
-                "rollout_completed_episodes": int(completed_episode_count),  # 本轮完成的回合数
-                "rollout_success_rate": success_rate,  # 本轮采集成功率
-                "rollout_average_return": avg_ep_return,  # 本轮平均回合总奖励
-                # "rollout_max_return": max_ep_return,  # 本轮最高回合奖励
-                "rollout_action_chunks": int(n_steps * n_envs),  # 本轮采集的动作块总数
-                "rollout_env_steps": int(n_steps * act_steps * n_envs),  # 本轮执行的环境步总数
-                "loss_critic": avg_v_loss,  # Critic平均价值损失
-                "loss_actor": avg_pg_loss,  # Actor平均策略损失
-                "loss_bc": avg_bc_loss,  # 行为克隆正则损失
-                "ppo_avg_kl": avg_kl,  # PPO更新的平均KL散度
-                "ppo_max_kl": max_kl,  # PPO更新的最大KL散度
-                # "ppo_clip_ploss_coef": float(clip_ploss_coef),  # 当前策略损失裁剪系数
-                # "ppo_clip_ploss_coef_base": float(clip_ploss_coef_base),  # 基础策略损失裁剪系数
-                # "ppo_clip_ploss_coef_rate": float(clip_ploss_coef_rate),  # 裁剪系数调度比例
-                "critic_explained_variance": float(critic_explained_variance),  # Critic解释方差
-                "critic_value_return_correlation": float(critic_value_return_corr),  # Value与Return相关性
-                "logprob_advantage_correlation": float(logprob_adv_corr),  # 概率变化与优势的相关性
-                "positive_advantage_mean_logprob_delta": float(pos_adv_logratio),  # 正优势样本平均概率变化
-                "negative_advantage_mean_logprob_delta": float(neg_adv_logratio),  # 负优势样本平均概率变化
-                "logprob_advantage_sign_agreement": float(adv_sign_agreement),  # 概率变化与优势符号一致率
-                "post_update_probe_size": int(post_probe_n),  # 更新后诊断样本数
-                "post_update_probe_logprob_delta_mean": float(post_probe_mean_delta),  # 更新后平均概率变化
-                "post_update_probe_logprob_advantage_correlation": float(post_probe_corr),  # 更新后概率变化与优势相关性
-                "post_update_probe_positive_advantage_mean_logprob_delta": float(post_probe_pos_delta),  # 更新后正优势概率变化
-                "post_update_probe_negative_advantage_mean_logprob_delta": float(post_probe_neg_delta),  # 更新后负优势概率变化
-                "post_update_probe_logprob_advantage_sign_agreement": float(post_probe_sign_agreement),  # 更新后符号一致率
-                "actor_update_enabled": int(actor_update_this_itr),  # 本轮是否更新Actor
-                "early_stop": int(early_stop),  # 本轮是否触发KL提前停止
-            },
+            train_log_metrics,
             step=itr + 1,
             mode="train",   #放到训练模块
         )
@@ -2136,6 +2139,13 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             logging.info(f"     Critic (Value) Loss: {avg_v_loss:.4f}")
             logging.info(f"     Actor (Policy) Loss: {avg_pg_loss:.4f}")
             logging.info(f"     PPO KL: avg={avg_kl:.3e}, max={max_kl:.3e}, BC_NLL={avg_bc_loss:.5f}")
+            logging.info(
+                f"     PPO ratio: mean={ppo_ratio_summary['mean']:.6f}, "
+                f"std={ppo_ratio_summary['std']:.3e}, "
+                f"range=[{ppo_ratio_summary['min']:.6f}, {ppo_ratio_summary['max']:.6f}], "
+                f"outside_clip={ppo_ratio_summary['outside_clip_fraction'] * 100:.1f}%, "
+                f"objective_clipped={ppo_ratio_summary['objective_clip_fraction'] * 100:.1f}%"
+            )
             logging.info(
                 f"     Critic诊断: EV={critic_explained_variance:.4f}, "
                 f"Value/Return Corr={critic_value_return_corr:.4f}"
@@ -2153,6 +2163,16 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 f"Adv>0均值Δlogp={post_probe_pos_delta:.3e}, "
                 f"Adv<0均值Δlogp={post_probe_neg_delta:.3e}, "
                 f"符号一致率={post_probe_sign_agreement * 100:.1f}%"
+            )
+            logging.info(
+                f"     Post-update Probe ratio: "
+                f"mean={post_probe_ratio_summary['mean']:.6f}, "
+                f"std={post_probe_ratio_summary['std']:.3e}, "
+                f"p05/p50/p95={post_probe_ratio_summary['p05']:.6f}/"
+                f"{post_probe_ratio_summary['p50']:.6f}/"
+                f"{post_probe_ratio_summary['p95']:.6f}, "
+                f"outside_clip={post_probe_ratio_summary['outside_clip_fraction'] * 100:.1f}%, "
+                f"objective_clipped={post_probe_ratio_summary['objective_clip_fraction'] * 100:.1f}%"
             )
         else:
             logging.info(f"⚠️ 第 {itr+1} 轮结束，但没有环境跑完一个完整回合 (考虑增加 rollout_steps)")
@@ -2185,55 +2205,118 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                     )
 
             # 3. 提取测试成绩
-            sr = eval_info["aggregated"]["success_rate"]
-            ar = eval_info["aggregated"]["average_reward"]
+            sr = float(eval_info["aggregated"]["success_rate"])
+            ar = float(eval_info["aggregated"]["average_reward"])
             logging.info(f"  评估完成! 成功率: {sr*100:.1f}%, 平均奖励: {ar:.2f}")
+
+            # 历史最高成功率和最高奖励相互独立，先更新再写日志，保证曲线单调不降。
+            best_eval_success_rate, best_eval_reward = update_historical_eval_best(
+                best_success_rate=best_eval_success_rate,
+                best_average_reward=best_eval_reward,
+                success_rate=sr,
+                average_reward=ar,
+            )
+
+            rollback_enabled = bool(
+                getattr(cfg.training, "rollback_on_eval_collapse", True)
+            )
+            rollback_sr = float(getattr(cfg.training, "rollback_success_rate", 0.1))
+            rollback_reward = float(getattr(cfg.training, "rollback_reward", -100.0))
+            rollback_patience = int(getattr(cfg.training, "rollback_patience", 1))
+            if rollback_patience < 1:
+                raise ValueError(
+                    f"training.rollback_patience 必须大于等于 1，当前为 {rollback_patience}"
+                )
+
+            # 塌陷候选不能覆盖健康的回滚快照；禁用回滚时不阻止正常的最佳模型选择。
+            eval_collapsed = sr <= rollback_sr and ar <= rollback_reward
+            candidate_eligible = is_eval_candidate_eligible(
+                rollback_enabled=rollback_enabled,
+                eval_collapsed=eval_collapsed,
+            )
+            collapse_blocks_candidate = not candidate_eligible
+            new_best_actor = False
+            rollback_triggered = False
+
+            if collapse_blocks_candidate:
+                eval_collapse_count += 1
+                logging.warning(
+                    f"  评估已塌陷(success={sr * 100:.1f}%, reward={ar:.2f})，"
+                    f"计数 {eval_collapse_count}/{rollback_patience}。"
+                )
+                if eval_collapse_count >= rollback_patience:
+                    restore_actor_state(best_actor_state)
+                    eval_collapse_count = 0
+                    rollback_triggered = True
+                    if best_actor_has_eval:
+                        logging.warning(
+                            f"  已回滚到内存最佳Actor(metric={checkpoint_metric}, "
+                            f"success={best_actor_success_rate * 100:.1f}%, "
+                            f"reward={best_actor_reward:.2f}, loss={best_actor_loss:.4f})，"
+                            "并清空Actor optimizer状态。"
+                        )
+                    else:
+                        logging.warning(
+                            "  已回滚到训练开始时的初始Actor；当前尚无通过塌陷检查的"
+                            "评估基线，并已清空Actor optimizer状态。"
+                        )
+            else:
+                eval_collapse_count = 0
+                if is_better_eval_candidate(
+                    metric=checkpoint_metric,
+                    candidate_loss=avg_pg_loss,
+                    candidate_reward=ar,
+                    candidate_success_rate=sr,
+                    best_loss=best_actor_loss,
+                    best_reward=best_actor_reward,
+                    best_success_rate=best_actor_success_rate,
+                ):
+                    best_actor_loss = float(avg_pg_loss)
+                    best_actor_reward = ar
+                    best_actor_success_rate = sr
+                    best_actor_state = snapshot_actor_state()
+                    best_actor_has_eval = True
+                    new_best_actor = True
+                    logging.info(
+                        f"刷新内存最佳Actor(metric={checkpoint_metric}, "
+                        f"success={best_actor_success_rate * 100:.1f}%, "
+                        f"reward={best_actor_reward:.2f}, loss={best_actor_loss:.4f})"
+                    )
+
+            eval_log = build_dppo_eval_metrics(
+                success_rate=sr,
+                average_reward=ar,
+                best_success_rate=best_eval_success_rate,
+                best_average_reward=best_eval_reward,
+                new_best_actor=new_best_actor,
+                eval_collapsed=eval_collapsed,
+                candidate_eligible=candidate_eligible,
+                rollback_triggered=rollback_triggered,
+                rollback_best_success_rate=(
+                    best_actor_success_rate if best_actor_has_eval else None
+                ),
+                rollback_best_average_reward=(
+                    best_actor_reward if best_actor_has_eval else None
+                ),
+                rollback_best_policy_loss=(
+                    best_actor_loss if best_actor_has_eval else None
+                ),
+            )
             logger.log_dict(
-                {
-                    "success_rate": float(sr),  # 当前评估成功率
-                    "average_reward": float(ar),  # 当前评估平均奖励
-                    "best_success_rate": float(max(best_eval_success_rate, sr)),  # 历史最佳成功率
-                    "best_average_reward": float(max(best_eval_reward, ar)),  # 历史最佳平均奖励
-                },
+                eval_log,
                 step=itr + 1,
                 mode="eval",
             )
 
-            if ar > best_eval_reward:
-                best_eval_reward = ar
-                best_eval_success_rate = sr
-                best_actor_state = snapshot_actor_state()
-                eval_collapse_count = 0
-                logging.info(
-                    f"  刷新内存最佳Actor: success={best_eval_success_rate * 100:.1f}%, "
-                    f"reward={best_eval_reward:.2f}"
-                )
-            else:
-                rollback_enabled = getattr(cfg.training, "rollback_on_eval_collapse", True)
-                rollback_sr = getattr(cfg.training, "rollback_success_rate", 0.1)
-                rollback_reward = getattr(cfg.training, "rollback_reward", -100.0)
-                rollback_patience = getattr(cfg.training, "rollback_patience", 1)
-                # 评估塌陷判定：成功率和奖励同时低于设定阈值，才算真正的塌陷，触发计数
-                eval_collapsed = sr <= rollback_sr and ar <= rollback_reward
-                if rollback_enabled and eval_collapsed:
-                    eval_collapse_count += 1
+            if not candidate_eligible:
+                if tmp_videos_dir.exists():
+                    import shutil
+                    shutil.rmtree(tmp_videos_dir, ignore_errors=True)
+                if not rollback_triggered:
                     logging.warning(
-                        f"  评估已塌陷(success={sr * 100:.1f}%, reward={ar:.2f})，"
-                        f"计数 {eval_collapse_count}/{rollback_patience}。"
+                        "  当前塌陷 Actor 不进入 checkpoint/Top-K，继续等待后续评估或回滚。"
                     )
-                    if eval_collapse_count >= rollback_patience:
-                        restore_actor_state(best_actor_state)
-                        eval_collapse_count = 0
-                        logging.warning(
-                            f"  已回滚到内存最佳Actor(success={best_eval_success_rate * 100:.1f}%, "
-                            f"reward={best_eval_reward:.2f})，并清空Actor optimizer状态。"
-                        )
-                        if tmp_videos_dir.exists():
-                            import shutil
-                            shutil.rmtree(tmp_videos_dir, ignore_errors=True)
-                        continue
-                else:
-                    eval_collapse_count = 0
+                continue
 
             # 4. 保存模型权重快照 (LeRobot 标准格式)
             ckpt_name = f"{itr+1:06d}_sr={sr:.2f}_reward={ar:.2f}_Ploss={avg_pg_loss:.4f}_Vloss={avg_v_loss:.4f}"
@@ -2299,6 +2382,18 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 "iteration": int(itr + 1),
                 "success_rate": float(sr),
                 "average_reward": float(ar),
+                "historical_best_success_rate": float(best_eval_success_rate),
+                "historical_best_average_reward": float(best_eval_reward),
+                "selection_metric": checkpoint_metric,
+                "selected_actor_success_rate": (
+                    float(best_actor_success_rate) if best_actor_has_eval else None
+                ),
+                "selected_actor_average_reward": (
+                    float(best_actor_reward) if best_actor_has_eval else None
+                ),
+                "selected_actor_policy_loss": (
+                    float(best_actor_loss) if best_actor_has_eval else None
+                ),
                 "avg_policy_loss": float(avg_pg_loss),
                 "avg_value_loss": float(avg_v_loss),
                 "critic_explained_variance": float(critic_explained_variance),
@@ -2355,10 +2450,10 @@ if __name__ == "__main__":
     default_args = [
         "policy=ft_zed_diffusion",
         "training.pretrained_ckpt_path='outputs/2_pretrain/train/2026-07-07/10-06-08_InsertCylinder-3Arms-v0_pre_zed_diffusion/checkpoints/186000_loss=0.0009_sr=50.0_ar=569.03'",
-        "env.n_envs=15",
-        "training.rollout_steps=150",
+        "env.n_envs=10",
+        "training.rollout_steps=700",
         "training.batch_size=16",
-        "training.update_epochs=20",
+        "training.update_epochs=10",
         "wandb.enable=true",
         "training.skip_update=false",
         "training.rollout_policy=dppo",

@@ -17,10 +17,9 @@ training:
   online_steps: 0
   eval_freq: 1000    # 评估频率
   save_freq: 1000    # 保存频率
-  log_freq: 100      # 打印频率
   save_checkpoint: true
   num_workers: 4
-  batch_size: 16
+  batch_size: 32
   lr: 2.5e-5
   lr_backbone: 1e-5
   weight_decay: 1e-6

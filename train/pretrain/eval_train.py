@@ -17,6 +17,13 @@ import time
 import gymnasium as gym
 from lerobot.common.envs.utils import preprocess_observation
 
+if __package__:
+    from .vector_info import as_bool_array as _as_bool_array
+    from .vector_info import extract_info_bool as _extract_info_bool
+else:
+    from vector_info import as_bool_array as _as_bool_array
+    from vector_info import extract_info_bool as _extract_info_bool
+
 # ==========================================
 # 🌟 [新增] 自定义 Top-K 快照管理器(包含视频同步清理)
 # ==========================================
@@ -35,6 +42,9 @@ class TopKCheckpointManager:
         self.metric = str(metric).lower()  # 记录筛选指标：'loss'、'reward' 或 'success'
         self.top_k = []       # 数据结构: [{"step": int, "loss": float, "reward": float, "success_rate": float, "path": Path}]
         self.latest_path = None
+        self.latest_step = -1
+        # 异步评估尚未完成的checkpoint不能被后续Top-K清理提前删除。
+        self._protected_paths: set[Path] = set()
         self.records_file = self.checkpoints_dir / "top_k_records.json"
         self.records_resume = records_resume
         # 支持断点续训：每次实例化时从本地读取记录，保证跨 step 调用时不丢失历史信息
@@ -43,6 +53,12 @@ class TopKCheckpointManager:
                 with open(self.records_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.latest_path = Path(data.get("latest")) if data.get("latest") else None
+                    self.latest_step = int(
+                        data.get(
+                            "latest_step",
+                            self._infer_step_from_path(self.latest_path),
+                        )
+                    )
                     self.top_k = [
                         {
                             "step": item["step"],
@@ -56,6 +72,23 @@ class TopKCheckpointManager:
             except Exception as e:
                 logging.warning(f"⚠️ 无法读取 Top-K 记录，将重新开始统计: {e}")
 
+    @staticmethod
+    def _infer_step_from_path(path: Path | None) -> int:
+        if path is None:
+            return -1
+        try:
+            return int(path.name.split("_", 1)[0])
+        except (TypeError, ValueError):
+            return -1
+
+    def protect(self, ckpt_path: Path):
+        """保护等待异步评估的checkpoint，避免被较晚step的清理流程删除。"""
+        self._protected_paths.add(Path(ckpt_path).absolute())
+
+    def release(self, ckpt_path: Path):
+        """评估结束后解除checkpoint保护；下一次update会按Top-K规则清理。"""
+        self._protected_paths.discard(Path(ckpt_path).absolute())
+
     def update(
         self,
         step: int,
@@ -64,9 +97,17 @@ class TopKCheckpointManager:
         reward: float = -float("inf"),
         success_rate: float = -float("inf"),
     ):
-        self.latest_path = ckpt_path
+        # 异步结果可能在更晚的训练step之后才返回，不能让旧评估覆盖真正的latest。
+        if step >= self.latest_step:
+            self.latest_step = int(step)
+            self.latest_path = ckpt_path
         # 防重入：如果当前路径已经在记录里了，先剔除旧的
-        self.top_k = [item for item in self.top_k if item["path"].name != ckpt_path.name]
+        self.top_k = [
+            item
+            for item in self.top_k
+            if int(item["step"]) != int(step)
+            and item["path"].name != ckpt_path.name
+        ]
         # 将新的 checkpoint 加入 top-k 候选并排序
         self.top_k.append(
             {
@@ -100,6 +141,7 @@ class TopKCheckpointManager:
             valid_names = {item["path"].name for item in self.top_k}
             if self.latest_path:
                 valid_names.add(self.latest_path.name) # 最新模型必须保存
+            valid_names.update(path.name for path in self._protected_paths)
 
             for d in self.checkpoints_dir.iterdir():
                 if d.is_dir() and d.name.split('_')[0].isdigit():
@@ -130,6 +172,7 @@ class TopKCheckpointManager:
         with open(self.records_file, "w", encoding="utf-8") as f:
             json.dump({
                 "latest": str(self.latest_path) if self.latest_path else None,
+                "latest_step": self.latest_step,
                 "top_k": [
                     {
                         "step": i["step"],
@@ -142,14 +185,28 @@ class TopKCheckpointManager:
                 ]
             }, f, indent=4, ensure_ascii=False)
 
+
+def make_checkpoint_identifier(
+    step: int,
+    offline_steps: int,
+    train_loss: float | None,
+) -> str:
+    """构造不依赖尚未返回的异步评估指标的稳定checkpoint标识。"""
+    num_digits = max(6, len(str(offline_steps)))
+    step_identifier = f"{step:0{num_digits}d}"
+    if train_loss is None:
+        return step_identifier
+    return f"{step_identifier}_loss={train_loss:.4f}"
+
 def seed_runtime(seed: int):
-    """重置一次运行时 RNG；评估时每个 episode 都会调用，避免上一局步数污染下一局扩散噪声。"""
+    """重置评估进程及当前CUDA设备RNG，不触碰训练进程占用的其他GPU。"""
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
+    torch.random.default_generator.manual_seed(seed)
     if torch.cuda.is_available():
+        # 异步评估进程已通过torch.cuda.set_device选择eval.device；
+        # 这里只初始化当前GPU，避免manual_seed_all在训练GPU上建立额外上下文。
         torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
 
 def seed_env_spaces(env, seed: int):
     """Gym space 自己也可能持有 RNG，显式对齐到当前 episode seed。"""
@@ -248,20 +305,6 @@ def prepare_policy_observation(raw_obs: dict, expected_keys: set[str], device) -
     return batch
 
 
-def _as_bool_array(value, n_envs: int, default: bool = False) -> np.ndarray:
-    if value is None:
-        return np.full(n_envs, default, dtype=bool)
-    arr = np.asarray(value)
-    if arr.shape == ():
-        return np.full(n_envs, bool(arr), dtype=bool)
-    arr = arr.astype(bool).reshape(-1)
-    if arr.shape[0] < n_envs:
-        padded = np.full(n_envs, default, dtype=bool)
-        padded[: arr.shape[0]] = arr
-        return padded
-    return arr[:n_envs]
-
-
 def _as_float_array(value, n_envs: int, default: float = 0.0) -> np.ndarray:
     if value is None:
         return np.full(n_envs, default, dtype=np.float32)
@@ -274,45 +317,6 @@ def _as_float_array(value, n_envs: int, default: float = 0.0) -> np.ndarray:
         padded[: arr.shape[0]] = arr
         return padded
     return arr[:n_envs]
-
-
-def _extract_info_bool(info, key: str, n_envs: int, default: bool = False) -> np.ndarray:
-    values = np.full(n_envs, default, dtype=bool)
-    if not isinstance(info, dict):
-        return values
-
-    def merge(raw_value, raw_mask):
-        parsed = _as_bool_array(raw_value, n_envs, default=default)
-        mask = _as_bool_array(raw_mask, n_envs, default=True)
-        values[mask] = parsed[mask]
-
-    if key in info:
-        merge(info[key], info.get(f"_{key}", np.ones(n_envs, dtype=bool)))
-
-    final_infos = info.get("final_info", None)
-    if final_infos is not None:
-        final_mask = _as_bool_array(
-            info.get("_final_info", np.ones(n_envs, dtype=bool)),
-            n_envs,
-            default=True,
-        )
-
-        # Gymnasium 新版 VectorEnv 将 final_info 合并为 dict-of-arrays。
-        if isinstance(final_infos, dict):
-            if key in final_infos:
-                key_mask = _as_bool_array(
-                    final_infos.get(f"_{key}", np.ones(n_envs, dtype=bool)),
-                    n_envs,
-                    default=True,
-                )
-                merge(final_infos[key], final_mask & key_mask)
-        else:
-            # 兼容旧版 object array/list-of-dicts。
-            for idx, final_info in enumerate(list(final_infos)[:n_envs]):
-                if final_mask[idx] and isinstance(final_info, dict) and key in final_info:
-                    values[idx] = bool(final_info[key])
-
-    return values
 
 
 def _render_vector_frames(env, camera: str, n_envs: int):
@@ -676,19 +680,57 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     }
 
 
+def build_eval_log_metrics(eval_info: dict) -> dict[str, float | int]:
+    """把评估汇总和逐回合记录转换为可直接上传 W&B 的标量指标。"""
+    aggregated = eval_info.get("aggregated", {})
+    episodes = list(eval_info.get("episodes", []))
+    average_reward = float(aggregated.get("average_reward", 0.0))
+
+    episode_rewards = np.asarray(
+        [float(episode.get("reward", 0.0)) for episode in episodes],
+        dtype=np.float64,
+    )
+    episode_steps = np.asarray(
+        [int(episode.get("steps", 0)) for episode in episodes],
+        dtype=np.float64,
+    )
+    successful_episodes = sum(bool(episode.get("success", False)) for episode in episodes)
+
+    if episode_rewards.size > 0:
+        reward_std = float(episode_rewards.std())
+        minimum_reward = float(episode_rewards.min())
+        maximum_reward = float(episode_rewards.max())
+    else:
+        reward_std = 0.0
+        minimum_reward = average_reward
+        maximum_reward = average_reward
+
+    return {
+        "success_rate": float(aggregated.get("success_rate", 0.0)),
+        "success_rate_percent": float(aggregated.get("success_rate", 0.0)) * 100.0,
+        "average_reward": average_reward,
+        "reward_std": reward_std,
+        "minimum_reward": minimum_reward,
+        "maximum_reward": maximum_reward,
+        "average_episode_steps": float(episode_steps.mean()) if episode_steps.size > 0 else 0.0,
+        "successful_episodes": int(successful_episodes),
+        "num_episodes": int(len(episodes)),
+        "avg_inference_ms": float(aggregated.get("avg_inference_ms", 0.0)),
+        "max_inference_ms": float(aggregated.get("max_inference_ms", 0.0)),
+    }
+
+
 def evaluate_and_checkpoint_if_needed(
     step, policy, optimizer, lr_scheduler, logger, cfg, device, out_dir, eval_env=None, train_loss=None, manager=None
 ):
     """
     主评估与保存入口
     """
-    _num_digits = max(6, len(str(cfg.training.offline_steps))) 
-    step_identifier = f"{step:0{_num_digits}d}" 
-
-    if train_loss is not None:
-        base_identifier = f"{step_identifier}_loss={train_loss:.4f}"
-    else:
-        base_identifier = step_identifier
+    base_identifier = make_checkpoint_identifier(
+        step,
+        int(cfg.training.offline_steps),
+        train_loss,
+    )
     final_identifier = base_identifier
     temp_video_dir = None
     ar = -float("inf")
@@ -719,13 +761,17 @@ def evaluate_and_checkpoint_if_needed(
             max_infer = eval_info["aggregated"]["max_inference_ms"]
             logging.info(f"评估完毕! 成功率: {sr*100:.1f}%, 平均奖励: {ar:.2f}, 推理平均耗时: {avg_infer:.2f} ms， 推理最大耗时: {max_infer:.2f} ms")
 
+            # mode="eval" 会在 W&B 中生成 eval/* 指标，并与当前训练 step 对齐。
+            logger.log_dict(build_eval_log_metrics(eval_info), step, mode="eval")
+
             if getattr(cfg, "wandb", {}).get("enable", False) and len(eval_info["video_paths"]) > 0:
                 logger.log_video(eval_info["video_paths"][0], step, mode="eval") # 只上传第一个视频到 wandb
 
             final_identifier = f"{base_identifier}_sr={sr*100:.1f}_ar={ar:.2f}"
 
     save_freq = getattr(cfg.training, "save_freq", 10000)
-    if getattr(cfg.training, "save_checkpoint", False) and (step > 0 and step % save_freq == 0 or is_last_step):
+    should_save = (save_freq > 0 and step > 0 and step % save_freq == 0) or is_last_step
+    if getattr(cfg.training, "save_checkpoint", False) and should_save:
         # 保存模型权重
         logging.info(f"保存模型快照... Step: {step}")
         logger.save_checkpoint(step, policy, optimizer, lr_scheduler, identifier=final_identifier)

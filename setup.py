@@ -1,9 +1,17 @@
-from setuptools import setup, find_packages
+from setuptools import find_namespace_packages, find_packages, setup
+
+
+project_packages = find_packages()
+vendored_lerobot_packages = find_namespace_packages(
+    include=["lerobot", "lerobot.*"],
+)
 
 setup(
     name='AV-piper',                # 发行包名
     version='0.1.0',
-    packages=find_packages(),       # 自动扫描当前目录下所有带 __init__.py 的文件夹（如 env, agent 等）
+    # LeRobot 0.1.0 的 common 等目录使用隐式 namespace
+    # package；仅使用 find_packages() 会在构建 wheel 时漏掉这些模块。
+    packages=sorted(set(project_packages + vendored_lerobot_packages)),
     include_package_data=True,      # 允许打包非 Python 文件（如你的 XML 模型文件）
     package_data={
         'env': [
@@ -13,11 +21,7 @@ setup(
             'assets/meshes/cameras/*',
             'assets/old/*',
         ],
-    },
-    entry_points={
-        'mjlab.tasks': [
-            'av_piper=env.mjlab',
-        ],
+        'lerobot': ['LICENSE'],
     },
     description='AV-piper Local Package',
 )

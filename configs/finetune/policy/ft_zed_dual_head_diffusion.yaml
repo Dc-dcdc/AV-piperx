@@ -3,11 +3,8 @@
 # 启动时请显式覆盖training.pretrained_ckpt_path为具体checkpoint目录。
 
 seed: 1000
-dataset_repo_id: "av_piper_dppo_zed_dual_head_rollout"
 
 env:
-  name: guided_vision
-  task: InsertCylinder-3Arms-v0
   n_envs: 2
 
 training:
@@ -19,13 +16,13 @@ training:
   batch_size: 32
   update_epochs: 10
 
-  # both、arm_only、view_only。
+  # both、arm_only、view_only；只控制可训练参数，联合likelihood始终覆盖两个头。
   train_head: both
-  view_loss_coef: 1.0
+  view_loss_coef: null              # 仅保留旧命令行兼容；联合PPO中不再使用
   train_vision_encoder: false
 
   actor_lr: 5e-7
-  critic_lr: 2e-4
+  critic_lr: 5e-5
   critic_hidden_dims: [256, 256, 256]
   critic_activation: Mish
   critic_use_layernorm: false
@@ -40,7 +37,7 @@ training:
   clip_ploss_coef_base: 0.001
   clip_ploss_coef_rate: 3.0
   gamma_denoising: 0.99
-  target_kl: 0.1
+  target_kl: 1e-4
   bc_coef: 0.0
 
   reward_source: binary_success_label
@@ -50,9 +47,12 @@ training:
   clip_advantage_lower_quantile: 0.05
   clip_advantage_upper_quantile: 0.95
 
-  min_sampling_denoising_std: 0.05
-  min_logprob_denoising_std: 0.05
-  logprob_reduction: mean
+  min_sampling_denoising_std: 0.01
+  min_logprob_denoising_std: 0.01
+  ddim_eta: 0.0                     # 与原版DPPO一致，sigma同时进入DDIM均值和采样方差
+  randn_clip_value: 3.0             # 对采样高斯噪声做原版DPPO风格裁剪
+  logprob_reduction: mean           # 两头各自求mean后按14:6还原完整20维动作mean
+  ppo_ratio_mode: joint_dim_mean    # 只对联合logprob计算一次ratio和PPO clip
   use_disk_cache: true
   disk_cache_dir: "outputs/buffer/finetune_dppo_dual_head"
   grad_accumulate: 16
@@ -60,7 +60,7 @@ training:
   rollout_policy: dppo
   skip_update: false
   update_actor: true
-  ref_bc_early_stop: 4.0
+  ref_bc_early_stop: null             # bc_coef=0时关闭；启用BC后再设置联合NLL阈值
 
   min_actor_update_success_rate: 0.0
   min_actor_update_avg_return: -100.0

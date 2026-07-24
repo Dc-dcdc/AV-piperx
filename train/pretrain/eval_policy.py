@@ -34,6 +34,21 @@ from types import SimpleNamespace
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.utils.utils import get_safe_torch_device, init_logging
 
+if __package__:
+    from .coupling_ablation import (
+        apply_coupling_ablation_overrides,
+        coupling_ablation_tag,
+    )
+    from .vector_info import as_bool_array as _as_bool_array
+    from .vector_info import extract_info_bool as _extract_info_bool
+else:
+    from coupling_ablation import (
+        apply_coupling_ablation_overrides,
+        coupling_ablation_tag,
+    )
+    from vector_info import as_bool_array as _as_bool_array
+    from vector_info import extract_info_bool as _extract_info_bool
+
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 ROOT_PATH = Path(ROOT_DIR)
 if ROOT_DIR not in sys.path:
@@ -180,20 +195,6 @@ def describe_eval_env(env_id: str, eval_env) -> str:
     return f"{env_id} -> {eval_env.unwrapped.__class__.__module__}.{eval_env.unwrapped.__class__.__name__}"
 
 
-def _as_bool_array(value, n_envs: int, default: bool = False) -> np.ndarray:
-    if value is None:
-        return np.full(n_envs, default, dtype=bool)
-    arr = np.asarray(value)
-    if arr.shape == ():
-        return np.full(n_envs, bool(arr), dtype=bool)
-    arr = arr.astype(bool).reshape(-1)
-    if arr.shape[0] < n_envs:
-        padded = np.full(n_envs, default, dtype=bool)
-        padded[: arr.shape[0]] = arr
-        return padded
-    return arr[:n_envs]
-
-
 def _as_float_array(value, n_envs: int, default: float = 0.0) -> np.ndarray:
     if value is None:
         return np.full(n_envs, default, dtype=np.float32)
@@ -206,23 +207,6 @@ def _as_float_array(value, n_envs: int, default: float = 0.0) -> np.ndarray:
         padded[: arr.shape[0]] = arr
         return padded
     return arr[:n_envs]
-
-
-def _extract_info_bool(info, key: str, n_envs: int, default: bool = False) -> np.ndarray:
-    values = np.full(n_envs, default, dtype=bool)
-    if not isinstance(info, dict):
-        return values
-
-    if key in info:
-        values = _as_bool_array(info.get(key), n_envs, default=default)
-
-    final_infos = info.get("final_info", None)
-    if final_infos is not None:
-        for idx, final_info in enumerate(list(final_infos)[:n_envs]):
-            if isinstance(final_info, dict) and key in final_info:
-                values[idx] = bool(final_info[key])
-
-    return values
 
 
 def _render_vector_frames(env, camera: str, n_envs: int):
@@ -746,10 +730,14 @@ def build_batch_output_dir(eval_cfg, run_dir: Path) -> Path:
     source = getattr(eval_cfg, "checkpoint_source", "all")
     mode = getattr(eval_cfg, "mode", "fast_repro")
     precision = "amp" if getattr(eval_cfg, "use_amp", False) and mode != "strict" else "fp32"
+    ablation_tag = coupling_ablation_tag(eval_cfg)
     return (
         run_dir
         / "policy_eval"
-        / f"{source}_{mode}_{precision}_seed={eval_cfg.seed}_ep={eval_cfg.n_episodes}_steps={eval_cfg.max_steps}"
+        / (
+            f"{source}_{mode}_{precision}_seed={eval_cfg.seed}_ep={eval_cfg.n_episodes}"
+            f"_steps={eval_cfg.max_steps}{ablation_tag}"
+        )
     ).resolve()
 
 
@@ -1018,6 +1006,7 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
     eval_mode = getattr(eval_cfg, "mode", "fast_repro")
     eval_env = None
     policy = None
+    active_coupling_scales = {}
 
     try:
         # ==========================================
@@ -1054,6 +1043,15 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
 
             logging.info("  成功使用 make_policy 加载策略！底层 Normalizer 与平滑权重已自动生效。")
             policy.to(device)
+            active_coupling_scales = apply_coupling_ablation_overrides(
+                policy, eval_cfg
+            )
+            if active_coupling_scales:
+                logging.info(
+                    "耦合推理消融已生效: "
+                    f"View→Arm={active_coupling_scales['view_to_arm_coupling_scale']:g}, "
+                    f"Arm→View={active_coupling_scales['arm_to_view_coupling_scale']:g}"
+                )
         except Exception as e:
             raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
 
@@ -1118,7 +1116,11 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
         ar = eval_info["aggregated"]["average_reward"]
         avg_infer = eval_info["aggregated"]["avg_inference_ms"]
         max_infer = eval_info["aggregated"]["max_inference_ms"]
-        new_folder_name = f"eval_seed={eval_cfg.seed}_ep={eval_cfg.n_episodes}_sr={sr*100:.1f}_ar={ar:.2f}"
+        ablation_tag = coupling_ablation_tag(eval_cfg)
+        new_folder_name = (
+            f"eval_seed={eval_cfg.seed}_ep={eval_cfg.n_episodes}{ablation_tag}"
+            f"_sr={sr*100:.1f}_ar={ar:.2f}"
+        )
         new_videos_dir = Path(videos_dir) / new_folder_name
         new_videos_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1151,6 +1153,7 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
             "videos_dir": str(new_videos_dir),
             "episode_results_path": str(episode_results_path),
             "error": "",
+            **active_coupling_scales,
         }
 
         logging.info("="*50)
@@ -1197,7 +1200,12 @@ def main(eval_cfg):
     logging.info(f"初始化评估程序... 使用设备: {device}")
     logging.info(f"将评估 {len(checkpoints)} 个 checkpoint")
 
-    batch_output_dir = build_batch_output_dir(eval_cfg, run_dir) if is_batch_input else None
+    has_explicit_output_dir = bool(getattr(eval_cfg, "eval_output_dir", None))
+    batch_output_dir = (
+        build_batch_output_dir(eval_cfg, run_dir)
+        if is_batch_input or has_explicit_output_dir
+        else None
+    )
     if batch_output_dir is not None:
         batch_output_dir.mkdir(parents=True, exist_ok=True)
         logging.info(f"批量评估输出目录: {batch_output_dir}")
@@ -1279,9 +1287,9 @@ if __name__ == "__main__":
     # 🎯 核心配置区：在这里自由修改你的评估参数！
     # ==========================================
     eval_cfg = SimpleNamespace(
-        seed=100,
+        seed=1000,
         # 可以指向单个 checkpoint，也可以指向整次训练 run 目录或 run/checkpoints 目录。
-        ckpt_path="outputs/3_finetune/train/2026-07-09/22-26-00_InsertCylinder-3Arms-v0_ft_zed_diffusion/checkpoints/000120_sr=0.79_reward=716.63_Ploss=-0.0067_Vloss=0.0058",
+        ckpt_path="outputs/2_pretrain/train/2026-07-19/02-13-32_InsertCylinder-3Arms-v0_pre_zed_coupled_dual_head_diffusion/checkpoints",
         checkpoint_source="all",  # all: 读取目录下 checkpoint全部文件；   top_k/latest: 读取 checkpoints/top_k_records.json中记录的模型
         max_checkpoints=None,     # 调试时可设为 1/2，正式评估保持 None
         eval_output_dir=None,     # None 时自动保存到 run_dir/policy_eval/固定配置名，方便断点续评
@@ -1293,11 +1301,11 @@ if __name__ == "__main__":
         
         # ⚙️ 评估参数设置
         mode="fast_repro",          # fast_repro: 快速且固定 seeds；  strict: 最强可复现但更慢
-        n_episodes=100,             # 评估多少个任务                 
+        n_episodes=200,             # 评估多少个任务                 
         max_episodes_rendered=0,    # 全量评估建议 0；需要视频时再改为 1/2
         fps=25,                     # 视频帧率，和环境控制频率对齐
         max_steps=400,              # 每个任务的最大步数
-        batch_size=10,               # 并行评估环境数量；设为 1 即回到单环境评估
+        batch_size=15,               # 并行评估环境数量；设为 1 即回到单环境评估
         use_async_envs=True,        # True 使用多进程 AsyncVectorEnv，False 使用单进程 SyncVectorEnv
         device="cuda",              # 如需完全规避 CUDA 非确定算子，可临时改成 "cpu"
         deterministic=False,        # 通常不用手动改；strict 模式会自动开启
@@ -1307,6 +1315,10 @@ if __name__ == "__main__":
         render_camera=['overhead_cam'],         # 保存video的相机视角    
         # ⚡ 快速评估默认开启混合精度；严格对比指标时可改 False
         use_amp=True,
+
+        # 耦合推理消融；None沿用checkpoint，0关闭对应方向，1保持完整耦合。
+        view_to_arm_coupling_scale=None,
+        arm_to_view_coupling_scale=None,
     )
     if eval_cfg.deterministic or eval_cfg.mode == "strict" or DETERMINISTIC_EVAL:
         ensure_python_hash_seed(eval_cfg.seed)

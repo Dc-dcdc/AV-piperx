@@ -1,0 +1,14 @@
+# @package _global_
+
+dataset_repo_id: av_piper_sew_needle_3arms_online_rollout
+
+env:
+  name: guided_vision
+  task: SewNeedle-3Arms-v0
+  state_dim: 20
+  action_dim: 20
+  fps: 25
+  episode_length: 350
+
+eval:
+  max_steps: ${env.episode_length}

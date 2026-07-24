@@ -29,7 +29,6 @@ training:
   online_steps: 0
   save_freq: 2000 # 每 5000 步保存一次模型快照
   eval_freq: 2000
-  log_freq: 100
   save_checkpoint: true
   num_workers: 4   # Number of workers for the offline training dataloader.
   batch_size: 32

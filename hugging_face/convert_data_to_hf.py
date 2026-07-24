@@ -59,10 +59,12 @@ import torch
 from safetensors.torch import save_file
 
 ROOT = Path(__file__).resolve().parents[1]
-LEROBOT_ROOT = ROOT.parent / "lerobot"
-for path in (ROOT, LEROBOT_ROOT):
-    if str(path) not in sys.path:
-        sys.path.append(str(path))
+# LeRobot is vendored as ``ROOT / "lerobot"``. Put the project root first so
+# a stale editable installation of the former sibling checkout cannot win.
+root_path = str(ROOT)
+if root_path in sys.path:
+    sys.path.remove(root_path)
+sys.path.insert(0, root_path)
 
 from lerobot.common.datasets.utils import calculate_episode_data_index, flatten_dict  # noqa: E402
 from lerobot.common.datasets.video_utils import VideoFrame  # noqa: E402
@@ -825,10 +827,10 @@ if __name__ == "__main__":
     ACTION_KEY = "joint_action"
 
     # 存放原始采集数据的目录
-    RAW_DIR = "outputs/4_data_collect/quest_teleop/quest_teleop_InsertCylinder-3Arms-v0_rgb"
+    RAW_DIR = "outputs/4_data_collect/quest_teleop/quest_teleop_SewNeedle-3Arms-v0_rgb"
 
     # 本地 HF 数据集生成目录。
-    OUTPUT_DIR = "outputs/5_hf_datasets/quest_teleop_insert_cylinder_3arms_rgb_joint"
+    OUTPUT_DIR = "outputs/5_hf_datasets/quest_teleop_SewNeedle-3Arms-v0_rgb_joint"
 
     # 本地 HF数据目录 已存在时是否覆盖重建。
     OVERWRITE = True

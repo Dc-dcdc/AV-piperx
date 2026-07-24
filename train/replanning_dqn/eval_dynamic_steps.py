@@ -34,6 +34,21 @@ from types import SimpleNamespace
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.utils.utils import get_safe_torch_device, init_logging
 
+if __package__:
+    from ..pretrain.coupling_ablation import (
+        apply_coupling_ablation_overrides,
+        coupling_ablation_tag,
+    )
+    from ..pretrain.vector_info import as_bool_array as _as_bool_array
+    from ..pretrain.vector_info import extract_info_bool as _extract_info_bool
+else:
+    from coupling_ablation import (
+        apply_coupling_ablation_overrides,
+        coupling_ablation_tag,
+    )
+    from vector_info import as_bool_array as _as_bool_array
+    from vector_info import extract_info_bool as _extract_info_bool
+
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 ROOT_PATH = Path(ROOT_DIR)
 if ROOT_DIR not in sys.path:
@@ -180,20 +195,6 @@ def describe_eval_env(env_id: str, eval_env) -> str:
     return f"{env_id} -> {eval_env.unwrapped.__class__.__module__}.{eval_env.unwrapped.__class__.__name__}"
 
 
-def _as_bool_array(value, n_envs: int, default: bool = False) -> np.ndarray:
-    if value is None:
-        return np.full(n_envs, default, dtype=bool)
-    arr = np.asarray(value)
-    if arr.shape == ():
-        return np.full(n_envs, bool(arr), dtype=bool)
-    arr = arr.astype(bool).reshape(-1)
-    if arr.shape[0] < n_envs:
-        padded = np.full(n_envs, default, dtype=bool)
-        padded[: arr.shape[0]] = arr
-        return padded
-    return arr[:n_envs]
-
-
 def _as_float_array(value, n_envs: int, default: float = 0.0) -> np.ndarray:
     if value is None:
         return np.full(n_envs, default, dtype=np.float32)
@@ -206,23 +207,6 @@ def _as_float_array(value, n_envs: int, default: float = 0.0) -> np.ndarray:
         padded[: arr.shape[0]] = arr
         return padded
     return arr[:n_envs]
-
-
-def _extract_info_bool(info, key: str, n_envs: int, default: bool = False) -> np.ndarray:
-    values = np.full(n_envs, default, dtype=bool)
-    if not isinstance(info, dict):
-        return values
-
-    if key in info:
-        values = _as_bool_array(info.get(key), n_envs, default=default)
-
-    final_infos = info.get("final_info", None)
-    if final_infos is not None:
-        for idx, final_info in enumerate(list(final_infos)[:n_envs]):
-            if isinstance(final_info, dict) and key in final_info:
-                values[idx] = bool(final_info[key])
-
-    return values
 
 
 def _render_vector_frames(env, camera: str, n_envs: int):
@@ -289,6 +273,9 @@ def custom_eval_policy_vectorized(env, policy, cfg_eval, videos_dir, device):
     render_cameras = [raw_camera] if isinstance(raw_camera, str) else list(raw_camera)
     expected_keys = set(policy.config.input_shapes)
     base_seed = int(getattr(cfg_eval, "seed", 1000))
+    n_action_steps = int(
+        getattr(cfg_eval, "n_action_steps", getattr(policy.config, "n_action_steps", 1))
+    )
     global_real_inference_times = []
 
     episode_cursor = 0
@@ -400,6 +387,7 @@ def custom_eval_policy_vectorized(env, policy, cfg_eval, videos_dir, device):
                     "success": success,
                     "reward": ep_reward,
                     "steps": int(steps_taken[local_idx]),
+                    "n_action_steps": n_action_steps,
                 }
             )
 
@@ -441,6 +429,7 @@ def custom_eval_policy_vectorized(env, policy, cfg_eval, videos_dir, device):
             "average_reward": float(np.mean(rewards)),
             "avg_inference_ms": float(avg_real_time),
             "max_inference_ms": float(max_time),
+            "n_action_steps": n_action_steps,
         },
         "video_paths": saved_video_paths,
         "episodes": episode_records,
@@ -476,6 +465,9 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     expected_keys = set(policy.config.input_shapes)
     # 从配置中提取基础种子，默认为 1000
     base_seed = getattr(cfg_eval, "seed", 1000)
+    n_action_steps = int(
+        getattr(cfg_eval, "n_action_steps", getattr(policy.config, "n_action_steps", 1))
+    )
     # 计算所有评估回合推理的总耗时
     global_real_inference_times = []
     # 动作执行循环
@@ -549,6 +541,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
                 "success": bool(info.get("is_success", False)),
                 "reward": float(ep_reward),
                 "steps": int(steps_taken),
+                "n_action_steps": n_action_steps,
             }
         )
 
@@ -597,7 +590,8 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
             "success_rate": float(np.mean(successes)),
             "average_reward": float(np.mean(rewards)),
             "avg_inference_ms": float(avg_real_time),
-            "max_inference_ms": float(max_time)
+            "max_inference_ms": float(max_time),
+            "n_action_steps": n_action_steps,
         },
         "video_paths": saved_video_paths,
         "episodes": episode_records,
@@ -735,6 +729,89 @@ def discover_checkpoints(path_like, checkpoint_source: str = "all") -> tuple[lis
     return checkpoints, run_dir.resolve(), True
 
 
+def resolve_action_step_values(eval_cfg) -> list[int | None]:
+    """解析 action chunk 执行步数；None 表示沿用 checkpoint 中的 n_action_steps。"""
+
+    raw_values = getattr(eval_cfg, "action_steps", None)
+    if raw_values is None:
+        raw_single_value = getattr(eval_cfg, "n_action_steps", None)
+        raw_values = [raw_single_value]
+    elif isinstance(raw_values, (int, np.integer)):
+        raw_values = [int(raw_values)]
+    else:
+        raw_values = list(raw_values)
+
+    if not raw_values:
+        raise ValueError("action_steps 不能为空；例如设置为 [1, 2, 4, 8]。")
+
+    values = []
+    seen = set()
+    for raw_value in raw_values:
+        value = None if raw_value is None else int(raw_value)
+        if value is not None and value <= 0:
+            raise ValueError(f"action_steps 中的值必须为正整数，当前为 {value}。")
+        if value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    return values
+
+
+def action_step_label(value: int | None) -> str:
+    return "native" if value is None else str(int(value))
+
+
+def configure_policy_action_steps(policy, requested_action_steps: int | None) -> tuple[int, int]:
+    """覆盖推理 action chunk 的执行长度，并校验不超过模型预测范围。"""
+
+    config = getattr(policy, "config", None)
+    if config is None or not hasattr(config, "n_action_steps"):
+        if requested_action_steps is None:
+            return 1, 1
+        raise ValueError("当前策略配置不包含 n_action_steps，无法执行步长消融。")
+
+    checkpoint_action_steps = int(config.n_action_steps)
+    active_action_steps = (
+        checkpoint_action_steps
+        if requested_action_steps is None
+        else int(requested_action_steps)
+    )
+    if active_action_steps <= 0:
+        raise ValueError(f"n_action_steps 必须为正整数，当前为 {active_action_steps}。")
+
+    upper_bounds = []
+    horizon = getattr(config, "horizon", None)
+    if horizon is not None:
+        action_start = max(0, int(getattr(config, "n_obs_steps", 1)) - 1)
+        horizon_limit = int(horizon) - action_start
+        if getattr(config, "coupling_mode", None) in {
+            "rbac",
+            "bidirectional_prefix_to_suffix",
+        }:
+            # 这些耦合方式要求执行前缀后至少保留一个未执行的 suffix action。
+            horizon_limit -= 1
+        upper_bounds.append(("horizon", horizon_limit))
+
+    chunk_size = getattr(config, "chunk_size", None)
+    if chunk_size is not None:
+        upper_bounds.append(("chunk_size", int(chunk_size)))
+
+    if getattr(config, "temporal_ensemble_coeff", None) is not None and active_action_steps != 1:
+        raise ValueError("ACT temporal ensembling 模式只支持 n_action_steps=1。")
+
+    if upper_bounds:
+        limit_name, max_action_steps = min(upper_bounds, key=lambda item: item[1])
+        if active_action_steps > max_action_steps:
+            raise ValueError(
+                f"n_action_steps={active_action_steps} 超过模型允许上限 "
+                f"{max_action_steps}（由 {limit_name} 决定）。"
+            )
+
+    config.n_action_steps = active_action_steps
+    policy.reset()
+    return checkpoint_action_steps, active_action_steps
+
+
 def build_batch_output_dir(eval_cfg, run_dir: Path) -> Path:
     output_dir = getattr(eval_cfg, "eval_output_dir", None)
     if output_dir:
@@ -746,36 +823,56 @@ def build_batch_output_dir(eval_cfg, run_dir: Path) -> Path:
     source = getattr(eval_cfg, "checkpoint_source", "all")
     mode = getattr(eval_cfg, "mode", "fast_repro")
     precision = "amp" if getattr(eval_cfg, "use_amp", False) and mode != "strict" else "fp32"
+    ablation_tag = coupling_ablation_tag(eval_cfg)
+    action_steps_tag = "-".join(
+        action_step_label(value) for value in resolve_action_step_values(eval_cfg)
+    )
     return (
         run_dir
         / "policy_eval"
-        / f"{source}_{mode}_{precision}_seed={eval_cfg.seed}_ep={eval_cfg.n_episodes}_steps={eval_cfg.max_steps}"
+        / (
+            f"{source}_{mode}_{precision}_seed={eval_cfg.seed}_ep={eval_cfg.n_episodes}"
+            f"_steps={eval_cfg.max_steps}_action_steps={action_steps_tag}{ablation_tag}"
+        )
     ).resolve()
 
 
-def make_checkpoint_eval_cfg(eval_cfg, checkpoint_path: Path):
+def make_checkpoint_eval_cfg(
+    eval_cfg,
+    checkpoint_path: Path,
+    n_action_steps: int | None = None,
+):
     checkpoint_cfg = SimpleNamespace(**vars(eval_cfg))
     checkpoint_cfg.ckpt_path = str(checkpoint_path)
+    checkpoint_cfg.n_action_steps = n_action_steps
     if isinstance(getattr(eval_cfg, "render_camera", None), list):
         checkpoint_cfg.render_camera = list(eval_cfg.render_camera)
     return checkpoint_cfg
 
 
-def checkpoint_identity_keys(checkpoint_path: Path) -> set[str]:
+def checkpoint_identity_keys(
+    checkpoint_path: Path,
+    n_action_steps: int | None = None,
+) -> set[str]:
     checkpoint_path = checkpoint_path.resolve()
-    return {str(checkpoint_path), checkpoint_path.name}
+    suffix = f"::n_action_steps={action_step_label(n_action_steps)}"
+    return {
+        f"{checkpoint_path}{suffix}",
+        f"{checkpoint_path.name}{suffix}",
+    }
 
 
 def row_identity_keys(row: dict) -> set[str]:
     keys = set()
+    suffix = f"::n_action_steps={action_step_label(row.get('n_action_steps'))}"
     for field in ("checkpoint_key", "checkpoint_path", "checkpoint_name"):
         value = row.get(field)
         if not value:
             continue
-        keys.add(str(value))
+        keys.add(f"{value}{suffix}")
         if field == "checkpoint_path":
             try:
-                keys.add(str(resolve_eval_path(value)))
+                keys.add(f"{resolve_eval_path(value)}{suffix}")
             except Exception:
                 pass
     return keys
@@ -861,6 +958,15 @@ def write_eval_summary(summary_dir: Path, rows: list[dict], eval_cfg, source_pat
     summary_dir.mkdir(parents=True, exist_ok=True)
     rows = clean_eval_rows(rows)
     latest_rows, ok_rows, ranked_rows = ranked_eval_rows(rows)
+    action_step_results = sorted(
+        latest_rows,
+        key=lambda row: (
+            str(row.get("checkpoint_name", "")),
+            int(row.get("n_action_steps", -1))
+            if row.get("n_action_steps") is not None
+            else -1,
+        ),
+    )
 
     payload = {
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -871,10 +977,15 @@ def write_eval_summary(summary_dir: Path, rows: list[dict], eval_cfg, source_pat
         "n_episodes": eval_cfg.n_episodes,
         "eval_batch_size": int(getattr(eval_cfg, "batch_size", getattr(eval_cfg, "num_envs", 1))),
         "max_steps": eval_cfg.max_steps,
+        "action_steps": [
+            action_step_label(value)
+            for value in resolve_action_step_values(eval_cfg)
+        ],
         "total_records": len(rows),
         "latest_checkpoint_records": len(latest_rows),
         "best": ranked_rows[0] if ok_rows else None,
         "ranking": ranked_rows,
+        "action_step_results": action_step_results,
         "results": rows,
     }
     json_path = summary_dir / "policy_eval_summary.json"
@@ -888,6 +999,8 @@ def write_eval_summary(summary_dir: Path, rows: list[dict], eval_cfg, source_pat
         "checkpoint_name",
         "checkpoint_key",
         "step",
+        "n_action_steps",
+        "checkpoint_n_action_steps",
         "success_rate",
         "success_rate_percent",
         "average_reward",
@@ -911,8 +1024,35 @@ def write_eval_summary(summary_dir: Path, rows: list[dict], eval_cfg, source_pat
             csv_row["rank"] = rank if row.get("status") == "ok" else ""
             writer.writerow(csv_row)
 
+    comparison_path = summary_dir / "action_step_comparison.csv"
+    comparison_fields = [
+        "status",
+        "checkpoint_name",
+        "step",
+        "n_action_steps",
+        "checkpoint_n_action_steps",
+        "success_rate",
+        "success_rate_percent",
+        "average_reward",
+        "avg_inference_ms",
+        "max_inference_ms",
+        "n_episodes",
+        "eval_batch_size",
+        "max_steps",
+        "seed",
+        "mode",
+        "videos_dir",
+        "error",
+    ]
+    with open(comparison_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=comparison_fields)
+        writer.writeheader()
+        for row in action_step_results:
+            writer.writerow({field: row.get(field, "") for field in comparison_fields})
+
     logging.info(f"批量评估汇总 JSON 已保存: {json_path}")
     logging.info(f"批量评估汇总 CSV 已保存: {csv_path}")
+    logging.info(f"步长-成功率对比 CSV 已保存: {comparison_path}")
     return json_path, csv_path
 
 
@@ -993,6 +1133,13 @@ def prune_if_configured(
     if batch_output_dir is None:
         return None
 
+    if len(resolve_action_step_values(eval_cfg)) > 1:
+        logging.warning(
+            "当前正在进行多 action_steps 消融，自动跳过 checkpoint/评估目录清理，"
+            "避免尚未完成的步长组合被删除。"
+        )
+        return None
+
     keep_top_after_eval = getattr(eval_cfg, "keep_top_after_eval", None)
     if keep_top_after_eval is None:
         return None
@@ -1018,6 +1165,9 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
     eval_mode = getattr(eval_cfg, "mode", "fast_repro")
     eval_env = None
     policy = None
+    active_coupling_scales = {}
+    checkpoint_n_action_steps = None
+    active_n_action_steps = None
 
     try:
         # ==========================================
@@ -1054,6 +1204,24 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
 
             logging.info("  成功使用 make_policy 加载策略！底层 Normalizer 与平滑权重已自动生效。")
             policy.to(device)
+            checkpoint_n_action_steps, active_n_action_steps = configure_policy_action_steps(
+                policy,
+                getattr(eval_cfg, "n_action_steps", None),
+            )
+            eval_cfg.n_action_steps = active_n_action_steps
+            logging.info(
+                "Action chunk 执行步长: "
+                f"checkpoint={checkpoint_n_action_steps}, eval={active_n_action_steps}"
+            )
+            active_coupling_scales = apply_coupling_ablation_overrides(
+                policy, eval_cfg
+            )
+            if active_coupling_scales:
+                logging.info(
+                    "耦合推理消融已生效: "
+                    f"View→Arm={active_coupling_scales['view_to_arm_coupling_scale']:g}, "
+                    f"Arm→View={active_coupling_scales['arm_to_view_coupling_scale']:g}"
+                )
         except Exception as e:
             raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
 
@@ -1118,7 +1286,12 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
         ar = eval_info["aggregated"]["average_reward"]
         avg_infer = eval_info["aggregated"]["avg_inference_ms"]
         max_infer = eval_info["aggregated"]["max_inference_ms"]
-        new_folder_name = f"eval_seed={eval_cfg.seed}_ep={eval_cfg.n_episodes}_sr={sr*100:.1f}_ar={ar:.2f}"
+        ablation_tag = coupling_ablation_tag(eval_cfg)
+        new_folder_name = (
+            f"eval_seed={eval_cfg.seed}_ep={eval_cfg.n_episodes}"
+            f"_action_steps={active_n_action_steps}{ablation_tag}"
+            f"_sr={sr*100:.1f}_ar={ar:.2f}"
+        )
         new_videos_dir = Path(videos_dir) / new_folder_name
         new_videos_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1143,6 +1316,8 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
             "n_episodes": eval_cfg.n_episodes,
             "eval_batch_size": int(getattr(eval_env, "num_envs", 1)),
             "max_steps": eval_cfg.max_steps,
+            "n_action_steps": int(active_n_action_steps),
+            "checkpoint_n_action_steps": int(checkpoint_n_action_steps),
             "success_rate": float(sr),
             "success_rate_percent": float(sr * 100.0),
             "average_reward": float(ar),
@@ -1151,12 +1326,17 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
             "videos_dir": str(new_videos_dir),
             "episode_results_path": str(episode_results_path),
             "error": "",
+            **active_coupling_scales,
         }
 
         logging.info("="*50)
         logging.info("--独立评估完成！")
         logging.info(f"--Checkpoint: {ckpt_path.name}")
         logging.info(f"--评估模式: {eval_mode}")
+        logging.info(
+            f"--Action chunk 执行步长: {active_n_action_steps} "
+            f"(checkpoint 默认 {checkpoint_n_action_steps})"
+        )
         logging.info(f"--成功率 (Success Rate): {sr*100:.1f}%")
         logging.info(f"--平均奖励 (Average Reward): {ar:.2f}")
         logging.info(f"--平均推理时间 (Average Inference Time): {avg_infer:.2f} ms")
@@ -1194,10 +1374,28 @@ def main(eval_cfg):
         checkpoints = checkpoints[: int(max_checkpoints)]
 
     device = get_safe_torch_device(getattr(eval_cfg, "device", "cuda"))
+    action_step_values = resolve_action_step_values(eval_cfg)
+    evaluation_jobs = [
+        (checkpoint_path, n_action_steps)
+        for checkpoint_path in checkpoints
+        for n_action_steps in action_step_values
+    ]
     logging.info(f"初始化评估程序... 使用设备: {device}")
-    logging.info(f"将评估 {len(checkpoints)} 个 checkpoint")
+    logging.info(
+        f"将评估 {len(checkpoints)} 个 checkpoint × "
+        f"{len(action_step_values)} 种 action_steps，共 {len(evaluation_jobs)} 组"
+    )
+    logging.info(
+        "Action chunk 执行步长: "
+        + ", ".join(action_step_label(value) for value in action_step_values)
+    )
 
-    batch_output_dir = build_batch_output_dir(eval_cfg, run_dir) if is_batch_input else None
+    has_explicit_output_dir = bool(getattr(eval_cfg, "eval_output_dir", None))
+    batch_output_dir = (
+        build_batch_output_dir(eval_cfg, run_dir)
+        if is_batch_input or has_explicit_output_dir or len(action_step_values) > 1
+        else None
+    )
     if batch_output_dir is not None:
         batch_output_dir.mkdir(parents=True, exist_ok=True)
         logging.info(f"批量评估输出目录: {batch_output_dir}")
@@ -1206,18 +1404,38 @@ def main(eval_cfg):
     completed_keys = completed_checkpoint_keys(rows)
     if completed_keys:
         completed_rows = sum(1 for row in rows if row.get("status") == "ok")
-        logging.info(f"已发现 {completed_rows} 条成功历史结果，将跳过对应 checkpoint")
+        logging.info(f"已发现 {completed_rows} 条成功历史结果，将跳过对应 checkpoint/步长组合")
 
-    continue_on_error = bool(getattr(eval_cfg, "continue_on_error", len(checkpoints) > 1))
-    for eval_order, checkpoint_path in enumerate(tqdm(checkpoints, desc="Evaluating checkpoints"), start=1):
-        checkpoint_keys = checkpoint_identity_keys(checkpoint_path)
+    continue_on_error = bool(getattr(eval_cfg, "continue_on_error", len(evaluation_jobs) > 1))
+    for eval_order, (checkpoint_path, n_action_steps) in enumerate(
+        tqdm(evaluation_jobs, desc="Evaluating checkpoints/action_steps"),
+        start=1,
+    ):
+        checkpoint_keys = checkpoint_identity_keys(checkpoint_path, n_action_steps)
+        step_label = action_step_label(n_action_steps)
         if batch_output_dir is not None and checkpoint_keys & completed_keys:
-            logging.info(f"[{eval_order}/{len(checkpoints)}] 跳过已评估 checkpoint: {checkpoint_path.name}")
+            logging.info(
+                f"[{eval_order}/{len(evaluation_jobs)}] 跳过已评估组合: "
+                f"{checkpoint_path.name}, action_steps={step_label}"
+            )
             continue
 
-        checkpoint_cfg = make_checkpoint_eval_cfg(eval_cfg, checkpoint_path)
-        output_root = batch_output_dir / checkpoint_path.name if batch_output_dir is not None else None
-        logging.info(f"[{eval_order}/{len(checkpoints)}] 开始评估 checkpoint: {checkpoint_path.name}")
+        checkpoint_cfg = make_checkpoint_eval_cfg(
+            eval_cfg,
+            checkpoint_path,
+            n_action_steps=n_action_steps,
+        )
+        output_root = (
+            batch_output_dir
+            / checkpoint_path.name
+            / f"action_steps={step_label}"
+            if batch_output_dir is not None
+            else None
+        )
+        logging.info(
+            f"[{eval_order}/{len(evaluation_jobs)}] 开始评估: "
+            f"{checkpoint_path.name}, action_steps={step_label}"
+        )
 
         try:
             result = evaluate_one_checkpoint(
@@ -1243,13 +1461,16 @@ def main(eval_cfg):
                 "n_episodes": eval_cfg.n_episodes,
                 "eval_batch_size": int(getattr(eval_cfg, "batch_size", getattr(eval_cfg, "num_envs", 1))),
                 "max_steps": eval_cfg.max_steps,
+                "n_action_steps": n_action_steps,
                 "error": repr(exc),
             }
             rows.append(error_row)
             if batch_output_dir is not None:
                 write_eval_summary(batch_output_dir, rows, eval_cfg, source_path=resolve_eval_path(eval_cfg.ckpt_path))
                 prune_if_configured(eval_cfg, run_dir, batch_output_dir, rows, stage="单个 checkpoint 评估失败")
-            logging.exception(f"评估 checkpoint 失败: {checkpoint_path}")
+            logging.exception(
+                f"评估失败: {checkpoint_path}, action_steps={step_label}"
+            )
             if not continue_on_error:
                 raise
 
@@ -1281,22 +1502,23 @@ if __name__ == "__main__":
     eval_cfg = SimpleNamespace(
         seed=100,
         # 可以指向单个 checkpoint，也可以指向整次训练 run 目录或 run/checkpoints 目录。
-        ckpt_path="outputs/2_pretrain/train/2026-07-07/10-06-08_InsertCylinder-3Arms-v0_pre_zed_diffusion",
+        ckpt_path="outputs/2_pretrain/train/2026-07-16/20-59-53_InsertCylinder-3Arms-v0_pre_zed_dual_head_diffusion/checkpoints/162000_loss=0.0051_sr=87.0_ar=751.50",
         checkpoint_source="all",  # all: 读取目录下 checkpoint全部文件；   top_k/latest: 读取 checkpoints/top_k_records.json中记录的模型
         max_checkpoints=None,     # 调试时可设为 1/2，正式评估保持 None
         eval_output_dir=None,     # None 时自动保存到 run_dir/policy_eval/固定配置名，方便断点续评
         continue_on_error=True,   # 某个 checkpoint 失败时继续评估后面的模型
-        keep_top_after_eval=10,   # 批量评估完成后只保留 ranking 前 N 个模型；设为 None 则不清理
-        prune_checkpoints=True,   # 删除低排名的 checkpoints/模型文件夹
-        prune_eval_outputs=True,  # 删除低排名的 policy_eval/当前评估输出文件夹，summary 会保留历史结果
+        keep_top_after_eval=None, # 步长消融默认不清理模型；设置整数 N 才启用排名清理
+        prune_checkpoints=False,  # 步长实验不要删除原 checkpoint
+        prune_eval_outputs=False, # 保留每种 action_steps 的评估输出
         allow_prune_with_max_checkpoints=False,  # max_checkpoints 调试时默认不清理，避免误删未完整评估的模型
         
         # ⚙️ 评估参数设置
         mode="fast_repro",          # fast_repro: 快速且固定 seeds；  strict: 最强可复现但更慢
-        n_episodes=100,             # 评估多少个任务                 
+        n_episodes=200,             # 评估多少个任务                 
         max_episodes_rendered=0,    # 全量评估建议 0；需要视频时再改为 1/2
         fps=25,                     # 视频帧率，和环境控制频率对齐
-        max_steps=400,              # 每个任务的最大步数
+        max_steps=400,              # 每条 episode 的最大环境步数，不是 action chunk 执行步长
+        action_steps=[ 4,5,6,7,8,9,10,11,12,13,14,15,16],  # 每次策略推理后连续执行的动作数；所有值使用相同 episode seeds
         batch_size=10,               # 并行评估环境数量；设为 1 即回到单环境评估
         use_async_envs=True,        # True 使用多进程 AsyncVectorEnv，False 使用单进程 SyncVectorEnv
         device="cuda",              # 如需完全规避 CUDA 非确定算子，可临时改成 "cpu"
@@ -1307,6 +1529,10 @@ if __name__ == "__main__":
         render_camera=['overhead_cam'],         # 保存video的相机视角    
         # ⚡ 快速评估默认开启混合精度；严格对比指标时可改 False
         use_amp=True,
+
+        # 耦合推理消融；None沿用checkpoint，0关闭对应方向，1保持完整耦合。
+        view_to_arm_coupling_scale=None,
+        arm_to_view_coupling_scale=None,
     )
     if eval_cfg.deterministic or eval_cfg.mode == "strict" or DETERMINISTIC_EVAL:
         ensure_python_hash_seed(eval_cfg.seed)

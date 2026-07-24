@@ -1,6 +1,8 @@
 outputs/
 src/
 datasets/
+!lerobot/common/datasets/
+!lerobot/common/datasets/**
 __pycache__/
 *.pyc
 

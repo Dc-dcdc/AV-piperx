@@ -35,6 +35,8 @@ from lerobot.common.logger import Logger
 from lerobot.common.policies.factory import make_policy # 用于获取训练策略模型
 from lerobot.common.policies.utils import get_device_from_parameters
 from lerobot.common.policies.policy_protocol import PolicyWithUpdate
+from train.pretrain.optimizer_utils import partition_optimizer_parameters
+from train.pretrain.scid_transform import initialize_scid_transform_from_dataset
 from lerobot.common.utils.utils import (
     format_big_number,
     get_safe_torch_device,
@@ -143,28 +145,52 @@ def make_optimizer_and_scheduler(cfg, policy):
             optimizer_params_dicts, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
         )
         lr_scheduler = None
-    elif cfg.policy.name in ["diffusion", "dual_head_diffusion", "two_model_diffusion"]:
-        # 修复：分离视觉 Backbone 和 U-Net 的学习率，并将所有参数纳入优化器
+    elif cfg.policy.name in [
+        "diffusion",
+        "dual_head_diffusion",
+        "scid_dual_head_diffusion",
+        "coupled_dual_head_diffusion",
+        "two_model_diffusion",
+    ]:
+        # 耦合分支关闭weight decay，避免零门控阶段发生参数塌缩。
+        trainable_named_parameters = [
+            (name, parameter)
+            for name, parameter in policy.named_parameters()
+            if parameter.requires_grad
+        ]
+        def is_visual_backbone_parameter(parameter_name: str) -> bool:
+            return parameter_name.startswith(
+                ("model.backbone", "image_encoder", "visual_encoders")
+            )
+
+        main_parameters, coupling_parameters, backbone_parameters = (
+            partition_optimizer_parameters(
+                trainable_named_parameters,
+                is_backbone_parameter=is_visual_backbone_parameter,
+            )
+        )
         optimizer_params_dicts = [
             {
-                "params": [
-                    p
-                    for n, p in policy.named_parameters()
-                    # 假设非 backbone 的参数（即 UNet 和相关投影层）
-                    if not n.startswith("model.backbone") and not n.startswith("image_encoder") and p.requires_grad
-                ]
-            },
-            {
-                "params": [
-                    p
-                    for n, p in policy.named_parameters()
-                    # 抓取视觉编码器的参数
-                    if (n.startswith("model.backbone") or n.startswith("image_encoder") or n.startswith("visual_encoders")) and p.requires_grad
-                ],
-                # 视觉网络给予 10 倍小的学习率，保护预训练特征
-                "lr": getattr(cfg.training, "lr_backbone", 1e-5), 
+                "name": "main",
+                "params": main_parameters,
             },
         ]
+        if coupling_parameters:
+            optimizer_params_dicts.append(
+                {
+                    "name": "coupling",
+                    "params": coupling_parameters,
+                    "weight_decay": 0.0,
+                }
+            )
+        optimizer_params_dicts.append(
+            {
+                "name": "backbone",
+                "params": backbone_parameters,
+                # 视觉网络给予 10 倍小的学习率，保护预训练特征
+                "lr": getattr(cfg.training, "lr_backbone", 1e-5),
+            }
+        )
 
         #对于扩散模型（diffusion model），我们使用了Adam优化器来更新模型的参数
         optimizer = torch.optim.Adam(
@@ -469,7 +495,13 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
         raise ValueError("配置文件`delta_timestamps` 中缺失了最核心的 `action` 时间轴！\n")
         
     # 软警告（可选）：Diffusion 通常还需要历史视觉帧，如果没写，可以给个黄字警告
-    if cfg.policy.name in ["diffusion", "dual_head_diffusion", "two_model_diffusion"] and not any("images" in k for k in delta_timestamps_dict.keys()):
+    if cfg.policy.name in [
+        "diffusion",
+        "dual_head_diffusion",
+        "scid_dual_head_diffusion",
+        "coupled_dual_head_diffusion",
+        "two_model_diffusion",
+    ] and not any("images" in k for k in delta_timestamps_dict.keys()):
         import logging
         logging.warning("警告: 你的 `delta_timestamps` 中没有包含任何图片的过去时间帧。\n")
 
@@ -648,6 +680,26 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         pretrained_policy_name_or_path=str(policy_load_path) if cfg.resume else None, 
     )
     policy.to(device)
+
+    if cfg.policy.name == "scid_dual_head_diffusion":
+        scid_fit = initialize_scid_transform_from_dataset(
+            policy,
+            offline_dataset,
+            resume=bool(cfg.resume),
+        )
+        if scid_fit is None:
+            logging.info("SCID变换已从checkpoint严格恢复，跳过重新拟合。")
+        else:
+            diagnostics = scid_fit.diagnostics
+            logging.info(
+                "SCID变换拟合完成: frames=%d, mean_R2=%.4f, "
+                "cross_corr=%.4f->%.4f, condition=%.3e",
+                diagnostics["num_frames"],
+                diagnostics["view_r2_mean"],
+                diagnostics["raw_cross_corr_norm"],
+                diagnostics["residual_cross_corr_norm"],
+                diagnostics["condition_number"],
+            )
 
     # 3.2 无论是不是 resume，都必须先根据模型初始化出全新的优化器！
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)

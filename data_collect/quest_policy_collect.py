@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -46,6 +47,24 @@ import env as _registered_env  # noqa: F401  注册 Gym 环境
 from quest_control import QuestControl
 from quest_receive import QuestReceive
 from quest_send import UnityImageStreamer
+from data_collect.collection_run_state import ExclusiveRunLock, atomic_write_json
+from data_collect.episode_seeding import (
+    ENVIRONMENT_SEED_STRATEGY,
+    REPLAY_ENVIRONMENT_SEED_STRATEGY,
+    SEED_MODE_REPLAY,
+    SEED_MODE_SEQUENTIAL,
+    EpisodeSeedAssignment,
+    EpisodeSeedStream,
+    ReplaySeedStream,
+    ReplaySeedsExhausted,
+    load_replay_seed_records,
+    normalize_base_seed,
+    normalize_replay_on_exhausted,
+    normalize_seed_mode,
+    replay_seed_digest,
+    resolve_next_attempt_index,
+    validate_append_seed_configuration,
+)
 from data_collect.robot_ik_solver import PoseActionIKSolver
 from data_collect.quest_teleop_collect import (
     AsyncEpisodeVideoWriter,
@@ -56,7 +75,6 @@ from data_collect.quest_teleop_collect import (
     replay_episode_videos,
     save_episode_reward_debug,
     stack_trace,
-    write_metadata,
 )
 
 
@@ -104,6 +122,21 @@ class EpisodeBuffer:
     index: int
     tmp_dir: Path
     final_dir: Path
+    attempt_index: int
+    environment_seed: int | None
+    policy_seed: int | None
+    seed_source: str
+    environment_seed_strategy: str
+    replay_batch_index: int | None = None
+    replay_index: int | None = None
+    replay_record_index: int | None = None
+    replay_repeat_index: int | None = None
+    replay_cycle: int | None = None
+    evaluation_source_index: int | None = None
+    evaluation_episode: int | None = None
+    evaluation_success: bool | None = None
+    evaluation_reward: float | None = None
+    evaluation_steps: int | None = None
     initial_time: float | None = None
     initial_qpos: np.ndarray | None = None
     initial_qvel: np.ndarray | None = None
@@ -115,6 +148,7 @@ class EpisodeBuffer:
     depth_traces: dict[str, list[np.ndarray]] = field(default_factory=dict)
     joint_actions: list[np.ndarray] = field(default_factory=list)
     policy_actions: list[np.ndarray] = field(default_factory=list)
+    teleop_actions: list[np.ndarray] = field(default_factory=list)
     pose_actions: list[np.ndarray] = field(default_factory=list)
     control_modes: list[int] = field(default_factory=list)
     teleop_applied: list[bool] = field(default_factory=list)
@@ -291,8 +325,8 @@ def make_env(policy, full_cfg: dict, cfg: DictConfig):
         "observation_height": int(cfg.render_height),
         "observation_width": int(cfg.render_width),
     }
-    if env_id == "guided_vision/InsertCylinder-3Arms-v0":
-        env_kwargs["enable_reward_debug"] = bool(cfg.get("save_reward_debug", False))
+    if bool(cfg.get("save_reward_debug", False)):
+        env_kwargs["enable_reward_debug"] = True
     env = gym.make(id=env_id, **env_kwargs)
     return env, cameras, env_id
 
@@ -451,7 +485,13 @@ def launch_viewer(sim_env, state: RunState, enabled: bool):
 
 
 # 创建新的 episode 临时目录。
-def start_episode(run_dir: Path, episode_index: int, physics) -> EpisodeBuffer:
+def start_episode(
+    run_dir: Path,
+    episode_index: int,
+    physics,
+    *,
+    seed_assignment: EpisodeSeedAssignment,
+) -> EpisodeBuffer:
     episodes_dir = run_dir / "episodes"
     episodes_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = episodes_dir / f"episode_{episode_index:06d}.tmp"
@@ -460,7 +500,32 @@ def start_episode(run_dir: Path, episode_index: int, physics) -> EpisodeBuffer:
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True)
 
-    buffer = EpisodeBuffer(index=episode_index, tmp_dir=tmp_dir, final_dir=final_dir)
+    buffer = EpisodeBuffer(
+        index=episode_index,
+        tmp_dir=tmp_dir,
+        final_dir=final_dir,
+        attempt_index=int(seed_assignment.attempt_index),
+        environment_seed=(
+            None
+            if seed_assignment.environment_seed is None
+            else int(seed_assignment.environment_seed)
+        ),
+        policy_seed=(
+            None if seed_assignment.policy_seed is None else int(seed_assignment.policy_seed)
+        ),
+        seed_source=str(seed_assignment.seed_source),
+        environment_seed_strategy=str(seed_assignment.environment_seed_strategy),
+        replay_batch_index=seed_assignment.replay_batch_index,
+        replay_index=seed_assignment.replay_index,
+        replay_record_index=seed_assignment.replay_record_index,
+        replay_repeat_index=seed_assignment.replay_repeat_index,
+        replay_cycle=seed_assignment.replay_cycle,
+        evaluation_source_index=seed_assignment.evaluation_source_index,
+        evaluation_episode=seed_assignment.evaluation_episode,
+        evaluation_success=seed_assignment.evaluation_success,
+        evaluation_reward=seed_assignment.evaluation_reward,
+        evaluation_steps=seed_assignment.evaluation_steps,
+    )
     buffer.initial_time = float(physics.data.time)
     buffer.initial_qpos = physics.data.qpos.copy()
     buffer.initial_qvel = physics.data.qvel.copy()
@@ -478,6 +543,7 @@ def record_step(
     obs_before: dict,
     joint_action: np.ndarray,
     policy_joint_action: np.ndarray,
+    teleop_joint_action: np.ndarray,
     pose_action: np.ndarray,
     control_mode: str,
     teleop_applied: bool,
@@ -504,6 +570,7 @@ def record_step(
 
     buffer.joint_actions.append(np.asarray(joint_action, dtype=np.float32).copy())
     buffer.policy_actions.append(np.asarray(policy_joint_action, dtype=np.float32).copy())
+    buffer.teleop_actions.append(np.asarray(teleop_joint_action, dtype=np.float32).copy())
     buffer.pose_actions.append(np.asarray(pose_action, dtype=np.float32).copy())
     buffer.control_modes.append(int(MODE_CODE[control_mode]))
     buffer.teleop_applied.append(bool(teleop_applied))
@@ -545,6 +612,9 @@ def save_episode_arrays(buffer: EpisodeBuffer, cfg: DictConfig) -> dict[str, dic
     arrays = {
         "joint_action": np.asarray(buffer.joint_actions, dtype=np.float32),
         "policy_action": np.asarray(buffer.policy_actions, dtype=np.float32),
+        # 保存平滑混合前的遥操作候选动作。非接管维度由 IK 求解器保持为
+        # policy_action，训练时必须结合 teleop_mask/blend_weight 使用。
+        "teleop_action": np.asarray(buffer.teleop_actions, dtype=np.float32),
         "control_mode": mode_arr,
         "teleop_applied": np.asarray(buffer.teleop_applied, dtype=np.bool_),
         "blend_weight": np.asarray(buffer.blend_weights, dtype=np.float32),
@@ -734,6 +804,21 @@ def finish_episode(
     mode_arr = np.asarray(buffer.control_modes, dtype=np.int8)
     info = {
         "episode": int(buffer.index),
+        "attempt_index": int(buffer.attempt_index),
+        "environment_seed": buffer.environment_seed,
+        "policy_seed": buffer.policy_seed,
+        "seed_source": buffer.seed_source,
+        "environment_seed_strategy": buffer.environment_seed_strategy,
+        "replay_batch_index": buffer.replay_batch_index,
+        "replay_index": buffer.replay_index,
+        "replay_record_index": buffer.replay_record_index,
+        "replay_repeat_index": buffer.replay_repeat_index,
+        "replay_cycle": buffer.replay_cycle,
+        "evaluation_source_index": buffer.evaluation_source_index,
+        "evaluation_episode": buffer.evaluation_episode,
+        "evaluation_success": buffer.evaluation_success,
+        "evaluation_reward": buffer.evaluation_reward,
+        "evaluation_steps": buffer.evaluation_steps,
         "steps": int(buffer.steps),
         "reason": reason,
         "success": success,
@@ -787,6 +872,177 @@ def next_episode_index(run_dir: Path) -> int:
     return max(indices, default=-1) + 1
 
 
+# 读取已有 run 元数据，以便 append 模式延续 attempt seed 游标。
+def load_run_metadata(run_dir: Path) -> dict:
+    metadata_path = run_dir / "metadata.json"
+    if not metadata_path.exists():
+        return {}
+    with metadata_path.open("r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Run metadata must be a JSON object: {metadata_path}")
+    return metadata
+
+
+# 同目录临时文件 + os.replace，避免 seed 游标写到一半损坏 metadata.json。
+def write_metadata(run_dir: Path, metadata: dict) -> None:
+    atomic_write_json(Path(run_dir) / "metadata.json", metadata)
+
+
+# append 必须保持同一环境和 checkpoint，避免把不同实验混入同一 run。
+def validate_append_run_identity(
+    *,
+    existing_metadata: dict,
+    env_id: str,
+    ckpt_path: Path,
+) -> None:
+    if not existing_metadata:
+        return
+
+    previous_env_id = existing_metadata.get("env_id")
+    if previous_env_id is not None and str(previous_env_id) != str(env_id):
+        raise ValueError(
+            "Cannot append with a different environment: "
+            f"existing={previous_env_id!r}, requested={env_id!r}."
+        )
+
+    previous_ckpt_path = existing_metadata.get("ckpt_path")
+    if previous_ckpt_path is not None:
+        previous_resolved = resolve_path(previous_ckpt_path).resolve()
+        requested_resolved = Path(ckpt_path).resolve()
+        if previous_resolved != requested_resolved:
+            raise ValueError(
+                "Cannot append with a different checkpoint: "
+                f"existing={previous_resolved}, requested={requested_resolved}."
+            )
+
+
+def validate_append_seed_mode(*, existing_metadata: dict, seed_mode: str) -> None:
+    """禁止在同一 run 中混合顺序派生 seed 和评估 seed 重放。"""
+    if not existing_metadata:
+        return
+    previous_mode = existing_metadata.get("seed_mode")
+    if previous_mode is None:
+        previous_mode = (
+            SEED_MODE_REPLAY
+            if existing_metadata.get("environment_seed_strategy")
+            == REPLAY_ENVIRONMENT_SEED_STRATEGY
+            else SEED_MODE_SEQUENTIAL
+        )
+    if str(previous_mode) != seed_mode:
+        raise ValueError(
+            "Cannot append with a different seed mode: "
+            f"existing={previous_mode!r}, requested={seed_mode!r}."
+        )
+
+
+def resolve_append_replay_state(
+    *,
+    existing_metadata: dict,
+    seed_digest: str,
+    failed_only: bool,
+    repeat: int,
+    on_exhausted: str,
+    replay_policy_rng: bool,
+) -> dict:
+    """恢复当前 replay 批次；旧批次用尽时允许同一 run 接续新 seed 文件。"""
+    if not existing_metadata:
+        return {
+            "next_replay_index": 0,
+            "replay_batch_index": 0,
+            "replay_batch_start_attempt_index": 0,
+            "replay_seed_history": [],
+            "source_changed": False,
+        }
+    expected = {
+        "replay_failed_only": bool(failed_only),
+        "replay_repeat": int(repeat),
+        "replay_on_exhausted": str(on_exhausted),
+        "replay_policy_rng": bool(replay_policy_rng),
+    }
+    for key, requested in expected.items():
+        if key not in existing_metadata:
+            continue
+        existing = existing_metadata[key]
+        if existing != requested:
+            raise ValueError(
+                f"Cannot append with a different {key}: "
+                f"existing={existing!r}, requested={requested!r}."
+            )
+
+    history = existing_metadata.get("replay_seed_history", [])
+    if not isinstance(history, list):
+        raise ValueError("metadata.replay_seed_history must be a list.")
+    history = list(history)
+    batch_index = int(existing_metadata.get("replay_batch_index", len(history)))
+    batch_start_attempt = int(
+        existing_metadata.get(
+            "replay_batch_start_attempt_index",
+            existing_metadata.get("environment_seed_strategy_start_attempt", 0),
+        )
+    )
+    next_replay_index = int(existing_metadata.get("next_replay_index", 0))
+    previous_digest = existing_metadata.get("replay_seed_digest")
+    if previous_digest is None:
+        raise ValueError(
+            "Existing replay metadata has no replay_seed_digest; use a new run_name "
+            "instead of changing its seed source."
+        )
+    if str(previous_digest) == str(seed_digest):
+        return {
+            "next_replay_index": next_replay_index,
+            "replay_batch_index": batch_index,
+            "replay_batch_start_attempt_index": batch_start_attempt,
+            "replay_seed_history": history,
+            "source_changed": False,
+        }
+
+    previous_count = int(existing_metadata.get("replay_seed_count", 0))
+    previous_repeat = int(existing_metadata.get("replay_repeat", 1))
+    previous_on_exhausted = str(existing_metadata.get("replay_on_exhausted", "stop"))
+    previous_capacity = previous_count * previous_repeat
+    if (
+        previous_count < 1
+        or previous_on_exhausted != "stop"
+        or next_replay_index < previous_capacity
+    ):
+        raise ValueError(
+            "Cannot switch replay seed files before the current queue is exhausted: "
+            f"allocated={next_replay_index}, capacity={previous_capacity}, "
+            f"on_exhausted={previous_on_exhausted!r}."
+        )
+
+    history.append(
+        {
+            "replay_batch_index": batch_index,
+            "replay_seed_file": existing_metadata.get("replay_seed_file"),
+            "replay_seed_digest": str(previous_digest),
+            "replay_failed_only": bool(existing_metadata.get("replay_failed_only", True)),
+            "replay_repeat": previous_repeat,
+            "replay_policy_rng": bool(existing_metadata.get("replay_policy_rng", True)),
+            "replay_on_exhausted": previous_on_exhausted,
+            "replay_seed_count": previous_count,
+            "replay_seeds": list(existing_metadata.get("replay_seeds", [])),
+            "allocated_replays": next_replay_index,
+            "start_attempt_index": batch_start_attempt,
+            "end_attempt_index_exclusive": int(
+                existing_metadata.get("next_attempt_index", batch_start_attempt)
+            ),
+            "status": "exhausted",
+            "archived_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    return {
+        "next_replay_index": 0,
+        "replay_batch_index": batch_index + 1,
+        "replay_batch_start_attempt_index": int(
+            existing_metadata.get("next_attempt_index", batch_start_attempt)
+        ),
+        "replay_seed_history": history,
+        "source_changed": True,
+    }
+
+
 # 按任务和数据模态创建或复用 run 输出目录。
 def make_run_dir(cfg: DictConfig, env_id: str) -> Path:
     modes = []
@@ -808,10 +1064,11 @@ def make_run_dir(cfg: DictConfig, env_id: str) -> Path:
     return run_dir
 
 
-# 固定 Python 数值库和策略采样用到的随机数。
+# 固定数值库和策略采样用到的全局随机数。
 def set_random_seed(seed: int | None) -> None:
     if seed is None:
         return
+    random.seed(int(seed))
     np.random.seed(int(seed))
     torch.manual_seed(int(seed))
     if torch.cuda.is_available():
@@ -821,25 +1078,97 @@ def set_random_seed(seed: int | None) -> None:
         torch.backends.cudnn.deterministic = True
 
 
-# 重置环境、策略和遥操状态。
+def seed_env_spaces(env, seed: int) -> None:
+    """与单环境评估一致，显式固定 Gym action/observation space RNG。"""
+    for space_name in ("action_space", "observation_space"):
+        space = getattr(env, space_name, None)
+        if hasattr(space, "seed"):
+            space.seed(int(seed))
+
+
+# 使用当前 attempt 的 seed，重置环境、策略队列和遥操状态。
 def reset_control_state(
     env,
     policy,
     quest_control: QuestControl,
     ik_solver: PoseActionIKSolver,
     *,
-    seed: int | None = None,
+    seed_assignment: EpisodeSeedAssignment,
 ):
-    if seed is None:
+    env_seed = seed_assignment.environment_seed
+    is_replay = seed_assignment.seed_source == "eval_failure_replay"
+    if is_replay and env_seed is not None:
+        # 复刻单环境评估顺序：先固定运行时和 spaces，再重置环境。
+        set_random_seed(env_seed)
+        seed_env_spaces(env, env_seed)
+
+    if env_seed is None:
         obs, _ = env.reset()
     else:
-        set_random_seed(seed)
-        obs, _ = env.reset(seed=int(seed))
+        obs, _ = env.reset(seed=int(env_seed))
     if hasattr(policy, "reset"):
         policy.reset()
+    if seed_assignment.policy_seed is not None:
+        # policy.reset 可能消费随机数；重置后再次对齐，保证第一段扩散噪声一致。
+        set_random_seed(seed_assignment.policy_seed)
     quest_control.reset()
     ik_solver.reset(active=False)
     return obs
+
+
+# 领取一次 attempt seed，重置控制状态并开始新的 rollout。
+def begin_episode(
+    *,
+    env,
+    policy,
+    quest_control: QuestControl,
+    ik_solver: PoseActionIKSolver,
+    run_dir: Path,
+    episode_index: int,
+    physics,
+    seed_stream: EpisodeSeedStream | ReplaySeedStream,
+    metadata: dict,
+) -> tuple[dict, EpisodeBuffer]:
+    seed_assignment = seed_stream.take_assignment()
+
+    # 在 env.reset 前持久化下一个游标；即使进程中断，也不会重复已经领取的 seed。
+    metadata["next_attempt_index"] = int(seed_stream.next_attempt_index)
+    if isinstance(seed_stream, ReplaySeedStream):
+        metadata["next_replay_index"] = int(seed_stream.next_replay_index)
+    metadata["last_allocated_attempt"] = {
+        "episode": int(episode_index),
+        **seed_assignment.to_metadata(),
+    }
+    write_metadata(run_dir, metadata)
+
+    obs = reset_control_state(
+        env,
+        policy,
+        quest_control,
+        ik_solver,
+        seed_assignment=seed_assignment,
+    )
+    buffer = start_episode(
+        run_dir,
+        episode_index,
+        physics,
+        seed_assignment=seed_assignment,
+    )
+    replay_suffix = ""
+    if seed_assignment.replay_index is not None:
+        replay_suffix = (
+            f", replay_batch={seed_assignment.replay_batch_index}, "
+            f"replay={seed_assignment.replay_index}, "
+            f"eval_episode={seed_assignment.evaluation_episode}"
+        )
+    print(
+        f"Started episode {episode_index:06d}: "
+        f"attempt={seed_assignment.attempt_index}, "
+        f"env_seed={seed_assignment.environment_seed if seed_assignment.environment_seed is not None else 'unseeded'}, "
+        f"policy_seed={seed_assignment.policy_seed if seed_assignment.policy_seed is not None else 'continuous'}"
+        f"{replay_suffix}"
+    )
+    return obs, buffer
 
 
 # 检查当前 Quest 数据是否满足某个遥操模式所需的输入源。
@@ -1056,7 +1385,36 @@ def run(cfg: DictConfig) -> None:
     elif not cfg.viewer and not cfg.camera_window and not os.environ.get("DISPLAY"):
         os.environ.setdefault("MUJOCO_GL", "egl")
 
-    set_random_seed(cfg.random_seed)
+    seed_mode = normalize_seed_mode(cfg.get("seed_mode", SEED_MODE_SEQUENTIAL))
+    base_random_seed = normalize_base_seed(cfg.random_seed)
+    replay_seed_path: Path | None = None
+    replay_records = []
+    replay_digest: str | None = None
+    replay_failed_only = bool(cfg.get("replay_failed_only", True))
+    replay_repeat = int(cfg.get("replay_repeat", 1))
+    replay_policy_rng = bool(cfg.get("replay_policy_rng", True))
+    replay_on_exhausted = normalize_replay_on_exhausted(
+        cfg.get("replay_on_exhausted", "stop")
+    )
+    if replay_repeat < 1:
+        raise ValueError(f"replay_repeat must be at least 1, got {replay_repeat}.")
+    if seed_mode == SEED_MODE_REPLAY:
+        replay_seed_file = cfg.get("replay_seed_file")
+        if not replay_seed_file:
+            raise ValueError("replay_seed_file is required when seed_mode=replay.")
+        replay_seed_path = resolve_path(replay_seed_file).resolve()
+        replay_records = load_replay_seed_records(
+            replay_seed_path,
+            failed_only=replay_failed_only,
+        )
+        replay_digest = replay_seed_digest(replay_records)
+    elif cfg.get("replay_seed_file"):
+        raise ValueError(
+            "replay_seed_file is set but seed_mode is not 'replay'. "
+            "Set seed_mode=replay to use evaluation seeds."
+        )
+
+    set_random_seed(base_random_seed)
     policy, full_cfg, device, _root_dir, load_dir = load_policy(cfg)
     env, policy_cameras, env_id = make_env(policy, full_cfg, cfg)
     sim_env = env.unwrapped
@@ -1064,40 +1422,167 @@ def run(cfg: DictConfig) -> None:
     record_cameras = list(cfg.record_cameras)
 
     run_dir = make_run_dir(cfg, env_id)
+    run_lock = ExclusiveRunLock(run_dir).acquire()
+    existing_metadata = load_run_metadata(run_dir) if cfg.append else {}
     existing_infos = load_existing_episode_infos(run_dir) if cfg.append else []
+    resolved_ckpt_path = resolve_path(cfg.ckpt_path).resolve()
+    validate_append_run_identity(
+        existing_metadata=existing_metadata,
+        env_id=env_id,
+        ckpt_path=resolved_ckpt_path,
+    )
+    validate_append_seed_mode(existing_metadata=existing_metadata, seed_mode=seed_mode)
+    legacy_seed_configuration = None
+    replay_state = None
+    if seed_mode == SEED_MODE_SEQUENTIAL:
+        legacy_seed_configuration = validate_append_seed_configuration(
+            existing_metadata=existing_metadata,
+            base_seed=base_random_seed,
+            saved_episode_count=len(existing_infos),
+        )
+    else:
+        assert replay_digest is not None
+        replay_state = resolve_append_replay_state(
+            existing_metadata=existing_metadata,
+            seed_digest=replay_digest,
+            failed_only=replay_failed_only,
+            repeat=replay_repeat,
+            on_exhausted=replay_on_exhausted,
+            replay_policy_rng=replay_policy_rng,
+        )
     episode_index = next_episode_index(run_dir)
-    metadata = {
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "run_dir": str(run_dir),
-        "ckpt_path": str(resolve_path(cfg.ckpt_path)),
-        "load_dir": str(load_dir),
-        "env_id": env_id,
-        "fps": int(cfg.fps),
-        "policy_cameras": policy_cameras,
-        "record_cameras": record_cameras,
-        "save_rgb": bool(cfg.save_rgb),
-        "save_videos": bool(cfg.save_rgb and cfg.save_videos),
-        "save_depth": bool(cfg.save_depth),
-        "save_reward_debug": bool(cfg.get("save_reward_debug", False)),
-        "video_save_mode": "replay_after_success_confirm",
-        "render_width": int(cfg.render_width),
-        "render_height": int(cfg.render_height),
-        "takeover_blend_steps": int(cfg.takeover_blend_steps),
-        "blend_weight_order": list(ARM_ORDER),
-        "random_seed": None if cfg.random_seed is None else int(cfg.random_seed),
-        "fixed_reset_seed": cfg.random_seed is not None,
-        "episode_initial_mode": MODE_POLICY,
-        "control_mode_map": {str(code): mode for mode, code in MODE_CODE.items()},
-        "camera_window": bool(cfg.camera_window),
-        "display_camera": str(cfg.display_camera),
-        "unity_image_stream": bool(cfg.unity_image_stream),
-        "unity_image_source": str(cfg.unity_image_source),
-        "unity_image_stereo": bool(cfg.unity_image_stereo),
-        "saved_episodes": len(existing_infos),
-        "successful_episodes": sum(1 for info in existing_infos if bool(info.get("success", False))),
-        "episodes": existing_infos,
-    }
+    next_attempt_index = resolve_next_attempt_index(
+        episode_index=episode_index,
+        existing_metadata=existing_metadata,
+        existing_infos=existing_infos,
+    )
+    if seed_mode == SEED_MODE_REPLAY:
+        assert replay_state is not None
+        seed_stream: EpisodeSeedStream | ReplaySeedStream = ReplaySeedStream(
+            records=replay_records,
+            next_attempt_index=next_attempt_index,
+            next_replay_index=int(replay_state["next_replay_index"]),
+            replay_batch_index=int(replay_state["replay_batch_index"]),
+            repeat=replay_repeat,
+            on_exhausted=replay_on_exhausted,
+            replay_policy_rng=replay_policy_rng,
+        )
+        environment_seed_strategy = REPLAY_ENVIRONMENT_SEED_STRATEGY
+    else:
+        seed_stream = EpisodeSeedStream(
+            base_seed=base_random_seed,
+            next_attempt_index=next_attempt_index,
+        )
+        environment_seed_strategy = (
+            ENVIRONMENT_SEED_STRATEGY if base_random_seed is not None else "unseeded"
+        )
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    metadata = dict(existing_metadata)
+    for deprecated_key in (
+        "attempted_episodes",
+        "allocated_attempts",
+        "episode_seed_strategy",
+        "process_rng_seeded_once",
+    ):
+        metadata.pop(deprecated_key, None)
+    if legacy_seed_configuration is not None:
+        metadata["legacy_seed_configuration"] = legacy_seed_configuration
+
+    previous_strategy = existing_metadata.get(
+        "environment_seed_strategy",
+        existing_metadata.get("episode_seed_strategy"),
+    )
+    strategy_start_attempt = int(
+        existing_metadata.get(
+            "environment_seed_strategy_start_attempt",
+            0 if previous_strategy is not None else next_attempt_index,
+        )
+    )
+    metadata.update(
+        {
+            "created_at": existing_metadata.get("created_at", now),
+            "updated_at": now,
+            "run_dir": str(run_dir),
+            "ckpt_path": str(resolved_ckpt_path),
+            "load_dir": str(load_dir),
+            "env_id": env_id,
+            "fps": int(cfg.fps),
+            "policy_cameras": policy_cameras,
+            "record_cameras": record_cameras,
+            "save_rgb": bool(cfg.save_rgb),
+            "save_videos": bool(cfg.save_rgb and cfg.save_videos),
+            "save_depth": bool(cfg.save_depth),
+            "save_reward_debug": bool(cfg.get("save_reward_debug", False)),
+            "video_save_mode": "replay_after_success_confirm",
+            "render_width": int(cfg.render_width),
+            "render_height": int(cfg.render_height),
+            "takeover_blend_steps": int(cfg.takeover_blend_steps),
+            "blend_weight_order": list(ARM_ORDER),
+            "random_seed": base_random_seed,
+            "base_random_seed": base_random_seed,
+            "fixed_reset_seed": False,
+            "global_rng_seeded_once": base_random_seed is not None,
+            "seed_mode": seed_mode,
+            "environment_seed_strategy": environment_seed_strategy,
+            "environment_seed_strategy_start_attempt": strategy_start_attempt,
+            "policy_rng_seed_strategy": (
+                "match_environment_seed_after_policy_reset"
+                if seed_mode == SEED_MODE_REPLAY and replay_policy_rng
+                else "continuous"
+            ),
+            "seed_schema_version": 4,
+            "next_attempt_index": int(seed_stream.next_attempt_index),
+            "episode_initial_mode": MODE_POLICY,
+            "control_mode_map": {str(code): mode for mode, code in MODE_CODE.items()},
+            "camera_window": bool(cfg.camera_window),
+            "display_camera": str(cfg.display_camera),
+            "unity_image_stream": bool(cfg.unity_image_stream),
+            "unity_image_source": str(cfg.unity_image_source),
+            "unity_image_stereo": bool(cfg.unity_image_stereo),
+            "saved_episodes": len(existing_infos),
+            "successful_episodes": sum(
+                1 for info in existing_infos if bool(info.get("success", False))
+            ),
+            "episodes": existing_infos,
+        }
+    )
+    if seed_mode == SEED_MODE_REPLAY:
+        assert replay_seed_path is not None and replay_digest is not None
+        assert replay_state is not None
+        metadata.update(
+            {
+                "replay_batch_index": int(replay_state["replay_batch_index"]),
+                "replay_batch_start_attempt_index": int(
+                    replay_state["replay_batch_start_attempt_index"]
+                ),
+                "replay_seed_history": replay_state["replay_seed_history"],
+                "replay_seed_file": str(replay_seed_path),
+                "replay_seed_digest": replay_digest,
+                "replay_failed_only": replay_failed_only,
+                "replay_repeat": replay_repeat,
+                "replay_policy_rng": replay_policy_rng,
+                "replay_on_exhausted": replay_on_exhausted,
+                "replay_seed_count": len(replay_records),
+                "replay_seeds": [record.seed for record in replay_records],
+                "next_replay_index": int(seed_stream.next_replay_index),
+            }
+        )
+        if replay_state["source_changed"]:
+            print(
+                "上一失败 seed 队列已用尽；将在同一 run 中开始新的重放批次 "
+                f"{replay_state['replay_batch_index']}，全局 attempt 从 "
+                f"{next_attempt_index} 继续。"
+            )
     write_metadata(run_dir, metadata)
+
+    if isinstance(seed_stream, ReplaySeedStream) and seed_stream.exhausted:
+        print(
+            "失败 seed 队列已经全部重放；未启动新 episode。"
+            "如需再次重放，请设置 replay_on_exhausted=loop，或使用新的 run_name。"
+        )
+        env.close()
+        run_lock.close()
+        return
 
     receiver = QuestReceive(host=cfg.host, port=cfg.port, timeout=cfg.timeout)
     image_streamer = (
@@ -1145,10 +1630,19 @@ def run(cfg: DictConfig) -> None:
     ik_solver.warmup()
     print(f"IK warmup done: {(time.time() - warmup_start) * 1000.0:.1f} ms")
 
-    obs = reset_control_state(env, policy, quest_control, ik_solver, seed=cfg.random_seed)
+    obs, buffer = begin_episode(
+        env=env,
+        policy=policy,
+        quest_control=quest_control,
+        ik_solver=ik_solver,
+        run_dir=run_dir,
+        episode_index=episode_index,
+        physics=physics,
+        seed_stream=seed_stream,
+        metadata=metadata,
+    )
     takeover_blender = TakeoverBlender(blend_steps=cfg.takeover_blend_steps)
     last_joint_action = np.asarray(obs["agent_pos"], dtype=np.float32).copy()
-    buffer = start_episode(run_dir, episode_index, physics)
     cumulative_reward = 0.0
     latest_data = None
     prev_buttons: dict[str, bool] = {}
@@ -1172,7 +1666,18 @@ def run(cfg: DictConfig) -> None:
     print("本地窗口/Viewer 快捷键:")
     print("  1: 全部策略 | 2: 右臂接管 | 3: 左臂接管 | 4: 头部接管 | 5: 双臂接管 | 6: 全部接管")
     print("  Space/R: 放弃当前 episode 并重置 | Q/Esc: 退出")
-    print(f"固定随机种子: {cfg.random_seed if cfg.random_seed is not None else '关闭'}")
+    print(f"Seed 模式: {seed_mode}")
+    print(f"基础随机种子: {base_random_seed if base_random_seed is not None else '关闭'}")
+    if seed_mode == SEED_MODE_REPLAY:
+        print(f"失败 seed 文件: {replay_seed_path}")
+        print(
+            f"重放 seed 数量/每个 seed 次数: {len(replay_records)}/{replay_repeat}; "
+            f"用尽后: {replay_on_exhausted}"
+        )
+    print(
+        f"当前 attempt/环境 seed: {buffer.attempt_index}/"
+        f"{buffer.environment_seed if buffer.environment_seed is not None else 'unseeded'}"
+    )
     print(f"记录相机: {record_cameras}")
     print(f"保存 RGB 视频: {'开启' if cfg.save_rgb and cfg.save_videos else '关闭'}")
     print(f"保存深度: {'开启' if cfg.save_depth else '关闭'}")
@@ -1224,10 +1729,19 @@ def run(cfg: DictConfig) -> None:
                     reason=completion_reason or "success_confirmed",
                 )
                 episode_index = next_episode_index(run_dir)
-                obs = reset_control_state(env, policy, quest_control, ik_solver, seed=cfg.random_seed)
+                obs, buffer = begin_episode(
+                    env=env,
+                    policy=policy,
+                    quest_control=quest_control,
+                    ik_solver=ik_solver,
+                    run_dir=run_dir,
+                    episode_index=episode_index,
+                    physics=physics,
+                    seed_stream=seed_stream,
+                    metadata=metadata,
+                )
                 takeover_blender.reset()
                 last_joint_action = np.asarray(obs["agent_pos"], dtype=np.float32).copy()
-                buffer = start_episode(run_dir, episode_index, physics)
                 cumulative_reward = 0.0
                 waiting_save_confirm = False
                 completion_reason = ""
@@ -1266,10 +1780,19 @@ def run(cfg: DictConfig) -> None:
                     reason="manual_reset",
                 )
                 episode_index = next_episode_index(run_dir)
-                obs = reset_control_state(env, policy, quest_control, ik_solver, seed=cfg.random_seed)
+                obs, buffer = begin_episode(
+                    env=env,
+                    policy=policy,
+                    quest_control=quest_control,
+                    ik_solver=ik_solver,
+                    run_dir=run_dir,
+                    episode_index=episode_index,
+                    physics=physics,
+                    seed_stream=seed_stream,
+                    metadata=metadata,
+                )
                 takeover_blender.reset()
                 last_joint_action = np.asarray(obs["agent_pos"], dtype=np.float32).copy()
-                buffer = start_episode(run_dir, episode_index, physics)
                 cumulative_reward = 0.0
                 waiting_save_confirm = False
                 completion_reason = ""
@@ -1289,6 +1812,7 @@ def run(cfg: DictConfig) -> None:
             overlay_lines = [
                 f"mode: {control_mode}",
                 f"steps: {buffer.steps}",
+                f"seed: {buffer.environment_seed}",
                 f"complete: {'YES' if waiting_save_confirm else 'NO'}",
                 f"saved episodes: {metadata['saved_episodes']}",
                 f"blend L/R/M: {np.round(takeover_blender.weights_array(), 2).tolist()}",
@@ -1352,6 +1876,7 @@ def run(cfg: DictConfig) -> None:
                 obs_before=obs_before,
                 joint_action=joint_action,
                 policy_joint_action=policy_joint_action,
+                teleop_joint_action=teleop_joint_action,
                 pose_action=pose_action,
                 control_mode=control_mode,
                 teleop_applied=teleop_applied,
@@ -1388,10 +1913,19 @@ def run(cfg: DictConfig) -> None:
                     reason=completion_reason,
                 )
                 episode_index = next_episode_index(run_dir)
-                obs = reset_control_state(env, policy, quest_control, ik_solver, seed=cfg.random_seed)
+                obs, buffer = begin_episode(
+                    env=env,
+                    policy=policy,
+                    quest_control=quest_control,
+                    ik_solver=ik_solver,
+                    run_dir=run_dir,
+                    episode_index=episode_index,
+                    physics=physics,
+                    seed_stream=seed_stream,
+                    metadata=metadata,
+                )
                 takeover_blender.reset()
                 last_joint_action = np.asarray(obs["agent_pos"], dtype=np.float32).copy()
-                buffer = start_episode(run_dir, episode_index, physics)
                 cumulative_reward = 0.0
                 waiting_save_confirm = False
                 completion_reason = ""
@@ -1419,6 +1953,7 @@ def run(cfg: DictConfig) -> None:
             overlay_lines = [
                 f"mode: {control_mode}",
                 f"steps: {buffer.steps}",
+                f"seed: {buffer.environment_seed}",
                 f"complete: {'YES' if waiting_save_confirm else 'NO'}",
                 f"saved episodes: {metadata['saved_episodes']}",
                 f"blend L/R/M: {np.round(takeover_blender.weights_array(), 2).tolist()}",
@@ -1445,20 +1980,25 @@ def run(cfg: DictConfig) -> None:
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
+    except ReplaySeedsExhausted:
+        print("失败 seed 队列已全部重放，采集程序正常退出。")
     except KeyboardInterrupt:
         print("\nStopped by Ctrl+C.")
     finally:
-        if buffer.tmp_dir.exists():
-            shutil.rmtree(buffer.tmp_dir, ignore_errors=True)
+        try:
+            if buffer.tmp_dir.exists():
+                shutil.rmtree(buffer.tmp_dir, ignore_errors=True)
 
-        receiver.close()
-        if image_streamer is not None:
-            image_streamer.close()
-        if viewer is not None:
-            viewer.close()
-        if cfg.camera_window:
-            cv2.destroyAllWindows()
-        env.close()
+            receiver.close()
+            if image_streamer is not None:
+                image_streamer.close()
+            if viewer is not None:
+                viewer.close()
+            if cfg.camera_window:
+                cv2.destroyAllWindows()
+            env.close()
+        finally:
+            run_lock.close()
 
 
 # Hydra 命令行入口，配置格式与 quest_teleop_collect.py 保持一致。
@@ -1470,12 +2010,12 @@ def quest_policy_collect_cli(cfg: DictConfig) -> None:
 if __name__ == "__main__":
     default_args = [
         (
-            "ckpt_path='outputs/2_pretrain/train/2026-06-30/"
-            "23-42-18_InsertCylinder-3Arms-v0_pre_zed_two_model_diffusion/"
-            "checkpoints/176000_loss=0.0031_sr=60.0_ar=577.94'"
+            "ckpt_path='outputs/2_pretrain/train/2026-07-16/20-59-53_InsertCylinder-3Arms-v0_pre_zed_dual_head_diffusion/checkpoints/162000_loss=0.0051_sr=87.0_ar=751.50'"
         ),                                                  # 预训练策略 checkpoint
+        "seed_mode=replay",                                # 直接重放测评失败 seed
+        "replay_seed_file='outputs/2_pretrain/train/2026-07-16/20-59-53_InsertCylinder-3Arms-v0_pre_zed_dual_head_diffusion/checkpoints/162000_loss=0.0051_sr=87.0_ar=751.50/extra_eval_videos/eval_seed=1100_ep=200_sr=75.0_ar=691.14/episode_results.json'",
+        "run_name=quest_policy_InsertCylinder_fail_replay",   # 新旧重放批次写入同一 run
         "device=cuda",                                      # 策略推理设备
-        "env_id=guided_vision/InsertCylinder-3Arms-v0",     # 仿真任务；设为 null 时读取 checkpoint 配置
         "max_steps_per_episode=600",                        # 单条轨迹最大步数
         "fps=25",                                           # 控制、记录与视频帧率
         "takeover_blend_steps=15",                          # 策略与人工接管的平滑过渡步数

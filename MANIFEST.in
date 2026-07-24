@@ -1,1 +1,4 @@
 recursive-include env/assets *
+recursive-include lerobot *.md *.txt *.yaml
+include lerobot/LICENSE
+global-exclude __pycache__ *.py[cod]

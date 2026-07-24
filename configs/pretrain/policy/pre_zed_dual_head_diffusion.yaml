@@ -19,8 +19,8 @@ training:
   lr_warmup_steps: 5000      # 预热步数：模型刚开始是白纸，用 500 步慢慢把学习率升到 1e-4，防止梯度爆炸，一般设置为总步数的1-5%
   offline_steps: 200000      # 离线训练总步数
   online_steps: 0
-  save_freq: 100         # 每 5000 步保存一次模型快照
-  eval_freq: 100         # 每 5000 步评估一次
+  save_freq: 2000         # 每 5000 步保存一次模型快照
+  eval_freq: 2000         # 每 5000 步评估一次
   save_checkpoint: true
   num_workers: 4   # Number of workers for the offline training dataloader.
   batch_size: 32
@@ -54,8 +54,8 @@ policy:
   # 1. 形状与时序 (Shape & Temporal)
   # ==========================================
   n_obs_steps: 2 # 2帧历史画面
-  horizon : 16 # 推理总步数   一个horizon视为一个动作块
-  n_action_steps: 8 # 执行的实际步数
+  horizon : 32 # 推理总步数   一个horizon视为一个动作块
+  n_action_steps: 16 # 执行的实际步数
 
   resize_shape: [240,320]
   crop_shape: [216, 288] # ch, cw 480x640 90% [432, 576]  [216, 288]

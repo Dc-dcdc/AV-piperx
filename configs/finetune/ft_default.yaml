@@ -3,6 +3,7 @@
 # 🌟 核心：告诉 Hydra 去哪里拉取基础配置
 defaults:
   - _self_                      # 允许本文件覆盖上面的默认值
+  - env: sim_insert_cylinder_3arms
   - policy: ft_zed_wrist_diffusion
 
 resume: false
@@ -13,7 +14,7 @@ hydra:
   run:
     dir: outputs/3_finetune/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
   job:
-    name: ${env.task}_${hydra.runtime.choices.policy}_${now:%Y-%m-%d}_${now:%H-%M-%S}
+    name: ${hydra.runtime.choices.policy}_${now:%Y-%m-%d}_${now:%H-%M-%S}
 
 training:
   pretrained_ckpt_path: "outputs/2_pretrain/train/.../checkpoints/050000"

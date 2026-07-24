@@ -6,7 +6,8 @@ fps: 25
 eval:
   # PiperX 仿真环境建议先关闭异步环境，避免 MuJoCo/渲染上下文冲突。
   use_async_envs: false
-
+  max_steps: ${env.episode_length}
+  
 env:
   name: guided_vision
   task: InsertCylinder-3Arms-v0
@@ -14,6 +15,3 @@ env:
   action_dim: 20
   fps: ${fps}
   episode_length: 400
-
-wandb:
-  project: ${env.task}_finetune

@@ -25,7 +25,6 @@ training:
   online_steps: 0
   eval_freq: 1000
   save_freq: 1000
-  log_freq: 100
   save_checkpoint: true
   num_workers: 4          #子进程数量，提高GPU利用率
   batch_size: 16

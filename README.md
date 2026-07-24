@@ -1,20 +1,22 @@
 # AV-piper
 ## 环境配置
 conda env create -f environment.yml
+conda activate AV-piper
 pip install -e .
-去lerobot项目代码下执行：
-pip install -e .
+
+项目使用的本地修改版 LeRobot 已迁入 `AV-piper/lerobot`，不再需要安装外部lerobot仓库。
 
 
 先用扩散模型预训练并使用强化学习PPO算法进行微调
 
 ## 当前状态速览
 
-本项目当前只保留松灵 PiperX 三臂圆柱插入主线。`guided_vision/InsertCylinder-3Arms-v0` 是唯一推荐入口，默认加载 `env/assets/task_insert_cylinder_piper.xml`，再包含 `piperx_scene.xml` 和 `piperx_sim.xml`。
+本项目提供松灵 PiperX 三臂圆柱插入和缝合针穿引两个任务。两个任务共用 `piperx_scene.xml`、`piperx_sim.xml` 以及同一套 20 维机器人状态/动作接口。
 
 | 类型 | Gym 环境 ID | 主要 XML/入口 | 说明 |
 |---|---|---|---|
 | PiperX 圆柱插入 | `guided_vision/InsertCylinder-3Arms-v0` | `env/assets/task_insert_cylinder_piper.xml` -> `piperx_scene.xml` -> `piperx_sim.xml` | 当前主入口 |
+| PiperX 缝合针穿引 | `guided_vision/SewNeedle-3Arms-v0` | `env/assets/task_sew_needle.xml` -> `piperx_scene.xml` -> `piperx_sim.xml` | 可通过 Hydra 任务配置选择 |
 
 
 ## 快速验证命令
@@ -39,6 +41,45 @@ pip install -e .
 
 `quest_teleop_collect.py` 直接运行时会读取 yaml 配置，同时底部 `default_args` 也会补默认参数；实际采集前建议在命令行中显式写出 `env_id`、`head_control`、`record_cameras` 和保存选项。
 
+缝合针任务可使用以下覆盖参数：
+
+```bash
+# Quest 映射和 IK 小步测试
+/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/quest_mujoco_test.py \
+  env_id=guided_vision/SewNeedle-3Arms-v0
+
+# Quest 正式采集
+/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/quest_teleop_collect.py \
+  env_id=guided_vision/SewNeedle-3Arms-v0
+
+# 策略 + Quest 接管采集；环境默认从 checkpoint 配置读取
+/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/quest_policy_collect.py \
+  ckpt_path=/path/to/sew_needle/checkpoint
+
+# 使用缝合针环境配置进行预训练
+/home/dc/miniforge3/envs/AV-piper/bin/python train/pretrain/train_pretrain.py \
+  env=sim_sew_needle_3arms seed=1000
+
+# 使用通用 ZED Diffusion 策略和缝合针环境配置进行 DPPO 微调
+/home/dc/miniforge3/envs/AV-piper/bin/python train/finetune/finetune_dppo.py \
+  env=sim_sew_needle_3arms policy=ft_zed_diffusion \
+  training.pretrained_ckpt_path=/path/to/sew_needle/checkpoint
+```
+
+`sim_sew_needle_3arms.yaml` 要求数据集中的 `observation.state` 和 `action` 都是 20 维；旧 Aloha 三臂 21 维数据不能直接用于当前 PiperX 环境。
+
+原始采集数据转换和上传时应显式使用缝合针目录与仓库名，避免沿用脚本中的圆柱任务默认路径：
+
+```bash
+/home/dc/miniforge3/envs/AV-piper/bin/python hugging_face/convert_data_to_hf.py \
+  --raw-dir outputs/4_data_collect/quest_teleop/quest_teleop_SewNeedle-3Arms-v0_rgb \
+  --output-dir outputs/5_hf_datasets/quest_teleop_sew_needle_3arms_rgb_joint
+
+/home/dc/miniforge3/envs/AV-piper/bin/python hugging_face/push_data_to_hf.py \
+  --local-dir outputs/5_hf_datasets/quest_teleop_sew_needle_3arms_rgb_joint \
+  --repo-id USER/quest_teleop_sew_needle_3arms_rgb_joint
+```
+
 ## ✨ Pretrain部分
 1. 训练代码位于 `train/pretrain/train_pretrain.py`，训练对应的配置参数位于`configs/pretrain/policy`，训练不同的任务时，需要注意修改`train_pretrain.py`中的`env`(决定场景)和`policy`(决定训练策略：ACT、diffusion)。
 2. 模型快照和评估视频储存的默认位置位于`configs/pretrain/pre_default.yaml`中的hydra.run.dir,这是相对于该项目（AV-piper）的相对保存位置，注意命令行的运行位置，否则会存到其他地方，wandb的保存文件名为hydra.run.job。
@@ -46,18 +87,19 @@ pip install -e .
 4. 评估代码位于`train/pretrain/eval_policy.py`，输入模型快照的路径即可，会自动读取训练时使用的policy配置参数，可以在`eval_policy.py`设置`render_camera=['overhead_cam']`来设置录制视频的视角。
 5. 值得注意的是，这里使用项目内置的 lerobot 代码，换设备训练时需确认依赖版本一致，后期可以更新为官方版本。
 ## ✨ Finetune部分
-1. 微调代码位于`train/finetune/train_finetune.py`，输入模型快照的路径即可，会自动读取训练时使用的policy配置参数
-2. 为了适配评估代码`train/pretrain/eval_policy.py`，保存权重的同时生成了对应的训练参数配置表`config.yaml`和`config.json`
+1. 微调环境配置位于 `configs/finetune/env`，策略配置位于 `configs/finetune/policy`；通过 `env=sim_insert_cylinder_3arms` 或 `env=sim_sew_needle_3arms` 独立选择任务。
+2. 各 policy 只保留算法参数及 `env.n_envs` 并行规模覆盖，环境名称、任务、状态/动作维度、帧率、回合长度和 rollout 数据标识统一由 env 配置提供。
+3. 微调代码位于 `train/finetune`；输入模型快照路径后，保存权重时会同时生成供评估使用的 `config.yaml` 和 `config.json`。
 
 
 ## ✨ sim_env部分
 1. 添加了模型推理部分，可以添加训练好的模型进行在线仿真推理，可以修改display_cameras参数获取要单独渲染的相机视角，一行两个进行排布。此外还可以通过修改代码中SIM_DT为具体值，从而实现慢速的观测效果。
 
 ## ✨ PiperX/松灵主线
-1. PiperX 仿真 XML 位于 `env/assets/piperx_sim.xml`，场景文件为 `env/assets/piperx_scene.xml`，圆柱任务入口为 `env/assets/task_insert_cylinder_piper.xml`。
-2. 当前 PiperX 主入口使用 `guided_vision/InsertCylinder-3Arms-v0`。左臂 7 维、右臂 7 维、中间臂 6 轴，总动作维度 `20`，动作切片为 `left[0:7] + right[7:14] + middle[14:20]`。
+1. PiperX 仿真 XML 位于 `env/assets/piperx_sim.xml`，场景文件为 `env/assets/piperx_scene.xml`，任务入口分别为 `env/assets/task_insert_cylinder_piper.xml` 和 `env/assets/task_sew_needle.xml`。
+2. PiperX 环境入口为 `guided_vision/InsertCylinder-3Arms-v0` 和 `guided_vision/SewNeedle-3Arms-v0`。左臂 7 维、右臂 7 维、中间臂 6 轴，总动作维度 `20`，动作切片为 `left[0:7] + right[7:14] + middle[14:20]`。
 3. 关节、执行器和末端 site 名称需要继续和 `env/constants.py` 对齐，例如 `left_gripper_control`、`right_gripper_control`、`middle_zed_camera_center`。
-4. 圆柱入口使用 `InsertCylinderEnv`，默认加载 `task_insert_cylinder_piper.xml`，并支持 `enable_reward_debug`；正式训练或采集前应先用 `data_collect/quest_mujoco_test.py` 做 Quest 映射和 IK 小步测试。
+4. 圆柱入口使用 `InsertCylinderEnv`，缝合针入口使用 `SewNeedleEnv`，两者都支持 `enable_reward_debug`；正式训练或采集前应先用 `data_collect/quest_mujoco_test.py` 做 Quest 映射和 IK 小步测试。
 
 ## ✨ data_collect部分
 ### 1. 脚本说明

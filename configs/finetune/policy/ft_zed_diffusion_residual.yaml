@@ -4,11 +4,8 @@
 # python train/finetune/finetune_residual.py policy=ft_zed_diffusion_residual --cfg job
 
 seed: 1000  # 随机种子
-dataset_repo_id: "av_piper_residual_rollout"  # Logger 数据集标识
 
 env:
-  name: guided_vision  # Gym 环境命名空间
-  task: InsertCylinder-3Arms-v0  # 任务名称
   n_envs: 10  # 并行环境数量
 
 training:

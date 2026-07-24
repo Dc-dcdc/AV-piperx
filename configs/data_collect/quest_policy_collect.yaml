@@ -7,7 +7,13 @@ defaults:
 # ===== 1. 策略与推理设备 =====
 ckpt_path: outputs/2_pretrain/train/
 device: cuda
-random_seed: 100
+random_seed: 1000         # 进程基础 seed；每个采集 attempt 会派生不同的环境 seed
+seed_mode: replay         # sequential: 派生新 seed；replay: 直接重放测评 seed
+replay_seed_file: null    # replay 模式必填；支持 episode_results.json 或 JSON seed 列表
+replay_failed_only: true  # episode_results.json 中只重放 success=false 的条目
+replay_repeat: 1          # 每个 seed 连续重放次数
+replay_policy_rng: true   # env.reset 后同步策略 RNG，对齐单环境评估的扩散采样
+replay_on_exhausted: stop  # stop: 队列结束后退出；loop: 循环重放
 
 # ===== 2. Quest3 位姿通信 =====
 host: 0.0.0.0
@@ -16,7 +22,7 @@ timeout: 0.0  # 非阻塞读取，未收到新包时继续使用上一帧
 
 # ===== 3. 数据保存 =====
 output_dir: outputs/4_data_collect/quest_policy
-run_name: null
+run_name: insert_dual_head
 append: true
 fps: 25
 save_rgb: true

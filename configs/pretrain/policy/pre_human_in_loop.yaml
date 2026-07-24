@@ -1,0 +1,123 @@
+# @package _global_
+
+# Human-in-the-loop / Intervention Weighted Regression 配置。
+# D_I 与 D_R 都来自同一个完整 policy+human rollout 数据集；原始专家数据只作为
+# 可选的第三路 replay，不再替代机器人 on-policy 数据 D_R。
+
+seed: 1000
+
+dataset_local_dir: outputs/5_hf_datasets/quest_teleop_insert_cylinder_3arms_rgb_joint
+hil_dataset_local_dir: outputs/5_hf_datasets/quest_policy_insert_cylinder_hil_full_rollout_rgb_joint
+dataset_repo_id: Dc-dc/quest_teleop_insert_cylinder_3arms_rgb_joint
+
+# 首次 HIL 必须从专家 checkpoint 初始化。这里默认使用采集这 20 条干预数据时
+# 实际运行的专家策略；可用 pretrained_model_path=<路径> 覆盖。
+pretrained_model_path: "outputs/2_pretrain/train/2026-07-16/20-59-53_InsertCylinder-3Arms-v0_pre_zed_dual_head_diffusion/checkpoints/162000_loss=0.0051_sr=87.0_ar=751.50"
+
+# resume 只用于继续已有 HIL run；此时从 resume_path 恢复模型、优化器、调度器和 step。
+resume: false
+resume_path: none
+
+wandb:
+  project: ${env.task}_human_in_loop
+
+training:
+  # 20 条 HIL rollout 先短训并高频评估，避免破坏 87% 的预训练策略。
+  offline_steps: 10000
+  online_steps: 0
+
+  iwr:
+    enabled: true
+    # 固定来源配额、来源内部随机采样；当前使用 D_I + 原始专家 replay。
+    intervention_batch_size: 16     # 每批次从 D_I 采样的干预片段帧数
+    robot_batch_size: 0            # 每批次从 D_R 采样的机器人自主片段帧数
+    expert_batch_size: 16          # 每批次从 D_E 采样的原始专家片段帧数
+    intervention_loss_weight: 0.5  # 人类干预数据权重
+    robot_loss_weight: 0           # D_R 未启用时该值不生效
+    expert_loss_weight: 0.5        # 原始专家数据权重
+    # 只有逐 action 人工权重大于该阈值的当前帧才进入 D_I。
+    min_intervention_weight: 1.0e-6
+    # 新采集数据优先使用平滑混合前 teleop_action；旧数据自动回退到 executed action。
+    prefer_teleop_action: true
+    # D_I 始终监督完整 20 维 action；该值只额外增强人工控制维度。
+    # 1.0 表示所有维度等权，2.0 表示完全接管时人工维度权重为 2。
+    human_action_weight: 1.0
+
+  lr_scheduler: "cosine"
+  lr_warmup_steps: 100
+  save_freq: 1000
+  eval_freq: 1000
+  save_checkpoint: true
+  num_workers: 4
+  batch_size: 32
+
+  # HIL 补训通常从专家 checkpoint 初始化，因此学习率比从零预训练更保守。
+  lr: 1.0e-6
+  lr_backbone: 0
+  adam_betas: [0.95, 0.999]
+  adam_eps: 1.0e-8
+  weight_decay: 1.0e-6
+  grad_clip_norm: 10
+  online_steps_between_rollouts: 1
+
+  delta_timestamps:
+    action: "[i / ${env.fps} for i in range(${policy.horizon})]"
+    teleop_action: "[i / ${env.fps} for i in range(${policy.horizon})]"
+    teleop_action_available: "[i / ${env.fps} for i in range(${policy.horizon})]"
+    is_intervention: "[i / ${env.fps} for i in range(${policy.horizon})]"
+    intervention_action_mask: "[i / ${env.fps} for i in range(${policy.horizon})]"
+    intervention_action_weight: "[i / ${env.fps} for i in range(${policy.horizon})]"
+    observation.state: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.zed_cam_left: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.zed_cam_right: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+
+policy:
+  # 必须与产生本批人类干预数据的专家 checkpoint 完全一致。
+  name: dual_head_diffusion
+  do_mask_loss_for_padding: true
+
+  arm_action_dim: 14
+  view_action_dim: 6
+  view_loss_weight: 0.5
+
+  n_obs_steps: 2
+  horizon: 16
+  n_action_steps: 8
+
+  resize_shape: [240, 320]
+  crop_shape: [216, 288]
+  crop_is_random: true
+  input_shapes:
+    observation.images.zed_cam_left: [3, 480, 640]
+    observation.images.zed_cam_right: [3, 480, 640]
+    observation.state: ["${env.state_dim}"]
+  output_shapes:
+    action: ["${env.action_dim}"]
+
+  input_normalization_modes:
+    observation.images.zed_cam_left: mean_std
+    observation.images.zed_cam_right: mean_std
+    observation.state: mean_std
+  output_normalization_modes:
+    action: min_max
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+  use_group_norm: false
+  spatial_softmax_num_keypoints: 32
+
+  down_dims: [128, 256, 512]
+  kernel_size: 5
+  n_groups: 8
+  diffusion_step_embed_dim: 128
+  use_film_scale_modulation: true
+
+  noise_scheduler_type: DDIM
+  num_inference_steps: 10
+  num_train_timesteps: 100
+  beta_schedule: squaredcos_cap_v2
+  beta_start: 0.0001
+  beta_end: 0.02
+  prediction_type: epsilon
+  clip_sample: true
+  clip_sample_range: 1.0

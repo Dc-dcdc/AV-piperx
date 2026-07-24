@@ -4,20 +4,16 @@
 # python train/finetune/finetune_dppo.py policy=ft_zed_diffusion --cfg job
 
 seed: 1000
-dataset_repo_id: "av_piper_dppo_zed_rollout"
 
 env:
-  name: guided_vision
-  task: InsertCylinder-3Arms-v0
   n_envs: 2
 
 training:
-  pretrained_ckpt_path: "outputs/2_pretrain/train/2026-06-26/17-07-44_InsertCylinder-3Arms-v0_pre_zed_diffusion/checkpoints/148000_loss=0.0026_sr=0.0_ar=387.35"
-
+  pretrained_ckpt_path: null
   n_train_itr: 1000
   n_critic_warmup_itr: 2
   rollout_steps: 800
-  batch_size: 32
+  batch_size: 16
   update_epochs: 10
 
   actor_lr: 1e-7
@@ -37,7 +33,7 @@ training:
   clip_ploss_coef_base: 0.001
   clip_ploss_coef_rate: 3.0
   gamma_denoising: 0.99
-  target_kl: 0.1
+  target_kl: 1e-4
   bc_coef: 0.0             # BC 正则/teacher 约束；设为0可对齐原版图像UNet DPPO
 
   reward_source: "binary_success_label"
@@ -47,14 +43,14 @@ training:
   clip_advantage_lower_quantile: 0.05
   clip_advantage_upper_quantile: 0.95
 
-  min_sampling_denoising_std: 0.02   # DDIM采样探索标准差；越大探索性越强
-  min_logprob_denoising_std: 0.02    # 与采样标准差保持一致，避免old/new logprob尺度不匹配
+  min_sampling_denoising_std: 0.01   # DDIM采样探索标准差；越大探索性越强
+  min_logprob_denoising_std: 0.01    # 与采样标准差保持一致，避免old/new logprob尺度不匹配
   ddim_eta: 0.0                      # 原版DPPO DDIM随机性系数，mu中会使用sigma项
   randn_clip_value: 3.0              # 原版DPPO采样噪声裁剪范围
   logprob_reduction: mean
   use_disk_cache: true
   disk_cache_dir: "outputs/buffer/finetune_dppo"
-  grad_accumulate: 16                 # 梯度累计步数
+  grad_accumulate: 32                 # 梯度累计步数  16*32=512
   post_update_probe_size: 256
   rollout_policy: dppo
   skip_update: false

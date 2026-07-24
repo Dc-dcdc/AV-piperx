@@ -34,6 +34,7 @@ for path in (ROOT_DIR, DATA_COLLECT_DIR):
 from quest_receive import QuestReceive
 from quest_send import UnityImageStreamer
 from quest_control import QuestControl
+from data_collect.quest_pose_filter import QuestPoseActionFilter, QuestPoseFilterConfig
 from data_collect.robot_ik_solver import PoseActionIKSolver
 from headset_utils import HeadsetData
 
@@ -601,6 +602,7 @@ def finish_episode(
 
 # 打印采集脚本启动信息和按键说明。
 def _print_header(cfg: DictConfig, run_dir: Path, record_cameras: list[str]) -> None:
+    pose_filter_cfg = cfg.get("pose_filter", {})
     print("\nQuest3 -> MuJoCo teleop data collection")
     print("-" * 78)
     print("Config:        configs/data_collect/quest_teleop_collect.yaml")
@@ -614,6 +616,7 @@ def _print_header(cfg: DictConfig, run_dir: Path, record_cameras: list[str]) -> 
     print(f"Save depth:    {'on' if cfg.save_depth else 'off'}")
     print(f"Reward debug:  {'on' if cfg.get('save_reward_debug', False) else 'off'}")
     print(f"Depth window:  {'on' if cfg.depth_window else 'off'}")
+    print(f"Pose filter:   {'on' if pose_filter_cfg.get('enabled', True) else 'off'}")
     print(f"FPS:           {cfg.fps}")
     print(f"Loop limit:    {1000.0 / float(cfg.fps):.1f} ms")
     print(f"Unity stream:  {'on' if cfg.unity_image_stream else 'off'}")
@@ -649,6 +652,11 @@ def _refresh_latest_quest_data(receiver: QuestReceive, fallback: HeadsetData | N
 def run(cfg: DictConfig) -> None:
     if float(cfg.fps) <= 0:
         raise ValueError(f"fps must be positive, got {cfg.fps}.")
+    pose_filter_config = QuestPoseFilterConfig.from_mapping(
+        cfg.get("pose_filter", {}),
+        fps=float(cfg.fps),
+    )
+    pose_action_filter = QuestPoseActionFilter(pose_filter_config)
     loop_period = 1.0 / float(cfg.fps)
     max_loop_ms = loop_period * 1000.0  # 实际最大的loop时长
     loop_timeout_margin_ms = 20.0       # 给予一定的缓冲时长
@@ -688,6 +696,8 @@ def run(cfg: DictConfig) -> None:
         "save_videos": bool(cfg.save_rgb and cfg.save_videos),
         "save_depth": bool(cfg.save_depth),
         "save_reward_debug": bool(cfg.get("save_reward_debug", False)),
+        "pose_action_semantics": "filtered_quest_target_pose",
+        "pose_filter": pose_filter_config.to_dict(),
         "video_save_mode": "replay_after_success_confirm",
         "render_width": int(cfg.render_width),
         "render_height": int(cfg.render_height),
@@ -705,8 +715,8 @@ def run(cfg: DictConfig) -> None:
         "observation_height": cfg.render_height,
         "observation_width": cfg.render_width,
     }
-    if str(cfg.env_id) == "guided_vision/InsertCylinder-3Arms-v0":
-        env_make_kwargs["enable_reward_debug"] = bool(cfg.get("save_reward_debug", False))
+    if bool(cfg.get("save_reward_debug", False)):
+        env_make_kwargs["enable_reward_debug"] = True
 
     env_obj = gym.make(cfg.env_id, **env_make_kwargs)
     sim_env = env_obj.unwrapped
@@ -886,6 +896,7 @@ def run(cfg: DictConfig) -> None:
                         obs, _ = env_obj.reset()
                         ik_solver.reset()
                         quest_control.reset()
+                        pose_action_filter.reset()
                         recording = False
                         waiting_success_confirm = False
                         skip_recording_this_loop = False
@@ -903,6 +914,7 @@ def run(cfg: DictConfig) -> None:
                     obs, _ = env_obj.reset()
                     ik_solver.reset()
                     quest_control.reset()
+                    pose_action_filter.reset()
                     recording = False
                     waiting_success_confirm = False
                     skip_recording_this_loop = False
@@ -940,6 +952,7 @@ def run(cfg: DictConfig) -> None:
                         if active_count > 0:
                             left_pose, right_pose, middle_pose = ik_solver.current_three_arm_poses()
                             quest_control.start(latest_data, middle_pose, left_pose, right_pose)
+                            pose_action_filter.reset()
                             episode_buffer = start_episode(run_dir, episode_index)
                             episode_buffer.initial_time = float(physics.data.time)
                             episode_buffer.initial_qpos = physics.data.qpos.copy()
@@ -962,6 +975,10 @@ def run(cfg: DictConfig) -> None:
                     left_pose, right_pose, middle_pose = ik_solver.current_three_arm_poses()
                     timing_t1 = time.perf_counter()
                     pose_action, latest_feedback = quest_control.run(latest_data, left_pose, right_pose, middle_pose)
+                    pose_action = pose_action_filter.filter(
+                        pose_action,
+                        timestamp=time.monotonic(),
+                    )
                     timing_t2 = time.perf_counter()
                     joint_action, active_count = ik_solver.pose2joint(pose_action, obs_before)
                     timing_t3 = time.perf_counter()
@@ -1034,6 +1051,7 @@ def run(cfg: DictConfig) -> None:
                             obs, _ = env_obj.reset()
                             ik_solver.reset()
                             quest_control.reset()
+                            pose_action_filter.reset()
                             recording = False
                             waiting_success_confirm = False
                             skip_recording_this_loop = False
@@ -1209,6 +1227,7 @@ def run(cfg: DictConfig) -> None:
                             obs, _ = env_obj.reset()
                             ik_solver.reset()
                             quest_control.reset()
+                            pose_action_filter.reset()
                             recording = False
                             waiting_success_confirm = False
                             skip_recording_this_loop = False
@@ -1288,7 +1307,6 @@ def quest_teleop_collect_cli(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     default_args = [
-        "env_id=guided_vision/InsertCylinder-3Arms-v0",
         "max_steps_per_episode=400",                  # 最大步长
         "head_control=true",                          # 是否使用头显控制中间臂
         "lock_pitch=False",                            # 是否锁定中间臂 pitch 角，true 时禁用抬头低头

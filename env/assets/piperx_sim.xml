@@ -329,7 +329,7 @@
     <joint name="left_gripper_mimic" joint1="left_right_finger" joint2="left_left_finger" polycoef="0 1 0 0 0"/>
     <joint name="right_gripper_mimic" joint1="right_left_finger" joint2="right_right_finger" polycoef="0 1 0 0 0"/>
   </equality>
-
+<!-- 控制力 ≈ kp × (目标位置 - 当前位置) - kv × 当前速度 -->
   <actuator>
     <position name="left_waist" joint="left_waist" ctrllimited="true" ctrlrange="-2.6179938 2.6179938" kp="80" kv="5" forcerange="-100 100"/>
     <position name="left_shoulder" joint="left_shoulder" ctrllimited="true" ctrlrange="0 3.1415926" kp="80" kv="5" forcerange="-100 100"/>

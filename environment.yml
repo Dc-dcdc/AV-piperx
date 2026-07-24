@@ -216,7 +216,7 @@ dependencies:
       - itsdangerous==2.2.0
       - jedi==0.19.2
       - labmaze==1.0.6
-      # - lerobot==0.1.0
+      # LeRobot 0.1.0 的本地修改版已 vendoring 到项目的 ./lerobot，随 AV-piper 一起安装。
       - llvmlite==0.46.0
       - lxml==6.0.2
       - markdown-it-py==4.0.0

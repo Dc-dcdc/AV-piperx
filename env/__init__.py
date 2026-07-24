@@ -13,6 +13,15 @@ ENVS = {
         "observation_width": 640,
         "init_config": "insert_cylinder",
     },
+    "guided_vision/SewNeedle-3Arms-v0": {
+        "entry_point": "env.task.sew_needle_env:SewNeedleEnv",
+        "num_arms": 3,
+        "episode_length": 350,
+        "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
+        "observation_height": 480,
+        "observation_width": 640,
+        "init_config": "sew_needle",
+    },
 }
 
 

@@ -307,7 +307,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="加载指定 Gym 任务环境或 MuJoCo XML，并拼接显示指定相机画面。")
     parser.add_argument(
         "--env-id",
-        default="guided_vision/InsertCylinder-3Arms-v0",
+        default="guided_vision/SewNeedle-3Arms-v0",
         help="要加载的 Gym 环境 ID。默认加载插圆柱任务；传空字符串并指定 --xml 可直接查看 XML。",
     )
     parser.add_argument(

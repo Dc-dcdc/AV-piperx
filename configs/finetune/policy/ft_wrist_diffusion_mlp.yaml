@@ -4,11 +4,8 @@
 # python train/finetune/test_finetune.py --cfg job
 
 seed: 1000
-dataset_repo_id: "av_piper_online_rollout"
 
 env:
-  name: guided_vision
-  task: InsertCylinder-3Arms-v0
   # 调试建议先用单环境，确认 MLP/PPO 链路无误后再改成 5。
   n_envs: 1
 
@@ -22,7 +19,7 @@ training:
   # RL 训练步数与采样规模。单环境 rollout_steps=400 约等于原 5 环境 * 80 chunk 的总样本量。
   n_train_itr: 1000
   rollout_steps: 400
-  batch_size: 16
+  batch_size: 32
   update_epochs: 2
 
   # 后置 MLP 是唯一被 PPO 更新的 actor 部分，可以比直接微调 Diffusion 稍大一点。
