@@ -10,7 +10,7 @@ port: 5005  # Quest3 数据接收端口
 timeout: 0.05  # socket 超时阈值，单位秒
 
 # ===== 2. 数据保存 =====
-output_dir: outputs/4_data_collect/quest_teleop  # 采集数据输出根目录
+output_dir: outputs/4_data_collect/quest_teleop_2  # 采集数据输出根目录
 run_name: null     # 本次采集名称，null 表示按任务名自动生成
 append: true       # 是否追加到已有 run_name 目录，同一任务默认写入同一数据集
 fps: 25            # 数据采集、时间戳和相机视频帧率
@@ -51,7 +51,7 @@ start_on_first_packet: false  # 是否在首帧有效 Quest 数据到达后启�
 # ===== 4. Quest 位姿平滑与防抖 =====
 pose_filter:
   enabled: true                 # 是否在 Quest 位姿映射后、IK 求解前启用滤波
-  position_min_cutoff: 1.5      # One Euro 静止时截止频率；越小越平滑，但延迟越大
+  position_min_cutoff: 1.0      # One Euro 静止时截止频率；越小越平滑，但延迟越大
   position_beta: 0.08           # One Euro 速度自适应系数；越大则快速运动时响应越快
   position_d_cutoff: 1.0        # One Euro 速度估计的截止频率
   rotation_alpha: 0.35          # 四元数 SLERP 中当前帧权重，范围 (0, 1]

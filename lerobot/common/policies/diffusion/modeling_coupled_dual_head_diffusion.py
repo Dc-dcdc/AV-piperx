@@ -226,6 +226,14 @@ class CoupledDualHeadDiffusionModel(DualHeadDiffusionModel):
         )
         self.coupling_use_ffn = bool(getattr(config, "coupling_use_ffn", False))
         coupling_ffn_ratio = float(getattr(config, "coupling_ffn_ratio", 2.0))
+        coupling_active_max_timestep = getattr(
+            config, "coupling_active_max_timestep", None
+        )
+        self.coupling_active_max_timestep = (
+            None
+            if coupling_active_max_timestep is None
+            else int(coupling_active_max_timestep)
+        )
         self.view_to_arm_coupling_scale = 1.0
         self.arm_to_view_coupling_scale = 1.0
         self.set_coupling_scales(
@@ -251,10 +259,12 @@ class CoupledDualHeadDiffusionModel(DualHeadDiffusionModel):
             "balanced_lookahead",
             "rcla",
             "bidirectional_prefix_to_suffix",
+            "bidirectional_half_prefix_to_suffix",
         }:
             raise ValueError(
                 "coupling_mode必须为'full'、'rbac'、'balanced_lookahead'、'rcla'或"
-                "'bidirectional_prefix_to_suffix'，当前为"
+                "'bidirectional_prefix_to_suffix'、"
+                "'bidirectional_half_prefix_to_suffix'，当前为"
                 f"{self.coupling_mode!r}"
             )
         if self.coupling_block_type not in {"scalar_gate", "role_adaln_zero"}:
@@ -376,14 +386,14 @@ class CoupledDualHeadDiffusionModel(DualHeadDiffusionModel):
     def _resolve_balanced_lookahead_token_slices(
         token_count: int,
     ) -> tuple[slice, slice]:
-        """把瓶颈token等分为当前前缀和未来后缀。
+        """把瓶颈token等分为前缀和后缀，供两个等分路由复用。
 
         等长切分让两个方向都是N×N注意力，避免RBAC在4-token瓶颈上退化为
-        单个future key；future仅作为前瞻信息，耦合残差只写回current前缀。
+        单个future key；具体读取方向和写回位置由coupling_mode决定。
         """
         if token_count < 2 or token_count % 2 != 0:
             raise ValueError(
-                "balanced_lookahead要求不少于2个且数量为偶数的瓶颈token，当前为"
+                "等分前后半段路由要求不少于2个且数量为偶数的瓶颈token，当前为"
                 f"{token_count}"
             )
         split = token_count // 2
@@ -479,6 +489,12 @@ class CoupledDualHeadDiffusionModel(DualHeadDiffusionModel):
             view_mask[:, suffix] = 1
             return arm_mask, view_mask
 
+        if self.coupling_mode == "bidirectional_half_prefix_to_suffix":
+            _, suffix = self._resolve_balanced_lookahead_token_slices(token_count)
+            arm_mask[:, suffix] = 1
+            view_mask[:, suffix] = 1
+            return arm_mask, view_mask
+
         current, _ = self._resolve_balanced_lookahead_token_slices(token_count)
         arm_mask[:, current] = 1
         view_mask[:, current] = 1
@@ -555,6 +571,31 @@ class CoupledDualHeadDiffusionModel(DualHeadDiffusionModel):
             arm_context[:, suffix] = future_view_context
             return view_context, arm_context
 
+        if self.coupling_mode == "bidirectional_half_prefix_to_suffix":
+            prefix, suffix = self._resolve_balanced_lookahead_token_slices(
+                normalized_arm.shape[1]
+            )
+            # Arm后缀[2,3]中的每个Query加权读取View前缀{0,1}。
+            future_arm_context, _ = self.view_to_arm_attention(
+                query=normalized_arm[:, suffix],
+                key=normalized_view[:, prefix],
+                value=normalized_view[:, prefix],
+                need_weights=False,
+            )
+            # View后缀[2,3]中的每个Query对称地加权读取Arm前缀{0,1}。
+            future_view_context, _ = self.arm_to_view_attention(
+                query=normalized_view[:, suffix],
+                key=normalized_arm[:, prefix],
+                value=normalized_arm[:, prefix],
+                need_weights=False,
+            )
+
+            view_context = torch.zeros_like(normalized_arm)
+            arm_context = torch.zeros_like(normalized_view)
+            view_context[:, suffix] = future_arm_context
+            arm_context[:, suffix] = future_view_context
+            return view_context, arm_context
+
         if self.coupling_mode == "rcla":
             view_to_arm_mask, arm_to_view_mask = self._build_rcla_attention_masks(
                 normalized_arm.shape[1], normalized_arm.device
@@ -614,6 +655,19 @@ class CoupledDualHeadDiffusionModel(DualHeadDiffusionModel):
         view_context[:, current] = current_arm_context
         arm_context[:, current] = current_view_context
         return view_context, arm_context
+
+    def _coupling_activation_mask(
+        self,
+        timesteps: Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> Tensor | None:
+        """返回低噪声耦合硬掩码[B,1,1]；None表示沿用全时间步耦合。"""
+        if self.coupling_active_max_timestep is None:
+            return None
+        return (
+            timesteps <= self.coupling_active_max_timestep
+        ).to(dtype=dtype).view(-1, 1, 1)
 
     @staticmethod
     def _as_timestep_batch(timestep: Tensor | int, sample: Tensor) -> Tensor:
@@ -700,6 +754,20 @@ class CoupledDualHeadDiffusionModel(DualHeadDiffusionModel):
                 f"arm={tuple(arm_tokens.shape)}, view={tuple(view_tokens.shape)}"
             )
 
+        # 反向扩散从大t走向小t；仅在t<=阈值时开放耦合残差。
+        # 推理时若整个batch都处于高噪声区，直接跳过Attention以节省计算，
+        # 并保证此时逐bit退化为原始独立双UNet瓶颈。
+        activation_mask = self._coupling_activation_mask(
+            timesteps,
+            dtype=arm_tokens.dtype,
+        )
+        if (
+            not self.training
+            and activation_mask is not None
+            and not bool(activation_mask.any())
+        ):
+            return arm_bottleneck, view_bottleneck
+
         # 位置编码只进入耦合分支；零门控时不会改变两个UNet的原始瓶颈。
         coupling_arm_tokens = arm_tokens
         coupling_view_tokens = view_tokens
@@ -735,6 +803,10 @@ class CoupledDualHeadDiffusionModel(DualHeadDiffusionModel):
         gates = torch.tanh(self.coupling_timestep_encoder(timesteps))
         arm_gate = gates[:, 0].view(-1, 1, 1)
         view_gate = gates[:, 1].view(-1, 1, 1)
+        if activation_mask is not None:
+            # g_eff(t)=1[t<=T_on] * g_learned(t)：高噪声样本不写入也不训练耦合残差。
+            arm_gate = arm_gate * activation_mask
+            view_gate = view_gate * activation_mask
         arm_tokens = arm_tokens + (
             self.view_to_arm_coupling_scale
             * arm_gate
@@ -762,6 +834,9 @@ class CoupledDualHeadDiffusionModel(DualHeadDiffusionModel):
                 device=arm_tokens.device,
                 dtype=arm_tokens.dtype,
             )
+            if activation_mask is not None:
+                arm_ffn_delta = arm_ffn_delta * activation_mask
+                view_ffn_delta = view_ffn_delta * activation_mask
             arm_tokens = arm_tokens + (
                 self.view_to_arm_coupling_scale
                 * arm_write_mask

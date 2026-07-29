@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from omegaconf import OmegaConf
 
-from train.finetune.dppo_logging import (
+from train.s3_finetune.dppo_logging import (
     add_wandb_parameter_tags,
     build_dppo_eval_metrics,
     build_dppo_train_metrics,

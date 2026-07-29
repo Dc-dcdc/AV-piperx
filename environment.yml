@@ -226,7 +226,7 @@ dependencies:
       - mkl-include==2024.0.0
       # mjlab==1.5.0 pulls mujoco~=3.10.0 and torch>=2.7.0, which breaks
       # the Gym/dm_control stack pinned below. Install mjlab in a separate env
-      # for train/finetune/*mjlab* workflows.
+      # for train/s3_finetune/*mjlab* workflows.
       # - mjlab==1.5.0
       - mujoco==3.5.0
       - multidict==6.7.1

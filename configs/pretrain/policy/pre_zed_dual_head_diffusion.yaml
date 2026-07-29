@@ -54,8 +54,8 @@ policy:
   # 1. 形状与时序 (Shape & Temporal)
   # ==========================================
   n_obs_steps: 2 # 2帧历史画面
-  horizon : 32 # 推理总步数   一个horizon视为一个动作块
-  n_action_steps: 16 # 执行的实际步数
+  horizon : 16 # 推理总步数   一个horizon视为一个动作块
+  n_action_steps: 8 # 执行的实际步数
 
   resize_shape: [240,320]
   crop_shape: [216, 288] # ch, cw 480x640 90% [432, 576]  [216, 288]
@@ -111,5 +111,5 @@ policy:
   # ==========================================
   # 5. 推理与 EMA (Inference & EMA)
   # ==========================================
-  use_ema: true                       # 【关键】必须开启,降低精度提升推理速度
-  ema_decay: 0.999                   # 【关键】EMA 的衰减系数
+  use_ema: true                       # 在线模型正常训练，EMA影子模型用于评估和部署
+  ema_update_after_step: 1000         # 到该步先精确复制online，之后才开始滑动平均

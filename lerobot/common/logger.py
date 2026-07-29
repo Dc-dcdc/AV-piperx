@@ -131,6 +131,7 @@ class Logger:
     """
 
     pretrained_model_dir_name = "pretrained_model"
+    online_pretrained_model_dir_name = "online_pretrained_model"
     training_state_file_name = "training_state.pth"
 
     def __init__(self, cfg: DictConfig, log_dir: str, wandb_job_name: str | None = None):
@@ -199,6 +200,13 @@ class Logger:
             )
             print(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
             logging.info(f"Track this run --> {colored(wandb.run.url, 'yellow', attrs=['bold'])}")
+            # 异步评估结果可能晚于对应checkpoint返回。W&B的全局step必须
+            # 单调递增，因此用独立的checkpoint_step作为所有eval指标横轴。
+            wandb.define_metric("eval/checkpoint_step")
+            wandb.define_metric(
+                "eval/*",
+                step_metric="eval/checkpoint_step",
+            )
             self._wandb = wandb
 
     @classmethod
@@ -244,6 +252,9 @@ class Logger:
         train_step: int,
         optimizer: Optimizer,
         scheduler: LRScheduler | None,
+        *,
+        grad_scaler=None,
+        ema_state: dict | None = None,
     ):
         """Checkpoint the global training_step, optimizer state, scheduler state, and random state.
 
@@ -256,6 +267,10 @@ class Logger:
         }
         if scheduler is not None:
             training_state["scheduler"] = scheduler.state_dict()
+        if grad_scaler is not None and grad_scaler.is_enabled():
+            training_state["grad_scaler"] = grad_scaler.state_dict()
+        if ema_state is not None:
+            training_state["ema"] = dict(ema_state)
         torch.save(training_state, save_dir / self.training_state_file_name)
 
     def save_checkpoint(
@@ -265,18 +280,52 @@ class Logger:
         optimizer: Optimizer,
         scheduler: LRScheduler | None,
         identifier: str,
+        *,
+        ema_policy: Policy | None = None,
+        ema_state: dict | None = None,
+        grad_scaler=None,
     ):
-        """Checkpoint the model weights and the training state."""
+        """Checkpoint model weights and training state.
+
+        启用EMA时，``pretrained_model``保存默认评估/部署的EMA权重，
+        ``online_pretrained_model``保存与optimizer对应、用于resume的在线权重。
+        """
         checkpoint_dir = self.checkpoints_dir / str(identifier)
         wandb_artifact_name = (
             None
             if self._wandb is None
             else f"{self._group.replace(':', '_').replace('/', '_')}-{self._cfg.seed}-{identifier}"
         )
-        self.save_model(
-            checkpoint_dir / self.pretrained_model_dir_name, policy, wandb_artifact_name=wandb_artifact_name
+        if ema_policy is None:
+            self.save_model(
+                checkpoint_dir / self.pretrained_model_dir_name,
+                policy,
+                wandb_artifact_name=wandb_artifact_name,
+            )
+        else:
+            self.save_model(
+                checkpoint_dir / self.pretrained_model_dir_name,
+                ema_policy,
+                wandb_artifact_name=wandb_artifact_name,
+            )
+            online_artifact_name = (
+                None
+                if wandb_artifact_name is None
+                else f"{wandb_artifact_name}-online"
+            )
+            self.save_model(
+                checkpoint_dir / self.online_pretrained_model_dir_name,
+                policy,
+                wandb_artifact_name=online_artifact_name,
+            )
+        self.save_training_state(
+            checkpoint_dir,
+            train_step,
+            optimizer,
+            scheduler,
+            grad_scaler=grad_scaler,
+            ema_state=ema_state,
         )
-        self.save_training_state(checkpoint_dir, train_step, optimizer, scheduler)
         os.symlink(checkpoint_dir.absolute(), self.last_checkpoint_dir)
 
     def load_last_training_state(self, optimizer: Optimizer, scheduler: LRScheduler | None) -> int:
@@ -300,17 +349,36 @@ class Logger:
         assert mode in {"train", "eval"}
         # TODO(alexander-soare): Add local text log.
         if self._wandb is not None:
+            payload = {}
             for k, v in d.items():
                 if not isinstance(v, (int, float, str)):
                     logging.warning(
                         f'WandB logging of key "{k}" was ignored as its type is not handled by this wrapper.'
                     )
                     continue
-                self._wandb.log({f"{mode}/{k}": v}, step=step)
+                payload[f"{mode}/{k}"] = v
 
-    def log_video(self, video_path: str, step: int, mode: str = "train"):
+            if mode == "eval":
+                # 同步评估默认等于当前step；异步评估可在d中显式传入
+                # checkpoint_step，从而与实际被评估的模型快照严格对齐。
+                payload.setdefault("eval/checkpoint_step", int(step))
+            if payload:
+                self._wandb.log(payload, step=step)
+
+    def log_video(
+        self,
+        video_path: str,
+        step: int,
+        mode: str = "train",
+        checkpoint_step: int | None = None,
+    ):
         assert mode in {"train", "eval"}
         assert self._wandb is not None
         # video_path 指向已编码的 MP4，实际帧率已写入文件元数据，W&B 会忽略额外的 fps 参数。
         wandb_video = self._wandb.Video(video_path, format="mp4")
-        self._wandb.log({f"{mode}/video": wandb_video}, step=step)
+        payload = {f"{mode}/video": wandb_video}
+        if mode == "eval":
+            payload["eval/checkpoint_step"] = int(
+                step if checkpoint_step is None else checkpoint_step
+            )
+        self._wandb.log(payload, step=step)

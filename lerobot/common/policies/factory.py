@@ -75,6 +75,27 @@ def get_policy_and_config_classes(name: str) -> tuple[Policy, object]:
         )
 
         return CoupledDualHeadDiffusionPolicy, DiffusionConfig
+    elif name == "post_diffusion_output_corrector":
+        from lerobot.common.policies.diffusion.configuration_post_diffusion_output_corrector import (
+            PostDiffusionOutputCorrectorConfig,
+        )
+        from lerobot.common.policies.diffusion.modeling_post_diffusion_output_corrector import (
+            PostDiffusionOutputCorrectorPolicy,
+        )
+
+        return PostDiffusionOutputCorrectorPolicy, PostDiffusionOutputCorrectorConfig
+    elif name == "routed_post_diffusion_output_corrector":
+        from lerobot.common.policies.diffusion.configuration_routed_post_diffusion_output_corrector import (
+            RoutedPostDiffusionOutputCorrectorConfig,
+        )
+        from lerobot.common.policies.diffusion.modeling_routed_post_diffusion_output_corrector import (
+            RoutedPostDiffusionOutputCorrectorPolicy,
+        )
+
+        return (
+            RoutedPostDiffusionOutputCorrectorPolicy,
+            RoutedPostDiffusionOutputCorrectorConfig,
+        )
     elif name == "two_model_diffusion":
         from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
         from lerobot.common.policies.diffusion.modeling_two_model_diffusion import TwoModelDiffusionPolicy

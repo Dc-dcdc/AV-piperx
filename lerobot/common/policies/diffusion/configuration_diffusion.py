@@ -109,7 +109,9 @@ class DiffusionConfig:
             to refine only the other head's current half. ``rcla`` applies role-causal local lag
             masks: Arm token i reads View tokens {i-1, i}, while View token i reads Arm tokens
             {i, i+1}. ``bidirectional_prefix_to_suffix`` lets each head's future suffix read only
-            the other head's prefix, leaving both prefixes unchanged.
+            the other head's execution-boundary prefix, leaving both prefixes unchanged.
+            ``bidirectional_half_prefix_to_suffix`` splits the bottleneck into equal halves, then
+            lets suffix tokens in each head read only the other head's prefix half.
         coupling_block_type: Conditioning block used around cross-head attention. ``scalar_gate``
             preserves the original LayerNorm plus scalar timestep gate. ``role_adaln_zero`` adds
             role-specific, timestep-conditioned adaptive LayerNorm with zero initialization.
@@ -118,6 +120,11 @@ class DiffusionConfig:
         coupling_use_ffn: Add a zero-gated, role-specific feed-forward residual after cross-head
             attention. This option requires ``coupling_block_type=role_adaln_zero``.
         coupling_ffn_ratio: Hidden-width multiplier of the optional coupling feed-forward network.
+        coupling_active_max_timestep: Inclusive maximum diffusion timestep at which coupling
+            residuals are enabled. ``None`` preserves coupling at every denoising step; an integer
+            ``T`` applies the hard low-noise mask ``1[t <= T]`` to Attention and optional FFN
+            residuals. Diffusion timesteps decrease during inference, so a smaller value activates
+            coupling only near the end of denoising.
         view_to_arm_coupling_scale: Ablation multiplier applied to the View-to-Arm coupling
             residual. ``0`` disables only View-to-Arm coupling.
         arm_to_view_coupling_scale: Ablation multiplier applied to the Arm-to-View coupling
@@ -188,6 +195,11 @@ class DiffusionConfig:
     # Loss computation
     do_mask_loss_for_padding: bool = False
 
+    # Exponential moving average used by the training entrypoint for evaluation/deployment.
+    use_ema: bool = False
+    ema_decay: float = 0.999
+    ema_update_after_step: int = 1000
+
     # Dual-head diffusion policy. These fields are ignored by the original single-head diffusion policy.
     arm_action_dim: int | None = None
     view_action_dim: int | None = None
@@ -199,6 +211,7 @@ class DiffusionConfig:
     coupling_use_temporal_pos_emb: bool = False
     coupling_use_ffn: bool = False
     coupling_ffn_ratio: float = 2.0
+    coupling_active_max_timestep: int | None = None
     view_to_arm_coupling_scale: float = 1.0
     arm_to_view_coupling_scale: float = 1.0
     scid_ridge: float = 1e-3
@@ -251,6 +264,21 @@ class DiffusionConfig:
             raise ValueError(f"`view_action_dim` must be positive or None. Got {self.view_action_dim}.")
         if self.view_loss_weight < 0:
             raise ValueError(f"`view_loss_weight` must be non-negative. Got {self.view_loss_weight}.")
+        if not isinstance(self.use_ema, bool):
+            raise ValueError(f"`use_ema` must be a bool. Got {self.use_ema!r}.")
+        if not math.isfinite(self.ema_decay) or not 0.0 <= self.ema_decay < 1.0:
+            raise ValueError(
+                f"`ema_decay` must be finite and in [0, 1). Got {self.ema_decay}."
+            )
+        if (
+            isinstance(self.ema_update_after_step, bool)
+            or not isinstance(self.ema_update_after_step, int)
+            or self.ema_update_after_step < 0
+        ):
+            raise ValueError(
+                "`ema_update_after_step` must be a non-negative integer. "
+                f"Got {self.ema_update_after_step!r}."
+            )
         if not math.isfinite(self.scid_ridge) or self.scid_ridge < 0:
             raise ValueError(
                 f"`scid_ridge` must be finite and non-negative. Got {self.scid_ridge}."
@@ -266,11 +294,13 @@ class DiffusionConfig:
             "balanced_lookahead",
             "rcla",
             "bidirectional_prefix_to_suffix",
+            "bidirectional_half_prefix_to_suffix",
         }
         if self.coupling_mode not in supported_coupling_modes:
             raise ValueError(
                 "`coupling_mode` must be 'full', 'rbac', 'balanced_lookahead', "
-                "'rcla', or 'bidirectional_prefix_to_suffix'. Got "
+                "'rcla', 'bidirectional_prefix_to_suffix', or "
+                "'bidirectional_half_prefix_to_suffix'. Got "
                 f"{self.coupling_mode!r}."
             )
         supported_coupling_block_types = {"scalar_gate", "role_adaln_zero"}
@@ -295,6 +325,20 @@ class DiffusionConfig:
                 "`coupling_ffn_ratio` must be finite and positive. "
                 f"Got {self.coupling_ffn_ratio}."
             )
+        if self.coupling_active_max_timestep is not None:
+            threshold = self.coupling_active_max_timestep
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, int)
+                or threshold < 0
+                or threshold >= self.num_train_timesteps
+            ):
+                raise ValueError(
+                    "`coupling_active_max_timestep` must be None or an integer in "
+                    f"[0, num_train_timesteps). Got "
+                    f"{threshold!r} with "
+                    f"num_train_timesteps={self.num_train_timesteps}."
+                )
         for field_name in (
             "view_to_arm_coupling_scale",
             "arm_to_view_coupling_scale",

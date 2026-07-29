@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from train.replanning_dqn.eval_fixed_steps import (
+from train.s4_adaptive_replanning.eval_fixed_steps import (
     build_markdown_report,
     choose_recommended_summary,
     default_execution_lengths,

@@ -91,4 +91,4 @@ policy:
 
   # 保留现有配置字段；当前训练代码的EMA行为与原dual-head一致。
   use_ema: true
-  ema_decay: 0.999
+  ema_update_after_step: 1000

@@ -87,7 +87,8 @@ policy:
   coupling_num_heads: 8
   coupling_dropout: 0.0
   # 实际微调会读取预训练checkpoint中的policy配置；此处保留可见的模式选项说明。
-  # 可选full、rbac、balanced_lookahead、rcla、bidirectional_prefix_to_suffix。
+  # 可选full、rbac、balanced_lookahead、rcla、bidirectional_prefix_to_suffix、
+  # bidirectional_half_prefix_to_suffix。
   coupling_mode: bidirectional_prefix_to_suffix
   coupling_block_type: role_adaln_zero
   coupling_use_temporal_pos_emb: true

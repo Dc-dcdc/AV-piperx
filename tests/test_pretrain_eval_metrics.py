@@ -1,6 +1,6 @@
 import unittest
 
-from train.pretrain.eval_train import build_eval_log_metrics
+from train.s1_pretrain.eval.eval_train import build_eval_log_metrics
 
 
 class PretrainEvalMetricsTest(unittest.TestCase):

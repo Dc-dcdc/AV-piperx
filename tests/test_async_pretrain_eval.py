@@ -6,14 +6,14 @@ from types import SimpleNamespace
 
 from omegaconf import OmegaConf
 
-from train.pretrain.async_eval import (
+from train.s1_pretrain.eval.async_eval import (
     AsyncEvalController,
     finalize_async_eval_result,
     make_evaluated_checkpoint_identifier,
     migrate_evaluated_checkpoint_names,
     rename_evaluated_checkpoint,
 )
-from train.pretrain.eval_train import (
+from train.s1_pretrain.eval.eval_train import (
     TopKCheckpointManager,
     make_checkpoint_identifier,
 )
@@ -27,8 +27,16 @@ class _RecordingLogger:
     def log_dict(self, metrics, step, mode):
         self.dict_calls.append((metrics, step, mode))
 
-    def log_video(self, video_path, step, mode):
-        self.video_calls.append((video_path, step, mode, Path(video_path).exists()))
+    def log_video(self, video_path, step, mode, checkpoint_step=None):
+        self.video_calls.append(
+            (
+                video_path,
+                step,
+                mode,
+                checkpoint_step,
+                Path(video_path).exists(),
+            )
+        )
 
 
 class AsyncPretrainEvalTest(unittest.TestCase):
@@ -186,6 +194,127 @@ class AsyncPretrainEvalTest(unittest.TestCase):
             records = json.loads(manager.records_file.read_text())
             self.assertEqual(records["latest_step"], 200)
 
+    def test_unassessed_success_checkpoint_updates_latest_but_not_top_k(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            manager = TopKCheckpointManager(
+                out_dir=out_dir,
+                max_keep=2,
+                metric="success",
+                records_resume=False,
+            )
+            evaluated = out_dir / "checkpoints" / "000100_loss=0.2000"
+            unassessed = out_dir / "checkpoints" / "000200_loss=0.1500"
+            evaluated.mkdir(parents=True)
+
+            manager.update(
+                100,
+                0.2,
+                evaluated,
+                reward=10.0,
+                success_rate=0.8,
+            )
+            unassessed.mkdir()
+            manager.update(200, 0.15, unassessed)
+
+            self.assertEqual(manager.latest_path, unassessed.absolute())
+            self.assertEqual(
+                [item["step"] for item in manager.top_k],
+                [100],
+            )
+            self.assertTrue(evaluated.exists())
+            self.assertTrue(unassessed.exists())
+            raw_records = manager.records_file.read_text(encoding="utf-8")
+            records = json.loads(
+                raw_records,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(value)
+                ),
+            )
+            self.assertNotIn("Infinity", raw_records)
+            self.assertEqual(len(records["top_k"]), 1)
+            self.assertTrue(Path(records["latest"]).is_absolute())
+            self.assertTrue(Path(records["top_k"][0]["path"]).is_absolute())
+
+    def test_loss_top_k_serializes_missing_eval_metrics_as_json_null(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            manager = TopKCheckpointManager(
+                out_dir=out_dir,
+                max_keep=1,
+                metric="loss",
+                records_resume=False,
+            )
+            checkpoint = out_dir / "checkpoints" / "000100_loss=0.2000"
+            checkpoint.mkdir(parents=True)
+
+            manager.update(100, 0.2, checkpoint)
+
+            raw_records = manager.records_file.read_text(encoding="utf-8")
+            records = json.loads(
+                raw_records,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(value)
+                ),
+            )
+            self.assertIsNone(records["top_k"][0]["reward"])
+            self.assertIsNone(records["top_k"][0]["success_rate"])
+
+    def test_resume_normalizes_legacy_infinity_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            checkpoints_dir = out_dir / "checkpoints"
+            evaluated = checkpoints_dir / "000100_loss=0.2000"
+            unassessed = checkpoints_dir / "000200_loss=0.1500"
+            evaluated.mkdir(parents=True)
+            unassessed.mkdir()
+            records_path = checkpoints_dir / "top_k_records.json"
+            records_path.write_text(
+                json.dumps(
+                    {
+                        "latest": str(unassessed),
+                        "latest_step": 200,
+                        "top_k": [
+                            {
+                                "step": 100,
+                                "loss": 0.2,
+                                "reward": 10.0,
+                                "success_rate": 0.8,
+                                "path": str(evaluated),
+                            },
+                            {
+                                "step": 200,
+                                "loss": 0.15,
+                                "reward": -float("inf"),
+                                "success_rate": -float("inf"),
+                                "path": str(unassessed),
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manager = TopKCheckpointManager(
+                out_dir=out_dir,
+                max_keep=2,
+                metric="success",
+                records_resume=True,
+            )
+
+            self.assertEqual(
+                [item["step"] for item in manager.top_k],
+                [100],
+            )
+            normalized_records = records_path.read_text(encoding="utf-8")
+            json.loads(
+                normalized_records,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(value)
+                ),
+            )
+            self.assertNotIn("Infinity", normalized_records)
+
     def test_async_result_logs_at_current_step_and_archives_by_checkpoint_step(self):
         with tempfile.TemporaryDirectory() as directory:
             out_dir = Path(directory)
@@ -251,7 +380,10 @@ class AsyncPretrainEvalTest(unittest.TestCase):
             self.assertEqual(metrics["checkpoint_step"], 100)
             self.assertEqual(metrics["evaluation_lag_steps"], 50)
             self.assertEqual(logger.dict_calls[0][1:], (150, "eval"))
-            self.assertEqual(logger.video_calls[0][1:], (150, "eval", True))
+            self.assertEqual(
+                logger.video_calls[0][1:],
+                (150, "eval", 100, True),
+            )
             renamed_checkpoint = checkpoint.with_name(
                 "000100_loss=0.2500_sr=80.0_ar=12.00"
             )

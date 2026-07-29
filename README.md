@@ -57,11 +57,11 @@ pip install -e .
   ckpt_path=/path/to/sew_needle/checkpoint
 
 # 使用缝合针环境配置进行预训练
-/home/dc/miniforge3/envs/AV-piper/bin/python train/pretrain/train_pretrain.py \
+/home/dc/miniforge3/envs/AV-piper/bin/python train/s1_pretrain/train/train_pretrain.py \
   env=sim_sew_needle_3arms seed=1000
 
 # 使用通用 ZED Diffusion 策略和缝合针环境配置进行 DPPO 微调
-/home/dc/miniforge3/envs/AV-piper/bin/python train/finetune/finetune_dppo.py \
+/home/dc/miniforge3/envs/AV-piper/bin/python train/s3_finetune/finetune_dppo.py \
   env=sim_sew_needle_3arms policy=ft_zed_diffusion \
   training.pretrained_ckpt_path=/path/to/sew_needle/checkpoint
 ```
@@ -81,15 +81,15 @@ pip install -e .
 ```
 
 ## ✨ Pretrain部分
-1. 训练代码位于 `train/pretrain/train_pretrain.py`，训练对应的配置参数位于`configs/pretrain/policy`，训练不同的任务时，需要注意修改`train_pretrain.py`中的`env`(决定场景)和`policy`(决定训练策略：ACT、diffusion)。
+1. 第一阶段训练代码位于 `train/s1_pretrain/train/`，评估代码位于 `train/s1_pretrain/eval/`。
 2. 模型快照和评估视频储存的默认位置位于`configs/pretrain/pre_default.yaml`中的hydra.run.dir,这是相对于该项目（AV-piper）的相对保存位置，注意命令行的运行位置，否则会存到其他地方，wandb的保存文件名为hydra.run.job。
 3. 预训练代码设置了断点续训，输入保存的模型快照路径并设置`resume=true`即可，会自动读取训练时使用的policy配置参数。
-4. 评估代码位于`train/pretrain/eval_policy.py`，输入模型快照的路径即可，会自动读取训练时使用的policy配置参数，可以在`eval_policy.py`设置`render_camera=['overhead_cam']`来设置录制视频的视角。
+4. 独立评估入口位于`train/s1_pretrain/eval/eval_policy.py`，输入模型快照的路径即可，会自动读取训练时使用的policy配置参数，可以在`eval_policy.py`设置`render_camera=['overhead_cam']`来设置录制视频的视角。
 5. 值得注意的是，这里使用项目内置的 lerobot 代码，换设备训练时需确认依赖版本一致，后期可以更新为官方版本。
 ## ✨ Finetune部分
 1. 微调环境配置位于 `configs/finetune/env`，策略配置位于 `configs/finetune/policy`；通过 `env=sim_insert_cylinder_3arms` 或 `env=sim_sew_needle_3arms` 独立选择任务。
 2. 各 policy 只保留算法参数及 `env.n_envs` 并行规模覆盖，环境名称、任务、状态/动作维度、帧率、回合长度和 rollout 数据标识统一由 env 配置提供。
-3. 微调代码位于 `train/finetune`；输入模型快照路径后，保存权重时会同时生成供评估使用的 `config.yaml` 和 `config.json`。
+3. 微调代码位于 `train/s3_finetune`；输入模型快照路径后，保存权重时会同时生成供评估使用的 `config.yaml` 和 `config.json`。
 
 
 ## ✨ sim_env部分

@@ -1,0 +1,25 @@
+# 冻结扩散策略，以多种固定执行步长采集动作价值离线轨迹。
+defaults:
+  - default
+  - _self_
+
+hydra:
+  run:
+    dir: outputs/7_adaptive_replanning/action_value/collect/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}
+  job:
+    name: ${env.task}_action_value_collect_${now:%Y-%m-%d}_${now:%H-%M-%S}
+  job_logging:
+    handlers:
+      file:
+        mode: a
+
+env:
+  max_episode_steps: 400
+  enable_reward_debug: false
+
+collection:
+  # 每次扩散推理后连续执行的动作数量；每个步长单独存放和计数。
+  execution_steps: [4, 6, 8, 10, 12, 14]
+  episodes_per_step: 100  # 每种执行步长自然采集的episode数。
+  image_quality: 95       # 原始相机JPEG质量，范围1到100。
+  resume: true            # 按execution_steps继续补齐已有数据集。

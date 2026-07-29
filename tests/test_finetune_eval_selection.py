@@ -1,6 +1,6 @@
 import unittest
 
-from train.finetune.eval_selection import (
+from train.s3_finetune.eval_selection import (
     canonical_checkpoint_metric,
     is_better_eval_candidate,
     is_eval_candidate_eligible,

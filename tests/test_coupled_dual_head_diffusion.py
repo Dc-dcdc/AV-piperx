@@ -1,6 +1,7 @@
 import math
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -9,11 +10,11 @@ from lerobot.common.policies.diffusion.modeling_coupled_dual_head_diffusion impo
     CoupledDualHeadDiffusionModel,
     CoupledDualHeadDiffusionPolicy,
 )
-from train.finetune.finetune_dppo_dual_head import (
+from train.s3_finetune.finetune_dppo_dual_head import (
     forward_dppo_from_global_cond,
     get_logprobs_from_global_cond,
 )
-from train.pretrain.coupling_ablation import (
+from train.s1_pretrain.eval.coupling_ablation import (
     apply_coupling_ablation_overrides,
     coupling_ablation_tag,
 )
@@ -25,6 +26,7 @@ def make_small_config(
     coupling_block_type: str = "scalar_gate",
     coupling_use_temporal_pos_emb: bool = False,
     coupling_use_ffn: bool = False,
+    coupling_active_max_timestep: int | None = None,
 ) -> DiffusionConfig:
     """构造无需图像编码器的小尺寸耦合双头测试配置。"""
     return DiffusionConfig(
@@ -57,6 +59,7 @@ def make_small_config(
         coupling_use_temporal_pos_emb=coupling_use_temporal_pos_emb,
         coupling_use_ffn=coupling_use_ffn,
         coupling_ffn_ratio=2.0,
+        coupling_active_max_timestep=coupling_active_max_timestep,
     )
 
 
@@ -90,7 +93,7 @@ class CoupledDualHeadDiffusionTest(unittest.TestCase):
         self.assertEqual(restored.n_obs_steps - 1, 1)
 
     def test_all_coupling_modes_are_checkpoint_compatible(self):
-        """验证五种模式只改变特征路由，不改变可学习参数名称或形状。"""
+        """验证六种模式只改变特征路由，不改变可学习参数名称或形状。"""
         torch.manual_seed(3)
         full_model = CoupledDualHeadDiffusionModel(make_small_config("full"))
         rbac_model = CoupledDualHeadDiffusionModel(make_small_config("rbac"))
@@ -100,6 +103,9 @@ class CoupledDualHeadDiffusionTest(unittest.TestCase):
         rcla_model = CoupledDualHeadDiffusionModel(make_small_config("rcla"))
         prefix_to_suffix_model = CoupledDualHeadDiffusionModel(
             make_small_config("bidirectional_prefix_to_suffix")
+        )
+        half_prefix_to_suffix_model = CoupledDualHeadDiffusionModel(
+            make_small_config("bidirectional_half_prefix_to_suffix")
         )
 
         rbac_incompatible = rbac_model.load_state_dict(
@@ -114,6 +120,12 @@ class CoupledDualHeadDiffusionTest(unittest.TestCase):
         prefix_to_suffix_incompatible = prefix_to_suffix_model.load_state_dict(
             full_model.state_dict(), strict=True
         )
+        half_prefix_to_suffix_incompatible = (
+            half_prefix_to_suffix_model.load_state_dict(
+                full_model.state_dict(),
+                strict=True,
+            )
+        )
 
         self.assertEqual(rbac_incompatible.missing_keys, [])
         self.assertEqual(rbac_incompatible.unexpected_keys, [])
@@ -123,6 +135,8 @@ class CoupledDualHeadDiffusionTest(unittest.TestCase):
         self.assertEqual(rcla_incompatible.unexpected_keys, [])
         self.assertEqual(prefix_to_suffix_incompatible.missing_keys, [])
         self.assertEqual(prefix_to_suffix_incompatible.unexpected_keys, [])
+        self.assertEqual(half_prefix_to_suffix_incompatible.missing_keys, [])
+        self.assertEqual(half_prefix_to_suffix_incompatible.unexpected_keys, [])
 
     def test_temporal_position_embedding_marks_each_bottleneck_token(self):
         """验证无参数时间编码具有[1,T,C]形状且不同位置可区分。"""
@@ -239,6 +253,125 @@ class CoupledDualHeadDiffusionTest(unittest.TestCase):
         """验证FFN只能与role_adaln_zero组合，避免配置被静默忽略。"""
         with self.assertRaisesRegex(ValueError, "role_adaln_zero"):
             make_small_config(coupling_use_ffn=True)
+
+    def test_low_noise_coupling_mask_supports_both_block_types(self):
+        """验证高噪声样本严格关闭Attention/FFN，低噪声样本仍可被修正。"""
+        for block_type, use_ffn in (
+            ("scalar_gate", False),
+            ("role_adaln_zero", True),
+        ):
+            with self.subTest(block_type=block_type):
+                torch.manual_seed(71)
+                model = CoupledDualHeadDiffusionModel(
+                    make_small_config(
+                        "bidirectional_prefix_to_suffix",
+                        coupling_block_type=block_type,
+                        coupling_use_ffn=use_ffn,
+                        coupling_active_max_timestep=4,
+                    )
+                ).train()
+                with torch.no_grad():
+                    model.coupling_timestep_encoder[-1].bias.fill_(math.atanh(0.5))
+                    if use_ffn:
+                        ffn_bias = model.role_adaln_coupling.ffn_modulation[-1].bias
+                        dim = model.role_adaln_coupling.bottleneck_dim
+                        ffn_bias[2 * dim] = 0.5
+                        ffn_bias[4 * dim + 1] = 0.5
+
+                arm = torch.randn(2, 32, 4)
+                view = torch.randn(2, 32, 4)
+                coupled_arm, coupled_view = model._couple_bottlenecks(
+                    arm,
+                    view,
+                    torch.tensor([4, 5]),
+                )
+
+                self.assertGreater(
+                    (coupled_arm[0] - arm[0]).abs().sum().item(),
+                    0.0,
+                )
+                self.assertGreater(
+                    (coupled_view[0] - view[0]).abs().sum().item(),
+                    0.0,
+                )
+                torch.testing.assert_close(
+                    coupled_arm[1],
+                    arm[1],
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    coupled_view[1],
+                    view[1],
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_low_noise_coupling_mask_skips_high_noise_attention_at_inference(self):
+        """验证推理前段全部高噪声时不执行交叉注意力。"""
+        model = CoupledDualHeadDiffusionModel(
+            make_small_config(coupling_active_max_timestep=4)
+        ).eval()
+        arm = torch.randn(2, 32, 4)
+        view = torch.randn(2, 32, 4)
+
+        with (
+            mock.patch.object(
+                model.view_to_arm_attention,
+                "forward",
+                wraps=model.view_to_arm_attention.forward,
+            ) as view_to_arm_forward,
+            mock.patch.object(
+                model.arm_to_view_attention,
+                "forward",
+                wraps=model.arm_to_view_attention.forward,
+            ) as arm_to_view_forward,
+            torch.no_grad(),
+        ):
+            coupled_arm, coupled_view = model._couple_bottlenecks(
+                arm,
+                view,
+                torch.tensor([5, 19]),
+            )
+
+        view_to_arm_forward.assert_not_called()
+        arm_to_view_forward.assert_not_called()
+        torch.testing.assert_close(coupled_arm, arm, rtol=0, atol=0)
+        torch.testing.assert_close(coupled_view, view, rtol=0, atol=0)
+
+    def test_low_noise_schedule_does_not_change_checkpoint_parameters(self):
+        """验证新增阈值不增加参数，旧的全时间步checkpoint仍可严格加载。"""
+        unrestricted = CoupledDualHeadDiffusionModel(make_small_config())
+        low_noise_only = CoupledDualHeadDiffusionModel(
+            make_small_config(coupling_active_max_timestep=4)
+        )
+
+        incompatible = low_noise_only.load_state_dict(
+            unrestricted.state_dict(),
+            strict=True,
+        )
+
+        self.assertEqual(incompatible.missing_keys, [])
+        self.assertEqual(incompatible.unexpected_keys, [])
+        self.assertEqual(
+            set(low_noise_only.state_dict()),
+            set(unrestricted.state_dict()),
+        )
+
+    def test_coupling_active_max_timestep_validation(self):
+        """验证低噪声阈值只能取合法训练时间步，且不把bool误当整数。"""
+        for invalid_value in (-1, 20, True, 1.5):
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "coupling_active_max_timestep",
+                ):
+                    DiffusionConfig(
+                        **{
+                            **make_small_config().__dict__,
+                            "coupling_active_max_timestep": invalid_value,
+                        }
+                    )
 
     def test_rcla_builds_role_causal_lag_masks(self):
         """验证4-token RCLA掩码与角色因果时滞交互图严格一致。"""
@@ -401,6 +534,151 @@ class CoupledDualHeadDiffusionTest(unittest.TestCase):
         self.assertIsNotNone(arm_to_view_grad)
         self.assertGreater(view_to_arm_grad.abs().sum().item(), 0.0)
         self.assertGreater(arm_to_view_grad.abs().sum().item(), 0.0)
+
+    def test_bidirectional_half_prefix_to_suffix_uses_exact_two_by_two_mapping(self):
+        """验证Arm/View后缀[2,3]分别只读取对方前缀[0,1]。"""
+        torch.manual_seed(67)
+        model = CoupledDualHeadDiffusionModel(
+            make_small_config("bidirectional_half_prefix_to_suffix")
+        ).eval()
+        normalized_arm = torch.randn(2, 4, 32)
+        normalized_view = torch.randn(2, 4, 32)
+
+        with (
+            mock.patch.object(
+                model.view_to_arm_attention,
+                "forward",
+                wraps=model.view_to_arm_attention.forward,
+            ) as view_to_arm_forward,
+            mock.patch.object(
+                model.arm_to_view_attention,
+                "forward",
+                wraps=model.arm_to_view_attention.forward,
+            ) as arm_to_view_forward,
+            torch.no_grad(),
+        ):
+            view_context, arm_context = model._compute_coupling_contexts(
+                normalized_arm,
+                normalized_view,
+            )
+
+        view_to_arm_call = view_to_arm_forward.call_args.kwargs
+        arm_to_view_call = arm_to_view_forward.call_args.kwargs
+        torch.testing.assert_close(
+            view_to_arm_call["query"], normalized_arm[:, 2:4]
+        )
+        torch.testing.assert_close(
+            view_to_arm_call["key"], normalized_view[:, 0:2]
+        )
+        torch.testing.assert_close(
+            view_to_arm_call["value"], normalized_view[:, 0:2]
+        )
+        torch.testing.assert_close(
+            arm_to_view_call["query"], normalized_view[:, 2:4]
+        )
+        torch.testing.assert_close(
+            arm_to_view_call["key"], normalized_arm[:, 0:2]
+        )
+        torch.testing.assert_close(
+            arm_to_view_call["value"], normalized_arm[:, 0:2]
+        )
+        torch.testing.assert_close(
+            view_context[:, :2],
+            torch.zeros_like(view_context[:, :2]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            arm_context[:, :2],
+            torch.zeros_like(arm_context[:, :2]),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_bidirectional_half_prefix_to_suffix_only_updates_both_suffix_halves(self):
+        """验证开启AdaLN/FFN后仍只修改双方后缀[2,3]。"""
+        torch.manual_seed(71)
+        model = CoupledDualHeadDiffusionModel(
+            make_small_config(
+                "bidirectional_half_prefix_to_suffix",
+                coupling_block_type="role_adaln_zero",
+                coupling_use_temporal_pos_emb=True,
+                coupling_use_ffn=True,
+            )
+        ).eval()
+        with torch.no_grad():
+            model.coupling_timestep_encoder[-1].bias.fill_(math.atanh(0.5))
+            ffn_bias = model.role_adaln_coupling.ffn_modulation[-1].bias
+            dim = model.role_adaln_coupling.bottleneck_dim
+            ffn_bias[2 * dim] = 0.5
+            ffn_bias[4 * dim + 1] = 0.5
+
+        arm = torch.randn(2, 32, 4)
+        view = torch.randn(2, 32, 4)
+        with torch.no_grad():
+            coupled_arm, coupled_view = model._couple_bottlenecks(
+                arm,
+                view,
+                torch.tensor([3, 7]),
+            )
+
+        torch.testing.assert_close(
+            coupled_arm[..., :2], arm[..., :2], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            coupled_view[..., :2], view[..., :2], rtol=0, atol=0
+        )
+        self.assertGreater(
+            (coupled_arm[..., 2:] - arm[..., 2:]).abs().sum().item(),
+            0.0,
+        )
+        self.assertGreater(
+            (coupled_view[..., 2:] - view[..., 2:]).abs().sum().item(),
+            0.0,
+        )
+
+    def test_bidirectional_half_prefix_to_suffix_routes_both_gradients(self):
+        """验证新模式两个2×2交叉注意力方向都能获得梯度。"""
+        torch.manual_seed(73)
+        model = CoupledDualHeadDiffusionModel(
+            make_small_config("bidirectional_half_prefix_to_suffix")
+        )
+        with torch.no_grad():
+            model.coupling_timestep_encoder[-1].bias.fill_(math.atanh(0.5))
+
+        coupled_arm, coupled_view = model._couple_bottlenecks(
+            torch.randn(2, 32, 4),
+            torch.randn(2, 32, 4),
+            torch.tensor([2, 9]),
+        )
+        (coupled_arm.square().mean() + coupled_view.square().mean()).backward()
+
+        view_to_arm_grad = model.view_to_arm_attention.in_proj_weight.grad
+        arm_to_view_grad = model.arm_to_view_attention.in_proj_weight.grad
+        self.assertIsNotNone(view_to_arm_grad)
+        self.assertIsNotNone(arm_to_view_grad)
+        self.assertGreater(view_to_arm_grad.abs().sum().item(), 0.0)
+        self.assertGreater(arm_to_view_grad.abs().sum().item(), 0.0)
+
+    def test_bidirectional_half_prefix_to_suffix_runs_end_to_end(self):
+        """验证新模式可通过完整双UNet编码、耦合与解码路径。"""
+        torch.manual_seed(79)
+        model = CoupledDualHeadDiffusionModel(
+            make_small_config("bidirectional_half_prefix_to_suffix")
+        ).eval()
+
+        with torch.no_grad():
+            arm_noise, view_noise = model.predict_noise(
+                torch.randn(2, 8, 14),
+                torch.randn(2, 8, 6),
+                torch.tensor([3, 7]),
+                torch.randn(2, 10),
+            )
+
+        self.assertEqual(tuple(arm_noise.shape), (2, 8, 14))
+        self.assertEqual(tuple(view_noise.shape), (2, 8, 6))
+        self.assertTrue(torch.isfinite(arm_noise).all())
+        self.assertTrue(torch.isfinite(view_noise).all())
 
     def test_balanced_lookahead_splits_four_tokens_into_equal_halves(self):
         """验证当前4-token瓶颈被确定地切分为[0:2]与[2:4]。"""

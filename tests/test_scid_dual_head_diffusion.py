@@ -17,12 +17,14 @@ from lerobot.common.policies.diffusion.modeling_scid_dual_head_diffusion import 
     SCIDDualHeadDiffusionPolicy,
 )
 from lerobot.common.policies.factory import get_policy_and_config_classes, make_policy
-from train.finetune.finetune_dppo_dual_head import forward_dppo_from_global_cond
-from train.pretrain.scid_transform import (
+from train.s3_finetune.finetune_dppo_dual_head import forward_dppo_from_global_cond
+from train.s1_pretrain.train.scid_transform import (
     fit_scid_transform,
     initialize_scid_transform_from_dataset,
 )
-from train.replanning_dqn.train_replanning_dqn import infer_full_joint_chunk
+from train.s4_adaptive_replanning.train_replanning_dqn import (
+    infer_full_joint_chunk,
+)
 
 
 def make_small_config(*, clamp: bool = True) -> DiffusionConfig:
@@ -317,7 +319,7 @@ class SCIDDualHeadDiffusionTest(unittest.TestCase):
 
         samples = [(arm, arm_chain), (innovation, innovation_chain)]
         with patch(
-            "train.finetune.finetune_dppo_dual_head._sample_head_dppo",
+            "train.s3_finetune.finetune_dppo_dual_head._sample_head_dppo",
             side_effect=samples,
         ):
             result = forward_dppo_from_global_cond(

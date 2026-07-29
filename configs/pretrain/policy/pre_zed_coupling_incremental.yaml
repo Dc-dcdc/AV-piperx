@@ -1,0 +1,156 @@
+# @package _global_
+
+
+hydra:
+  run:
+    dir: outputs/2_pretrain/coupling_incremental/${env.task}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
+    # ${hydra.runtime.choices.policy}就是对应的policy名称，如果直接写${policy}会把文件里的参数都放进去
+  job:
+    name: ${hydra.runtime.choices.policy}_${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+# 冻结87%双扩散头基线、只训练Coupling Adapter的增量能力实验。
+seed: 1000
+
+# 首次实验只加载模型/归一化状态并从step 0建立新优化器；断点续训时入口会
+# 自动清空该字段，改由resume_path恢复Coupled模型及完整训练状态。
+init_policy_path: outputs/2_pretrain/train/2026-07-16/20-59-53_InsertCylinder-3Arms-v0_pre_zed_dual_head_diffusion/checkpoints/162000_loss=0.0051_sr=87.0_ar=751.50
+
+override_dataset_stats:
+  observation.images.zed_cam_left:
+    mean: [[[0.485]], [[0.456]], [[0.406]]]
+    std: [[[0.229]], [[0.224]], [[0.225]]]
+  observation.images.zed_cam_right:
+    mean: [[[0.485]], [[0.456]], [[0.406]]]
+    std: [[[0.229]], [[0.224]], [[0.225]]]
+
+incremental:
+  equivalence_check:
+    enabled: true
+    atol: 1.0e-6
+    rtol: 1.0e-5
+
+training:
+  # 冻结基线上的Adapter通常比全模型更快收敛，先用3万步观察完整曲线。
+  offline_steps: 30000
+  eval_freq: 2000
+  save_freq: 2000
+  log_freq: 100
+  save_checkpoint: true
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+  batch_size: 32
+
+  # 所有开放Coupling模块使用同一学习率；零初始化控制层由独立参数组设为wd=0。
+  lr: 1.0e-4
+  coupling_lr: 1.0e-4
+  coupling_structural_weight_decay: 1.0e-6
+  lr_backbone: 0.0
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  adam_betas: [0.95, 0.999]
+  adam_eps: 1.0e-8
+  weight_decay: 0.0
+  grad_clip_norm: 10
+  online_steps: 0
+  online_steps_between_rollouts: 1
+
+  delta_timestamps:
+    action: "[i / ${env.fps} for i in range(${policy.horizon})]"
+    observation.state: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.zed_cam_left: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.zed_cam_right: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+
+  image_transforms:
+    enable: false
+    max_num_transforms: 3
+    random_order: true
+    brightness:
+      weight: 1
+      min_max: [0.8, 1.2]
+    contrast:
+      weight: 1
+      min_max: [0.8, 1.2]
+    saturation:
+      weight: 1
+      min_max: [0.5, 1.5]
+    hue:
+      weight: 1
+      min_max: [-0.05, 0.05]
+    sharpness:
+      weight: 1
+      min_max: [0.8, 1.2]
+
+policy:
+  name: coupled_dual_head_diffusion
+
+  # 这些字段必须与init checkpoint一致；入口会逐项校验。
+  arm_action_dim: 14
+  view_action_dim: 6
+  view_loss_weight: 0.5
+
+  coupling_num_heads: 8
+  coupling_dropout: 0.0
+  coupling_mode: bidirectional_prefix_to_suffix
+
+  # 可切换scalar_gate或role_adaln_zero。
+  coupling_block_type: scalar_gate
+  # 可切换纯Attention与显式瓶颈token时间位置编码。
+  coupling_use_temporal_pos_emb: false
+  # true时必须同时选择role_adaln_zero。
+  coupling_use_ffn: false
+  coupling_ffn_ratio: 2.0
+
+  # scale>0会开放对应方向参数；scale=0会自动冻结该方向Attention。
+  # 默认先验证更有希望且更易解释的View→Arm单向增量。
+  view_to_arm_coupling_scale: 0.5
+  arm_to_view_coupling_scale: 0.5
+
+  n_obs_steps: 2
+  horizon: 16
+  n_action_steps: 8
+
+  resize_shape: [240, 320]
+  crop_shape: [216, 288]
+  crop_is_random: true
+  input_shapes:
+    observation.images.zed_cam_left: [3, 480, 640]
+    observation.images.zed_cam_right: [3, 480, 640]
+    observation.state: ["${env.state_dim}"]
+  output_shapes:
+    action: ["${env.action_dim}"]
+
+  input_normalization_modes:
+    observation.images.zed_cam_left: mean_std
+    observation.images.zed_cam_right: mean_std
+    observation.state: mean_std
+  output_normalization_modes:
+    action: min_max
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+  use_group_norm: false
+  spatial_softmax_num_keypoints: 32
+
+  down_dims: [128, 256, 512]
+  kernel_size: 5
+  n_groups: 8
+  diffusion_step_embed_dim: 128
+  use_film_scale_modulation: true
+
+  noise_scheduler_type: DDIM
+  num_inference_steps: 10
+  num_train_timesteps: 100
+  beta_schedule: squaredcos_cap_v2
+  beta_start: 0.0001
+  beta_end: 0.02
+  prediction_type: epsilon
+  clip_sample: true
+  clip_sample_range: 1.0
+  do_mask_loss_for_padding: false
+
+wandb:
+  project: coupling_incremental #项目名称
+  tags:
+    - frozen_dual_head
+    - coupling_incremental

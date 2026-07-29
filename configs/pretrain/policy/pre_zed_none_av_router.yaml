@@ -1,0 +1,155 @@
+# @package _global_
+
+hydra:
+  run:
+    dir: outputs/2_pretrain/none_av_router/${env.task}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
+  job:
+    name: ${hydra.runtime.choices.policy}_${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+seed: 20260728
+
+# 已训练好的完整后置修正器。Router训练时冻结其中的视觉编码器、两个UNet和A→V修正器。
+init_policy_path: null
+
+router_collection:
+  root_dir: outputs/buffer/output_corrector_router  # 反事实任务结果的持久缓存根目录。
+  device: ${device}                                # 扩散推理和分支续跑使用的GPU。
+  start_seed: 2000                                 # 采集episode seed的起点。
+  n_episodes: 200                                  # 连续采集的episode数量。
+  max_steps: ${env.episode_length}                 # 每个反事实分支的最大环境步数。
+  collect_every_decisions: 8                       # 每隔几个8步重规划点建立一次分支。
+  max_samples_per_episode: 4                       # 限制终局续跑数量，控制采集耗时。
+  arm_to_view_scale: 1.0                           # A→V候选使用的固定修正强度。
+  reward_margin: 10.0                              # 同成功/阶段时，回报差超过该值才标注。
+  enable_reward_debug: true                        # 使用InsertCylinder任务阶段作为次级标签。
+  rebuild: false                                   # false时复用身份完全匹配的已有缓存。
+
+router_cache:
+  # 先运行collect_none_av_router_dataset.py，再把一个或多个manifest写到这里。
+  # 多个manifest会联合训练，但每一份都严格按episode seed划分训练/验证集。
+  manifests: []
+  memory_limit_gb: 4.0
+
+router_training:
+  steps: 30000
+  batch_size: 128
+  num_workers: 4
+  persistent_workers: true
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1000
+  validation_fraction: 0.2
+  false_positive_cost: 1.5  # 错误开启修正比漏开修正更危险，因此阈值校准偏保守。
+  log_freq: 100
+  eval_freq: 2000
+
+training:
+  adam_betas: [0.9, 0.999]
+  adam_eps: 1.0e-8
+  lr_scheduler: cosine
+  grad_clip_norm: 5.0
+
+policy:
+  name: routed_post_diffusion_output_corrector
+
+  arm_action_dim: 14
+  view_action_dim: 6
+  view_loss_weight: 0.5
+  n_obs_steps: 2
+  horizon: 16
+  n_action_steps: 8
+
+  # 必须与init_policy_path中的后置修正器结构一致；推理候选只启用A→V。
+  output_corrector_type: bipartite_attention
+  output_corrector_direction: arm_to_view
+  output_corrector_d_model: 32  # 与默认099999源checkpoint严格一致。
+  output_corrector_num_heads: 4
+  output_corrector_dropout: 0.0
+  output_corrector_residual_limit: 0.5
+  output_corrector_clamp_actions: true
+  view_to_arm_output_scale: 0.0
+  arm_to_view_output_scale: 1.0
+  output_residual_loss_weight: 1.0e-1
+  output_smoothness_loss_weight: 1.0e-3
+
+  # 同一共享评分器分别计算Q_none和Q_A→V，概率由两者分差得到。
+  router_d_model: 64
+  router_num_heads: 4
+  router_num_layers: 2
+  router_ffn_dim: 128
+  router_dropout: 0.1
+  router_threshold: 0.7
+  router_mode: router  # router / none / arm_to_view，仅影响推理。
+
+  resize_shape: [240, 320]
+  crop_shape: [216, 288]
+  crop_is_random: true
+  input_shapes:
+    observation.images.zed_cam_left: [3, 480, 640]
+    observation.images.zed_cam_right: [3, 480, 640]
+    observation.state: ["${env.state_dim}"]
+  output_shapes:
+    action: ["${env.action_dim}"]
+
+  input_normalization_modes:
+    observation.images.zed_cam_left: mean_std
+    observation.images.zed_cam_right: mean_std
+    observation.state: mean_std
+  output_normalization_modes:
+    action: min_max
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+  use_group_norm: false
+  spatial_softmax_num_keypoints: 32
+  debug_save_input_images: false
+  down_dims: [128, 256, 512]
+  kernel_size: 5
+  n_groups: 8
+  diffusion_step_embed_dim: 128
+  use_film_scale_modulation: true
+
+  noise_scheduler_type: DDIM
+  num_inference_steps: 10
+  num_train_timesteps: 100
+  beta_schedule: squaredcos_cap_v2
+  beta_start: 0.0001
+  beta_end: 0.02
+  prediction_type: epsilon
+  clip_sample: true
+  clip_sample_range: 1.0
+  do_mask_loss_for_padding: false
+
+  # DiffusionConfig继承字段；后置Router不在去噪循环中调用Coupling。
+  coupling_num_heads: 8
+  coupling_dropout: 0.0
+  coupling_mode: full
+  coupling_block_type: scalar_gate
+  coupling_use_temporal_pos_emb: false
+  coupling_use_ffn: false
+  coupling_ffn_ratio: 2.0
+  view_to_arm_coupling_scale: 1.0
+  arm_to_view_coupling_scale: 1.0
+  scid_ridge: 1.0e-3
+  scid_residual_eps: 1.0e-6
+  scid_clamp_reconstructed_view: true
+
+eval:
+  seed: 1400
+  n_episodes: 200
+  max_episodes_rendered: 0
+  fps: 25
+  max_steps: ${env.episode_length}
+  batch_size: 15
+  use_async_envs: true
+  device: ${device}
+  deterministic: false
+  render_camera: [zed_cam_left]
+  use_amp: true
+
+wandb:
+  project: none_av_router
+  tags:
+    - frozen_post_corrector
+    - supervised_router
+    - none_vs_arm_to_view

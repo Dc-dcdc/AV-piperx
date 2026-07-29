@@ -1,7 +1,7 @@
 # @package _global_
 # ZED-only Diffusion checkpoint 的 DPPO 微调配置。
 # 可用命令查看最终合并结果:
-# python train/finetune/finetune_dppo.py policy=ft_zed_diffusion --cfg job
+# python train/s3_finetune/finetune_dppo.py policy=ft_zed_diffusion --cfg job
 
 seed: 1000
 

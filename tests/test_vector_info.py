@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from train.pretrain.vector_info import as_bool_array, extract_info_bool
+from train.s1_pretrain.eval.vector_info import as_bool_array, extract_info_bool
 
 
 class AsBoolArrayTest(unittest.TestCase):

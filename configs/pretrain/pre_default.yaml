@@ -6,7 +6,7 @@ defaults:
 
 hydra:
   run:
-    dir: outputs/2_pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
+    dir: outputs/2_pretrain/${env.task}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
     # ${hydra.runtime.choices.policy}就是对应的policy名称，如果直接写${policy}会把文件里的参数都放进去
   job:
     name: ${hydra.runtime.choices.policy}_${now:%Y-%m-%d}_${now:%H-%M-%S}
@@ -19,10 +19,8 @@ hydra:
 # 将 `resume` 设置为 true 以恢复之前的运行。为此，您需要确保hydra.run.dir是至少包含一个检查点的现有运行目录。
 # resume会从checkpoint恢复策略/环境等训练语义配置以及模型、优化器、调度器和训练步数。
 # 当前配置仅覆盖device/use_amp、训练时长与记录频率、数据加载性能、评估吞吐和wandb设置。
-# init_policy_path只加载模型权重，并完全使用当前配置创建全新实验。
 resume: false
 resume_path: none
-init_policy_path: none  # 可以只加载模型权重、重置 optimizer/scheduler/step，创建独立对照实验。 可传checkpoint目录或其pretrained_model目录；与resume=true互斥。
 device: "cuda:0"  # cuda或cpu
 
 # 把部分计算从 float32 改成 float16，速度快 30%~100%
@@ -107,6 +105,9 @@ training:
 
 policy:
   do_mask_loss_for_padding: false
+  # 所有Diffusion预训练策略共用的EMA衰减系数；仅在对应策略use_ema=true时生效。
+  # 越接近1越平滑、滞后越明显，例如0.999约对应最近1000次更新的平滑窗口。
+  ema_decay: 0.999
 
 wandb:
   enable: true

@@ -152,7 +152,9 @@ Multi-head attention 的 head 数表示将 bottleneck channel 维拆成8个子�
 policy.coupling_mode=rbac
 ```
 
-- `configs/pretrain/pre_default.yaml` 新增 `init_policy_path`：只加载模型权重，重置 optimizer、scheduler 和训练步数，用于从同一基线 checkpoint 分叉 full/RBAC 独立实验；它与 `resume=true` 互斥。
+- `s1_pretrain`主入口已移除`init_policy_path`：`resume=false`始终按当前
+  env/policy全新训练，`resume=true`只允许完整断点续训。冻结基线后的权重
+  初始化仍由`s2_incremental`各独立入口管理。
 - 已用130000步、评估成功率49%的真实 full checkpoint 严格加载 RBAC，参数总数保持 `50,230,330`。
 - 当前只完成结构、梯度、采样、checkpoint兼容和路由回归测试；尚未完成 RBAC 训练后的成功率对照，因此不能声称性能有效。
 
@@ -187,7 +189,7 @@ arm_to_view_coupling_scale: 0.5
 
 ```text
 lerobot/common/policies/diffusion/modeling_scid_dual_head_diffusion.py
-train/pretrain/scid_transform.py
+train/s1_pretrain/train/scid_transform.py
 configs/pretrain/policy/pre_zed_scid_dual_head_diffusion.yaml
 configs/finetune/policy/ft_zed_scid_dual_head_diffusion.yaml
 tests/test_scid_dual_head_diffusion.py
@@ -207,7 +209,8 @@ V_hat = G A_hat + b + residual_scale * R_scaled_hat
 - 拟合直接读取底层HF dataset的原始单帧`action`列，不展开horizon、不计episode边界padding、不解码图片。
 - 三个变换量和`scid_transform_fitted`作为persistent buffers保存在checkpoint中，不参与梯度更新。
 - fresh训练自动拟合；SCID resume/评估必须严格恢复已有变换，禁止静默重拟合。
-- `init_policy_path`可受控加载原始`dual_head_diffusion`权重；只允许缺少四个SCID buffers，随后从当前训练集拟合。
+- HIL专用`pretrained_model_path`可受控加载原始`dual_head_diffusion`权重；
+  只允许缺少四个SCID buffers，随后从当前训练集拟合。
 - 对外仍输出原始20维Arm/View动作，动作队列、反归一化和实机接口不变。
 - DPPO chain保留`(A,R_scaled)`计算likelihood，仅发送环境前解码成`(A,V)`；联合ratio仍覆盖14+6维潜变量。
 - 事件重规划DQN的完整动作采样已统一调用`combine_action_heads()`：耦合策略行为不变，独立dual和SCID也能生成正确的原始View动作。
@@ -229,9 +232,9 @@ residual_scale = [0.6719, 0.7190, 0.8577, 0.7874, 0.6111, 0.5105]
 
 文件：
 
-- `train/finetune/dppo_math.py`
-- `train/finetune/finetune_dppo.py`
-- `train/finetune/finetune_dppo_dual_head.py`
+- `train/s3_finetune/dppo_math.py`
+- `train/s3_finetune/finetune_dppo.py`
+- `train/s3_finetune/finetune_dppo_dual_head.py`
 
 已实现：
 
@@ -277,7 +280,7 @@ ddim_eta: 0.0
 
 ### 5.4 PPO clip 监测
 
-`train/finetune/dppo_logging.py` 已从 `finetune_dppo.py` 拆分出 W&B 标签和指标构造。主要监测项包括：
+`train/s3_finetune/dppo_logging.py` 已从 `finetune_dppo.py` 拆分出 W&B 标签和指标构造。主要监测项包括：
 
 - `ppo_ratio_mean/std/min/max`
 - `ppo_ratio_outside_clip_fraction`
@@ -293,7 +296,7 @@ ddim_eta: 0.0
 
 ### 5.5 评估最佳指标
 
-`train/finetune/eval_selection.py` 为单头 `finetune_dppo.py` 提供共享选择规则：
+`train/s3_finetune/eval_selection.py` 为单头 `finetune_dppo.py` 提供共享选择规则：
 
 - `best_eval_success_rate` 和 `best_eval_reward` 使用历史 `max()` 更新，应只上升或不变。
 - 当前评估曲线仍可以下降；下降的是 current eval，不是 historical best。
@@ -308,14 +311,15 @@ ddim_eta: 0.0
 新增：
 
 ```text
-train/pretrain/vector_info.py
+train/s1_pretrain/eval/vector_info.py
 ```
 
 已在以下入口复用：
 
-- `train/pretrain/eval_policy.py`
-- `train/pretrain/eval_train.py`
-- `train/pretrain/eval_action_steps.py`
+- `train/s1_pretrain/eval/eval_policy.py`
+- `train/s1_pretrain/eval/eval_train.py`
+- `train/s4_adaptive_replanning/eval_dynamic_steps.py`
+- `train/s4_adaptive_replanning/eval_fixed_steps.py`
 
 兼容：
 
@@ -326,7 +330,7 @@ train/pretrain/vector_info.py
 
 ### 6.2 预训练 W&B 评估指标
 
-`train/pretrain/eval_train.py` 新增 `build_eval_log_metrics()`，评估时上传：
+`train/s1_pretrain/eval/eval_train.py` 新增 `build_eval_log_metrics()`，评估时上传：
 
 - success rate / percent
 - average/std/min/max reward
@@ -338,7 +342,7 @@ train/pretrain/vector_info.py
 
 ### 6.3 视角动作 target 插值平滑
 
-目前这三个参数只在 `train/pretrain/train_pretrain_collect_data.py` 中使用：
+目前这三个参数只在 `train/s1_pretrain/train/train_pretrain_collect_data.py` 中使用：
 
 ```python
 +training.view_action_smooth_stride=2
@@ -403,14 +407,14 @@ train/pretrain/vector_info.py
 ### 9.2 代码结构
 
 ```text
-train/replanning_dqn/
+train/s4_adaptive_replanning/
 ├── __init__.py
 ├── dqn.py
 ├── data_collection.py
 ├── train_replanning_dqn.py
 └── eval_fixed_execution_steps.py
 
-configs/replanning_dqn/default.yaml
+configs/adaptive_replanning/default.yaml
 ```
 
 `dqn.py` 包含：
@@ -453,7 +457,7 @@ DQN 状态包含：
 
 - **当前只有动0和动2可用。**
 - View-only 条件扩散采样尚未实现，动1被 action mask 屏蔽。
-- `configs/replanning_dqn/default.yaml` 中 `training.view_only_available` 必须保持 `false`。
+- `configs/adaptive_replanning/default.yaml` 中 `training.view_only_available` 必须保持 `false`。
 - 训练入口目前只支持单环境，没有 VectorEnv 采集。
 - DQN checkpoint 会恢复网络、优化器和全局步数，但不保存 replay buffer；恢复后需要重新预热回放池。
 - 已完成代码连通和1步真实 checkpoint 冒烟测试，但本对话中没有完成20万步 DQN 正式训练，也没有 DQN 成功率结论。
@@ -478,7 +482,7 @@ updates_per_step: 1
 文件：
 
 ```text
-train/replanning_dqn/eval_fixed_execution_steps.py
+train/s4_adaptive_replanning/eval_fixed_steps.py
 ```
 
 这里的 `execution_lengths` 表示“每次扩散推理后，固定执行多少个物理动作再重新推理”，不是 diffusion denoising steps。
@@ -503,7 +507,7 @@ execution_lengths=[3, 4, 5, 6, 7, 8]
 
 注意：当前实现期望 `None` 或整数列表；只评估一个步长时使用 `[8]`，不要使用标量 `8`。所有值必须在 `[1,horizon]` 内，程序会自动去重并排序。
 
-文件底部使用与 `train/pretrain/eval_policy.py` 相同的 `SimpleNamespace` 集中配置方式。正式使用时至少修改：
+文件底部使用与 `train/s1_pretrain/eval/eval_policy.py` 相同的 `SimpleNamespace` 集中配置方式。正式使用时至少修改：
 
 ```python
 model_path="你的checkpoint路径"
@@ -513,7 +517,7 @@ model_path="你的checkpoint路径"
 
 ```bash
 /home/dc/miniforge3/envs/AV-piper/bin/python \
-  train/replanning_dqn/eval_fixed_execution_steps.py
+  train/s4_adaptive_replanning/eval_fixed_steps.py
 ```
 
 报告默认输出到：
@@ -637,10 +641,10 @@ OK
 - `configs/finetune/*`
 - `data_collect/quest_policy_collect.py`
 - `env/assets/piperx_sim.xml`（仅增加执行器 PD 公式注释）
-- `train/pretrain/*`
-- `train/finetune/*`
-- 新增 `train/replanning_dqn/*`
-- 新增 `configs/replanning_dqn/*`
+- `train/s1_pretrain/*`
+- `train/s3_finetune/*`
+- 新增 `train/s4_adaptive_replanning/*`
+- 新增 `configs/adaptive_replanning/*`
 - 新增 `tests/*`
 
 其中可能包含用户自己的更早修改。新对话不应根据本文档认定全部 diff 都由同一次任务产生，修改任何重叠文件前都应先查看实际 diff。

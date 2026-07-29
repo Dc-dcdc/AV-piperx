@@ -1,7 +1,7 @@
 # @package _global_
 # 冻结 ZED-only 预训练 Diffusion，只训练 20 维动作上的单个 residual MLP。
 # 可用命令查看最终合并结果:
-# python train/finetune/finetune_mlp.py policy=ft_zed_diffusion_mlp --cfg job
+# python train/s3_finetune/finetune_mlp.py policy=ft_zed_diffusion_mlp --cfg job
 
 seed: 1000  # 随机种子
 

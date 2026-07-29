@@ -7,7 +7,7 @@ from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionC
 from lerobot.common.policies.diffusion.modeling_dual_head_diffusion import (
     DualHeadDiffusionModel,
 )
-from train.pretrain.train_human_in_loop import (
+from train.s1_pretrain.train.train_human_in_loop import (
     classify_iwr_sample_indices,
     prepare_intervention_batch,
 )

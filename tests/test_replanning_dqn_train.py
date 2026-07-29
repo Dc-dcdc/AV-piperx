@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import torch
 
-from train.replanning_dqn.dqn import ReplanningDecision
-from train.replanning_dqn.train_replanning_dqn import (
+from train.s4_adaptive_replanning.dqn import ReplanningDecision
+from train.s4_adaptive_replanning.train_replanning_dqn import (
     NormalizedObservationHistory,
     extract_visual_features,
     infer_full_joint_chunk,

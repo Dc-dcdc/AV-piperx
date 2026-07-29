@@ -64,7 +64,7 @@ try:
         seed_runtime,
     )
 except ModuleNotFoundError:
-    from train.pretrain.eval import (  # noqa: E402
+    from train.s1_pretrain.eval import (  # noqa: E402
         ensure_python_hash_seed,
         patch_act_position_embedding_for_determinism,
         seed_env_spaces,

@@ -73,10 +73,15 @@ policy:
   #   View token i仅读取Arm token {i,i+1}，越界位置自动忽略；
   #   例如Arm[2]<-View{1,2}，View[2]<-Arm{2,3}，所有token均可被局部修正。
   #
-  # bidirectional_prefix_to_suffix （双向前缀到后缀耦合，当前启用）：
+  # bidirectional_prefix_to_suffix（双向执行边界前缀到后缀耦合）：
   #   Arm token [3]读取View前缀[0,1,2]；
   #   View token [3]读取Arm前缀[0,1,2]；
   #   双方前缀保持不变，仅由对方较可靠的前缀修正自己的未来后缀。
+  #
+  # bidirectional_half_prefix_to_suffix （双向前半段到后半段耦合，当前启用）：
+  #   Arm token [2,3]分别加权读取View前缀{0,1}；
+  #   View token [2,3]分别加权读取Arm前缀{0,1}；
+  #   双方前缀[0,1]保持不变，仅修正双方后缀[2,3]。
   coupling_mode: bidirectional_prefix_to_suffix
 
   # coupling_block_type与上面的时间路由正交：
@@ -86,8 +91,13 @@ policy:
   # 固定一维正弦编码显式标记4个压缩时间token的位置；只进入耦合分支。
   coupling_use_temporal_pos_emb: true
   # 在交叉注意力后增加角色独立、零门控FFN，并沿用coupling_mode的写回位置。
-  coupling_use_ffn: true
+  coupling_use_ffn: false
   coupling_ffn_ratio: 2.0
+
+  # 仅在低噪声去噪阶段启用耦合：有效gate=1[t<=阈值]×学习gate。
+  # null表示所有时间步均启用；当前100个训练时间步、DDIM推理10步时，
+  # 20会使典型推理序列[90,80,...,20,10,0]只在最后3步开放Attention/FFN。
+  coupling_active_max_timestep: 0
 
   # 同一checkpoint推理消融：0关闭对应方向，1保持训练时完整耦合。
   view_to_arm_coupling_scale: 0.5   # View前3个瓶颈token修正Arm最后1个token
@@ -95,8 +105,8 @@ policy:
 
   # 按原版Diffusion Policy规则，从最后一帧历史观测对应的动作开始执行。
   n_obs_steps: 2
-  horizon: 32
-  n_action_steps: 16
+  horizon: 16
+  n_action_steps: 8
 
   resize_shape: [240, 320]
   crop_shape: [216, 288]
@@ -136,5 +146,6 @@ policy:
   clip_sample: true
   clip_sample_range: 1.0
 
+  # 在线模型正常参与反向传播；EMA在1000步时复制在线权重，之后仅用于评估和部署。
   use_ema: true
-  ema_decay: 0.999
+  ema_update_after_step: 1000

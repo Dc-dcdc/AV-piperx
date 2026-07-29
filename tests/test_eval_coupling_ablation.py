@@ -5,7 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from train.pretrain.eval_coupling_ablation import (
+from train.s2_incremental.eval.eval_coupling_ablation import (
+    _output_root,
     make_preset_eval_cfg,
     main,
     normalize_ablation_presets,
@@ -13,6 +14,33 @@ from train.pretrain.eval_coupling_ablation import (
 
 
 class EvalCouplingAblationTest(unittest.TestCase):
+    def test_output_root_automatically_appends_seed_and_episode_count(self):
+        checkpoint = Path("/tmp/checkpoint")
+        requested = Path("/tmp/custom_ablation")
+
+        self.assertEqual(
+            _output_root(checkpoint, None, seed=100, n_episodes=200),
+            checkpoint / "coupling_ablation" / "eval_seed=100_ep=200",
+        )
+        self.assertEqual(
+            _output_root(
+                checkpoint,
+                str(requested),
+                seed=1000,
+                n_episodes=300,
+            ),
+            requested / "eval_seed=1000_ep=300",
+        )
+        self.assertEqual(
+            _output_root(
+                checkpoint,
+                str(requested / "eval_seed=1000_ep=300"),
+                seed=1000,
+                n_episodes=300,
+            ),
+            requested / "eval_seed=1000_ep=300",
+        )
+
     def test_checkpoint_config_preserves_checkpoint_scales(self):
         presets = normalize_ablation_presets(
             [("checkpoint_config", None, None), ("uncoupled", 0, 0)]
@@ -68,6 +96,8 @@ class EvalCouplingAblationTest(unittest.TestCase):
             eval_cfg = SimpleNamespace(
                 ckpt_path=str(checkpoint),
                 eval_output_dir=str(output),
+                seed=100,
+                n_episodes=2,
                 ablation_presets=[
                     ("trained", 0.5, 0.0),
                     ("uncoupled", 0.0, 0.0),
@@ -85,7 +115,7 @@ class EvalCouplingAblationTest(unittest.TestCase):
                 ]
 
             with patch(
-                "train.pretrain.eval_coupling_ablation.evaluate_policy",
+                "train.s2_incremental.eval.eval_coupling_ablation.evaluate_policy",
                 side_effect=fake_evaluate,
             ) as evaluate_mock:
                 rows = main(eval_cfg)
@@ -95,7 +125,11 @@ class EvalCouplingAblationTest(unittest.TestCase):
             self.assertEqual(rows[0]["requested_view_to_arm_scale"], 0.5)
             self.assertEqual(rows[1]["requested_view_to_arm_scale"], 0.0)
 
-            summary_path = output / "coupling_ablation_summary.json"
+            summary_path = (
+                output
+                / "eval_seed=100_ep=2"
+                / "coupling_ablation_summary.json"
+            )
             self.assertTrue(summary_path.is_file())
             saved_rows = json.loads(summary_path.read_text(encoding="utf-8"))
             self.assertEqual(saved_rows, rows)

@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from train.finetune.dppo_math import (
+from train.s3_finetune.dppo_math import (
     clipped_ppo_loss,
     combine_head_logprobs,
     dppo_ddim_mean_std,
@@ -15,7 +15,7 @@ from train.finetune.dppo_math import (
     summarize_ppo_ratio,
     update_ppo_ratio_stats,
 )
-from train.finetune.finetune_dppo_dual_head import (
+from train.s3_finetune.finetune_dppo_dual_head import (
     _head_ddim_mean_std,
     _head_logprob,
     _sample_head_dppo,
@@ -199,7 +199,7 @@ class DDPODDIMMeanStdTest(unittest.TestCase):
         unet = ZeroUNet()
 
         with patch(
-            "train.finetune.finetune_dppo_dual_head.torch.randn_like",
+            "train.s3_finetune.finetune_dppo_dual_head.torch.randn_like",
             side_effect=lambda tensor: torch.ones_like(tensor),
         ):
             _, chain = _sample_head_dppo(

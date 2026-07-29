@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from train.replanning_dqn import (
+from train.s4_adaptive_replanning import (
     CHUNK_PROGRESS,
     REMAINING_ACTION_MASK,
     REMAINING_ARM_ACTIONS,

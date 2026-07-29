@@ -1,0 +1,48 @@
+# 使用冻结视觉底座和原始多步长轨迹，离线训练标量Q(obs, action)。
+defaults:
+  - default
+  - _self_
+
+hydra:
+  run:
+    dir: outputs/7_adaptive_replanning/action_value/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}
+  job:
+    name: ${env.task}_action_value_train_${now:%Y-%m-%d}_${now:%H-%M-%S}
+  job_logging:
+    handlers:
+      file:
+        mode: a
+
+resume_critic_path: null  # 可选：latest.pt、具体Critic快照或其checkpoints目录。
+
+critic:
+  visual_embed_dim: 256  # 两帧、多相机冻结视觉特征的投影维数。
+  state_embed_dim: 128   # 两帧归一化关节状态的投影维数。
+  action_embed_dim: 128  # 下一条归一化20维动作的投影维数。
+  hidden_dims: [512, 256]
+  output_activation: sigmoid  # 二值终止奖励使理论Q位于[0,1]。
+  initial_q: 0.05             # 避免随机负Q污染单步TD自举目标。
+
+training:
+  # null使用数据集中的全部步长；[4]仅使用固定步长4；[4, 8]混合使用。
+  execution_steps: null
+  gamma: 0.99                 # 严格单步SARSA折扣因子。
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-6
+  batch_size: 32              # 实时编码图像，多相机时显存占用较高。
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+  epochs: 100
+  target_update_tau: 0.005    # Target Critic的Polyak软更新比例。
+  grad_clip_norm: 10.0
+  validation_ratio: 0.1       # 按episode和execution_steps分别划分。
+  log_freq_steps: 100
+  save_freq_epochs: 10
+
+wandb:
+  enable: false
+  project: ${env.task}_action_value
+  notes: ""
+  disable_system_stats: true
+  disable_machine_info: true

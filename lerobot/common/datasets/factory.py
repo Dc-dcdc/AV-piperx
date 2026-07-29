@@ -25,6 +25,69 @@ from omegaconf import ListConfig, OmegaConf
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, MultiLeRobotDataset
 from lerobot.common.datasets.transforms import get_image_transforms
 
+
+def apply_dataset_stats_overrides(dataset, overrides) -> dict[str, dict[str, torch.Tensor]]:
+    """用配置值严格覆盖数据集统计量，并返回实际写入的张量。
+
+    自定义本地数据加载入口不会经过 :func:`make_dataset`，因此覆盖逻辑必须
+    保持为可复用函数。形状或数值异常时直接报错，避免归一化配置被广播或
+    静默忽略。
+    """
+    if not overrides:
+        return {}
+    if not hasattr(dataset, "stats") or dataset.stats is None:
+        raise AttributeError("数据集没有可供覆盖的 stats。")
+
+    applied: dict[str, dict[str, torch.Tensor]] = {}
+    for key, stats_dict in overrides.items():
+        if key not in dataset.stats:
+            raise KeyError(
+                f"override_dataset_stats 包含数据集不存在的字段 {key!r}；"
+                f"可用字段为 {sorted(dataset.stats)}。"
+            )
+
+        applied[key] = {}
+        for stats_type, configured_value in stats_dict.items():
+            if stats_type not in dataset.stats[key]:
+                raise KeyError(
+                    f"数据集统计字段 {key!r} 不包含 {stats_type!r}；"
+                    f"可用统计量为 {sorted(dataset.stats[key])}。"
+                )
+
+            value = (
+                OmegaConf.to_container(configured_value, resolve=True)
+                if OmegaConf.is_config(configured_value)
+                else configured_value
+            )
+            tensor = torch.as_tensor(value, dtype=torch.float32)
+            expected = dataset.stats[key][stats_type]
+            if tensor.shape != expected.shape:
+                raise ValueError(
+                    f"override_dataset_stats[{key!r}][{stats_type!r}] 形状错误："
+                    f"配置为 {tuple(tensor.shape)}，数据集需要 {tuple(expected.shape)}。"
+                )
+            if not torch.isfinite(tensor).all():
+                raise ValueError(
+                    f"override_dataset_stats[{key!r}][{stats_type!r}] 必须全部为有限值。"
+                )
+            if stats_type == "std" and not torch.all(tensor > 0):
+                raise ValueError(
+                    f"override_dataset_stats[{key!r}]['std'] 必须全部大于0。"
+                )
+
+            tensor = tensor.clone()
+            dataset.stats[key][stats_type] = tensor
+            applied[key][stats_type] = tensor
+            logging.info(
+                "已覆盖数据集统计: %s/%s=%s",
+                key,
+                stats_type,
+                tensor.flatten().tolist(),
+            )
+
+    return applied
+
+
 # 将配置文件中的字符串类型的 delta_timestamps 解析为list类型，以便在训练时使用
 def resolve_delta_timestamps(cfg):
     """Resolves delta_timestamps config key (in-place) by using `eval`.
@@ -112,11 +175,9 @@ def make_dataset(cfg, split: str = "train") -> LeRobotDataset | MultiLeRobotData
             video_backend=cfg.video_backend,
         )
 
-    if cfg.get("override_dataset_stats"):
-        for key, stats_dict in cfg.override_dataset_stats.items():
-            for stats_type, listconfig in stats_dict.items():
-                # example of stats_type: min, max, mean, std
-                stats = OmegaConf.to_container(listconfig, resolve=True)
-                dataset.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+    apply_dataset_stats_overrides(
+        dataset,
+        cfg.get("override_dataset_stats"),
+    )
 
     return dataset

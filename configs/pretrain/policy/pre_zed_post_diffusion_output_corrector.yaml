@@ -1,0 +1,199 @@
+# @package _global_
+
+hydra:
+  run:
+    dir: outputs/2_pretrain/post_diffusion_output_corrector/${env.task}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
+  job:
+    name: ${hydra.runtime.choices.policy}_${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+# 冻结原始dual-head，仅训练完整去噪后的14x6动作空间修正器。
+seed: 1000
+
+# 首次训练使用原始dual checkpoint；resume时入口会自动恢复复合checkpoint。
+init_policy_path: outputs/2_pretrain/train/2026-07-16/20-59-53_InsertCylinder-3Arms-v0_pre_zed_dual_head_diffusion/checkpoints/162000_loss=0.0051_sr=87.0_ar=751.50
+
+override_dataset_stats:
+  observation.images.zed_cam_left:
+    mean: [[[0.485]], [[0.456]], [[0.406]]]
+    std: [[[0.229]], [[0.224]], [[0.225]]]
+  observation.images.zed_cam_right:
+    mean: [[[0.485]], [[0.456]], [[0.406]]]
+    std: [[[0.229]], [[0.224]], [[0.225]]]
+
+output_corrector:
+  equivalence_check:
+    enabled: true       # 启动训练前验证scale=0与原dual完整轨迹逐元素一致。
+    seed: 20260727      # 等价性检查使用的固定扩散采样种子。
+
+output_cache:
+  # 保存为root_dir/dual_trajectory_<12位配置哈希>/seed=<seed>/。
+  root_dir: outputs/buffer/post_diffusion_output_corrector  # 多个随机种子共用的持久缓存根目录。
+  resolved_manifests: []               # 自动写入本次联合训练使用的全部manifest路径。
+  resolved_manifest: null              # 兼容旧脚本，指向resolved_manifests中的第一个manifest。
+  source_checkpoint_fingerprint: null  # 首次自动计算基线checkpoint哈希，防止误用其他基线缓存。
+  sampling_seeds: [20260727, 20260728, 20260729, 20260730]  # 逐个生成/复用，四份轨迹联合shuffle训练。
+  sampling_seed: 20260729              # 旧配置兼容字段；sampling_seeds不为null时忽略。
+  storage_dtype: float32               # float32精确；磁盘紧张时可改为float16。
+  batch_size: 10                       # 首次缓存时的DDIM推理批大小，按显存调整。
+  num_workers: 4                       # 首次缓存时的视频/图像读取进程数。
+  persistent_workers: true             # 缓存构建期间复用数据进程。
+  log_every_batches: 50                # 每隔多少个缓存batch打印一次进度。
+  memory_limit_gb: 4.0                 # 缓存小于此值时载入内存，否则使用磁盘mmap。
+  device: ${device}                    # 首次缓存使用的GPU；不会占用异步评估GPU。
+  rebuild: false                       # true强制新建缓存，但不会删除已有缓存。
+
+training:
+  offline_steps: 100000                 # 输出Adapter训练20万步，并按下方频率逐个评估checkpoint。
+  eval_freq: 5000                      # step 0不会评估；之后按频率异步评估修正后策略。
+  save_freq: 5000
+  log_freq: 1000
+  save_checkpoint: true
+  num_workers: 4                       # 轨迹缓存训练DataLoader进程数。
+  persistent_workers: true
+  prefetch_factor: 2
+  batch_size: 256                      # 不再解码图像，可使用较大batch；按内存调整。
+
+  lr: 1.0e-6                           # 兼容通用日志的主学习率字段。
+  output_corrector_lr: 1.0e-6          # 只作用于输出修正器。
+  output_corrector_structural_weight_decay: 1.0e-6  # Attention/线性结构参数弱衰减。
+  lr_backbone: 0.0                     # 视觉编码器完全冻结。
+  lr_scheduler: cosine
+  lr_warmup_steps: 2000
+  adam_betas: [0.95, 0.999]
+  adam_eps: 1.0e-8
+  weight_decay: 0.0                    # 实际分组衰减由专用优化器控制。
+  grad_clip_norm: 10
+  online_steps: 0
+  online_steps_between_rollouts: 1
+
+  delta_timestamps:
+    action: "[i / ${env.fps} for i in range(${policy.horizon})]"
+    observation.state: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.zed_cam_left: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.zed_cam_right: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+
+  # 轨迹缓存只在首次构建时读取图像，修正器训练阶段不会使用图像增强。
+  image_transforms:
+    enable: false
+    max_num_transforms: 3
+    random_order: true
+    brightness:
+      weight: 1
+      min_max: [0.8, 1.2]
+    contrast:
+      weight: 1
+      min_max: [0.8, 1.2]
+    saturation:
+      weight: 1
+      min_max: [0.5, 1.5]
+    hue:
+      weight: 1
+      min_max: [-0.05, 0.05]
+    sharpness:
+      weight: 1
+      min_max: [0.8, 1.2]
+
+eval:
+  async_enabled: true                  # 与训练并行评估修正后策略。
+  device: ${device}                    # 双GPU服务器建议命令行覆盖为eval.device=cuda:1。
+  max_pending: 1
+  skip_if_busy: false                  # 队列忙时等待，确保每个保存的checkpoint都完成评估。
+  wait_at_end: true
+  startup_timeout_s: 180
+  shutdown_timeout_s: 30
+  checkpoint_metric: success
+  max_checkpoints: 10
+  n_episodes: 100
+  max_episodes_rendered: 1
+  batch_size: 15
+  use_async_envs: true
+  records_resume: true
+  fps: 25
+  seed: 100
+  render_camera: [zed_cam_left]
+  max_steps: ${env.episode_length}
+
+policy:
+  name: post_diffusion_output_corrector
+
+  # 必须与init_policy_path中的原始dual模型完全一致。
+  arm_action_dim: 14
+  view_action_dim: 6
+  view_loss_weight: 0.5               # 87%基线checkpoint中的原始View损失权重。
+  n_obs_steps: 2
+  horizon: 16
+  n_action_steps: 8
+
+  # 修正器类型：linear为共享14x6线性基线；bipartite_attention为共享二部图。
+  output_corrector_type: bipartite_attention
+  # 可选view_to_arm、arm_to_view或bidirectional。
+  output_corrector_direction: bidirectional
+  output_corrector_d_model: 64          # 每个动作维度token的隐藏维度。
+  output_corrector_num_heads: 4        # 32维对应每个head 8维。
+  output_corrector_dropout: 0.0
+  output_corrector_residual_limit: 0.5 # 单维归一化动作最大修正绝对值。
+  output_corrector_clamp_actions: true # 修正后限制在扩散动作归一化范围。
+  view_to_arm_output_scale: 1        # View轨迹修正Arm轨迹的外部scale。
+  arm_to_view_output_scale: 1        # Arm轨迹修正View轨迹的外部scale。
+  output_residual_loss_weight: 1.0e-1 # 小幅约束修正量，保护强基线。
+  output_smoothness_loss_weight: 1.0e-3 # 约束相邻时刻修正量变化，减少抖动。
+
+  resize_shape: [240, 320]
+  crop_shape: [216, 288]
+  crop_is_random: true
+  input_shapes:
+    observation.images.zed_cam_left: [3, 480, 640]
+    observation.images.zed_cam_right: [3, 480, 640]
+    observation.state: ["${env.state_dim}"]
+  output_shapes:
+    action: ["${env.action_dim}"]
+
+  input_normalization_modes:
+    observation.images.zed_cam_left: mean_std
+    observation.images.zed_cam_right: mean_std
+    observation.state: mean_std
+  output_normalization_modes:
+    action: min_max
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+  use_group_norm: false
+  spatial_softmax_num_keypoints: 32
+  debug_save_input_images: false
+  down_dims: [128, 256, 512]
+  kernel_size: 5
+  n_groups: 8
+  diffusion_step_embed_dim: 128
+  use_film_scale_modulation: true
+
+  noise_scheduler_type: DDIM
+  num_inference_steps: 10
+  num_train_timesteps: 100
+  beta_schedule: squaredcos_cap_v2
+  beta_start: 0.0001
+  beta_end: 0.02
+  prediction_type: epsilon
+  clip_sample: true
+  clip_sample_range: 1.0
+  do_mask_loss_for_padding: false
+
+  # 这些继承字段只用于完整描述DiffusionConfig；输出修正器不会在去噪中调用它们。
+  coupling_num_heads: 8
+  coupling_dropout: 0.0
+  coupling_mode: full
+  coupling_block_type: scalar_gate
+  coupling_use_temporal_pos_emb: false
+  coupling_use_ffn: false
+  coupling_ffn_ratio: 2.0
+  view_to_arm_coupling_scale: 1.0
+  arm_to_view_coupling_scale: 1.0
+  scid_ridge: 1.0e-3
+  scid_residual_eps: 1.0e-6
+  scid_clamp_reconstructed_view: true
+
+wandb:
+  project: post_diffusion_output_corrector
+  tags:
+    - frozen_dual_head
+    - post_diffusion_output
+    - shared_14x6_graph

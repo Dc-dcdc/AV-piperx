@@ -1,0 +1,11 @@
+# 动作价值轨迹采集和Critic训练共用的模型、数据与运行配置。
+pretrained_ckpt_path: null  # 必填：checkpoint目录或其pretrained_model子目录。
+dataset_dir: outputs/6_action_value_datasets/insert_cylinder  # 原始JPEG+NPZ轨迹目录。
+device: cuda:0              # 冻结扩散策略、视觉底座和Critic使用的设备。
+use_amp: true               # CUDA上使用bfloat16自动混合精度。
+seed: 1000
+
+env:
+  # name为null时从预训练快照config.yaml恢复环境结构。
+  name: null
+  task: InsertCylinder-3Arms-v0
