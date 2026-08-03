@@ -95,10 +95,25 @@ class DiffusionConfig:
         do_mask_loss_for_padding: Whether to mask the loss when there are copy-padded actions. See
             `LeRobotDataset` and `load_previous_and_future_frames` for mor information. Note, this defaults
             to False as the original Diffusion Policy implementation does the same.
-        arm_action_dim: Number of action dimensions modeled by the arm diffusion head. If None, the
-            dual-head policy chooses a conservative default from the total action dimension.
-        view_action_dim: Number of action dimensions modeled by the view/head diffusion head. If None, it is
-            inferred from the total action dimension and `arm_action_dim`.
+        eef_pose_position_loss_weight: Weight of the differentiable-FK end-effector
+            position loss in square metres. ``0`` disables the position branch.
+        eef_pose_rotation_loss_weight: Weight of the differentiable-FK SO(3)
+            geodesic rotation loss in square radians. ``0`` disables the rotation
+            branch. When both pose weights are zero no FK module or pose calculation
+            is used.
+        eef_pose_loss_max_timestep: Optional inclusive diffusion timestep limit for
+            end-effector supervision. Samples above this threshold keep the ordinary
+            denoising loss but skip pose supervision because reconstructed clean
+            actions are unreliable at high noise. ``None`` supervises every timestep.
+        arm_action_dim: Number of leading action dimensions assigned to manipulation arms. If None,
+            the policy chooses a conservative default from the total action dimension.
+        view_action_dim: Number of trailing action dimensions assigned to the View arm/head. If None,
+            it is inferred from the total action dimension and `arm_action_dim`.
+        view_action_representation: Semantics used by the View action slice in single- and dual-head
+            Diffusion policies. ``absolute`` predicts ordinary absolute joint targets.
+            ``delta_from_current`` predicts every future View token relative to the measured View joints
+            at the current replanning instant; the policy restores absolute commands before placing the
+            generated chunk in its execution queue.
         view_loss_weight: Loss weight for the view/head action head when using `dual_head_diffusion`.
         coupling_num_heads: Number of attention heads used for bidirectional bottleneck coupling.
         coupling_dropout: Dropout probability applied to coupling attention and residuals.
@@ -129,12 +144,6 @@ class DiffusionConfig:
             residual. ``0`` disables only View-to-Arm coupling.
         arm_to_view_coupling_scale: Ablation multiplier applied to the Arm-to-View coupling
             residual. ``0`` disables only Arm-to-View coupling.
-        scid_ridge: Ridge regularization used when fitting the fixed Arm-to-View
-            linear predictor in normalized action coordinates.
-        scid_residual_eps: Minimum per-dimension innovation scale used to avoid
-            division by zero for nearly deterministic View joints.
-        scid_clamp_reconstructed_view: Clamp reconstructed normalized View actions
-            to the diffusion scheduler's configured sample range before unnormalization.
     """
 
     # Inputs / output structure.
@@ -200,9 +209,17 @@ class DiffusionConfig:
     ema_decay: float = 0.999
     ema_update_after_step: int = 1000
 
-    # Dual-head diffusion policy. These fields are ignored by the original single-head diffusion policy.
+    # Optional differentiable-FK supervision shared by single- and dual-head diffusion policies.
+    eef_pose_position_loss_weight: float = 0.0
+    eef_pose_rotation_loss_weight: float = 0.0
+    eef_pose_loss_max_timestep: int | None = None
+
+    # Arm/View action semantics shared by single- and dual-head Diffusion policies.
+    # The single-head policy still uses one U-Net, but applies the configured View representation
+    # to the final View slice of its joint action tensor.
     arm_action_dim: int | None = None
     view_action_dim: int | None = None
+    view_action_representation: str = "absolute"
     view_loss_weight: float = 0.2
     coupling_num_heads: int = 8
     coupling_dropout: float = 0.0
@@ -214,15 +231,18 @@ class DiffusionConfig:
     coupling_active_max_timestep: int | None = None
     view_to_arm_coupling_scale: float = 1.0
     arm_to_view_coupling_scale: float = 1.0
-    scid_ridge: float = 1e-3
-    scid_residual_eps: float = 1e-6
-    scid_clamp_reconstructed_view: bool = True
-
     @classmethod
     def from_dict(cls, values: dict) -> "DiffusionConfig":
         """加载配置字典，并忽略旧checkpoint遗留的可配置动作起点。"""
         values = dict(values)
+        # 旧checkpoint没有该字段，其动作语义只能是绝对关节目标。
+        values.setdefault("view_action_representation", "absolute")
         values.pop("action_start", None)
+        # SCID分支移除前，这些字段被写入所有Diffusion checkpoint配置。
+        # 普通Diffusion/Dual/Coupled旧权重仍应能够加载，因此将其作为遗留字段忽略。
+        values.pop("scid_ridge", None)
+        values.pop("scid_residual_eps", None)
+        values.pop("scid_clamp_reconstructed_view", None)
         return cls(**values)
 
     def __post_init__(self):
@@ -262,8 +282,66 @@ class DiffusionConfig:
             raise ValueError(f"`arm_action_dim` must be positive or None. Got {self.arm_action_dim}.")
         if self.view_action_dim is not None and self.view_action_dim <= 0:
             raise ValueError(f"`view_action_dim` must be positive or None. Got {self.view_action_dim}.")
+        supported_view_action_representations = {
+            "absolute",
+            "delta_from_current",
+        }
+        if self.view_action_representation not in supported_view_action_representations:
+            raise ValueError(
+                "`view_action_representation` must be 'absolute' or "
+                f"'delta_from_current'. Got {self.view_action_representation!r}."
+            )
         if self.view_loss_weight < 0:
             raise ValueError(f"`view_loss_weight` must be non-negative. Got {self.view_loss_weight}.")
+        for field_name in (
+            "eef_pose_position_loss_weight",
+            "eef_pose_rotation_loss_weight",
+        ):
+            value = getattr(self, field_name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"`{field_name}` must be finite and non-negative. Got {value}."
+                )
+        if self.eef_pose_loss_max_timestep is not None:
+            threshold = self.eef_pose_loss_max_timestep
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, int)
+                or threshold < 0
+                or threshold >= self.num_train_timesteps
+            ):
+                raise ValueError(
+                    "`eef_pose_loss_max_timestep` must be None or an integer in "
+                    f"[0, num_train_timesteps). Got {threshold!r} with "
+                    f"num_train_timesteps={self.num_train_timesteps}."
+                )
+        eef_pose_loss_enabled = (
+            self.eef_pose_position_loss_weight > 0
+            or self.eef_pose_rotation_loss_weight > 0
+        )
+        if eef_pose_loss_enabled:
+            action_shape = self.output_shapes.get("action")
+            action_dim = action_shape[0] if action_shape else None
+            if action_dim != 20:
+                raise ValueError(
+                    "End-effector pose supervision currently requires the Piper "
+                    f"three-arm 20D joint layout. Got action_dim={action_dim}."
+                )
+            resolved_arm_dim = self.arm_action_dim
+            resolved_view_dim = self.view_action_dim
+            if resolved_arm_dim is None and resolved_view_dim is None:
+                resolved_arm_dim, resolved_view_dim = 14, 6
+            elif resolved_arm_dim is None:
+                resolved_arm_dim = action_dim - resolved_view_dim
+            elif resolved_view_dim is None:
+                resolved_view_dim = action_dim - resolved_arm_dim
+            if resolved_arm_dim != 14 or resolved_view_dim != 6:
+                raise ValueError(
+                    "End-effector pose supervision requires arm_action_dim=14 and "
+                    "view_action_dim=6 for left/right/middle joint routing. Got "
+                    f"arm_action_dim={self.arm_action_dim}, "
+                    f"view_action_dim={self.view_action_dim}."
+                )
         if not isinstance(self.use_ema, bool):
             raise ValueError(f"`use_ema` must be a bool. Got {self.use_ema!r}.")
         if not math.isfinite(self.ema_decay) or not 0.0 <= self.ema_decay < 1.0:
@@ -278,15 +356,6 @@ class DiffusionConfig:
             raise ValueError(
                 "`ema_update_after_step` must be a non-negative integer. "
                 f"Got {self.ema_update_after_step!r}."
-            )
-        if not math.isfinite(self.scid_ridge) or self.scid_ridge < 0:
-            raise ValueError(
-                f"`scid_ridge` must be finite and non-negative. Got {self.scid_ridge}."
-            )
-        if not math.isfinite(self.scid_residual_eps) or self.scid_residual_eps <= 0:
-            raise ValueError(
-                "`scid_residual_eps` must be finite and positive. "
-                f"Got {self.scid_residual_eps}."
             )
         supported_coupling_modes = {
             "full",

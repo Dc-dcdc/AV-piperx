@@ -38,6 +38,9 @@ from lerobot.common.policies.diffusion.modeling_dual_head_diffusion import (
     DualHeadDiffusionModel,
     DualHeadDiffusionPolicy,
 )
+from lerobot.common.policies.diffusion.view_action_representation import (
+    prepare_output_dataset_stats,
+)
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.utils import get_device_from_parameters, get_dtype_from_parameters
 
@@ -181,15 +184,22 @@ class CoupledDualHeadDiffusionPolicy(DualHeadDiffusionPolicy):
         self.normalize_inputs = Normalize(
             config.input_shapes, config.input_normalization_modes, dataset_stats
         )
+        output_dataset_stats = prepare_output_dataset_stats(config, dataset_stats)
         self.normalize_targets = Normalize(
-            config.output_shapes, config.output_normalization_modes, dataset_stats
+            config.output_shapes,
+            config.output_normalization_modes,
+            output_dataset_stats,
         )
         self.unnormalize_outputs = Unnormalize(
-            config.output_shapes, config.output_normalization_modes, dataset_stats
+            config.output_shapes,
+            config.output_normalization_modes,
+            output_dataset_stats,
         )
 
         self._queues = None
         self.diffusion = CoupledDualHeadDiffusionModel(config)
+        self._initialize_view_action_representation()
+        self._initialize_eef_pose_supervision()
         self.expected_image_keys = [
             key for key in config.input_shapes if key.startswith("observation.image")
         ]
@@ -1037,8 +1047,30 @@ class CoupledDualHeadDiffusionModel(DualHeadDiffusionModel):
             self.config.do_mask_loss_for_padding,
         )
         loss = arm_loss + self.view_loss_weight * view_loss
-        return {
+        output_dict = {
             "loss": loss,
             "arm_loss": arm_loss.detach(),
             "view_loss": view_loss.detach(),
         }
+        if self.eef_pose_loss_enabled:
+            arm_x0 = self._prediction_to_x0(
+                noisy_arm,
+                arm_prediction,
+                timesteps,
+                self.arm_noise_scheduler,
+            )
+            view_x0 = self._prediction_to_x0(
+                noisy_view,
+                view_prediction,
+                timesteps,
+                self.view_noise_scheduler,
+            )
+            output_dict["_predicted_action_x0"] = (
+                self.combine_predicted_x0_heads(arm_x0, view_x0)
+            )
+            is_active = self._eef_pose_timestep_is_active(timesteps)
+            output_dict["_eef_pose_valid_roles"] = is_active[:, None].expand(
+                -1,
+                3,
+            )
+        return output_dict

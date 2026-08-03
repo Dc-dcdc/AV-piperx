@@ -10,16 +10,16 @@ class SewNeedleEnv(GuidedVisionEnv):
     """PiperX 三臂缝合针穿引任务环境。"""
 
     def __init__(self, **kwargs):
-        self.enable_reward_debug = bool(kwargs.pop("enable_reward_debug", False))
-        self.hole_y_threshold = float(kwargs.pop("hole_y_threshold", 0.018))
-        self.hole_z_threshold = float(kwargs.pop("hole_z_threshold", 0.018))
-        self.left_grasp_mark_threshold = float(
-            kwargs.pop("left_grasp_mark_threshold", 0.06)
-        )
-        self.success_x_threshold = float(kwargs.pop("success_x_threshold", 0.015))
-        self.success_y_threshold = float(kwargs.pop("success_y_threshold", 0.05))
-        self.success_z_clearance = float(kwargs.pop("success_z_clearance", 0.012))
-        self.success_stable_steps = int(kwargs.pop("success_stable_steps", 5))
+        self.needle_position_ranges = self._validate_reset_position_ranges("needle_position_ranges", kwargs.pop("needle_position_ranges", [[0.15, 0.20], [0.00, 0.20], [0.00, 0.00]]))  # 针初始XYZ范围，单位m。
+        self.wall_position_ranges = self._validate_reset_position_ranges("wall_position_ranges", kwargs.pop("wall_position_ranges", [[-0.025, 0.025], [-0.01, 0.11], [0.00, 0.00]]))  # 孔墙初始XYZ范围，单位m。
+        self.enable_reward_debug = bool(kwargs.pop("enable_reward_debug", False))  # 是否记录奖励阶段、接触和距离信息。
+        self.hole_y_threshold = float(kwargs.pop("hole_y_threshold", 0.018))  # 针穿孔时允许的Y轴孔径误差，单位m。
+        self.hole_z_threshold = float(kwargs.pop("hole_z_threshold", 0.018))  # 针穿孔时允许的Z轴孔径误差，单位m。
+        self.left_grasp_mark_threshold = float(kwargs.pop("left_grasp_mark_threshold", 0.06))  # 左夹爪到接针标记的最大距离，单位m。
+        self.success_x_threshold = float(kwargs.pop("success_x_threshold", 0.015))  # 最终针中心允许的X轴误差，单位m。
+        self.success_y_threshold = float(kwargs.pop("success_y_threshold", 0.05))  # 最终针中心允许的Y轴误差，单位m。
+        self.success_z_clearance = float(kwargs.pop("success_z_clearance", 0.012))  # 最终针中心高于孔出口的安全余量，单位m。
+        self.success_stable_steps = int(kwargs.pop("success_stable_steps", 5))  # 最终成功姿态需要连续保持的仿真步数。
         if self.success_stable_steps < 1:
             raise ValueError("success_stable_steps 必须大于等于 1")
         for name in (
@@ -33,7 +33,7 @@ class SewNeedleEnv(GuidedVisionEnv):
                 raise ValueError(f"{name} 必须大于 0")
         if self.success_z_clearance < 0:
             raise ValueError("success_z_clearance 必须大于等于 0")
-        xml_path = kwargs.pop("xml_path", os.path.join(XML_DIR, "task_sew_needle.xml"))
+        xml_path = kwargs.pop("xml_path", os.path.join(XML_DIR, "task_sew_needle.xml"))  # MuJoCo任务XML路径。
         super().__init__(xml_path, **kwargs)
 
         self._needle_joint = self._mjcf_root.find("joint", "needle_joint")
@@ -249,27 +249,24 @@ class SewNeedleEnv(GuidedVisionEnv):
         }
 
     def reset(self, seed=None, options=None) -> tuple:
+        """重置机器人、针和孔墙的初始位置。"""
         super().reset(seed=seed, options=options)
-        rng = self.np_random
-        # 随机化针的位置
-        x_range = [0.15, 0.2]
-        y_range = [0, 0.2] #中心点0.1
-        z_range = [0.0, 0.0]
-        ranges = np.vstack([x_range, y_range, z_range])
-        needle_position = rng.uniform(ranges[:, 0], ranges[:, 1])
-        needle_quat = np.array([1, 0, 0, 0])
 
-        # 随机化墙(洞)的位置
-        x_range = [-0.025, 0.025]
-        y_range = [-0.01, 0.11]    #中心点0.05
-        z_range = [0.0, 0.0]
-        ranges = np.vstack([x_range, y_range, z_range])
-        wall_position = rng.uniform(ranges[:, 0], ranges[:, 1])
-        wall_quat = np.array([1, 0, 0, 0])
+        needle_position = self._sample_reset_position(
+            self.needle_position_ranges
+        )
+        wall_position = self._sample_reset_position(
+            self.wall_position_ranges
+        )
 
-        self._physics.bind(self._needle_joint).qpos = np.concatenate([needle_position, needle_quat])
-        self._physics.bind(self._wall_joint).qpos = np.concatenate([wall_position, wall_quat])
-
+        self._set_free_joint_reset_pose(
+            self._needle_joint,
+            needle_position,
+        )
+        self._set_free_joint_reset_pose(
+            self._wall_joint,
+            wall_position,
+        )
         self._physics.forward()
         self.needle_reached_exit = False                 # 针头穿墙标志位
         self.left_has_grasped = False                    # 左臂成功接针标志位

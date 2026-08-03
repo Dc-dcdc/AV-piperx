@@ -756,11 +756,10 @@ def make_incremental_policy(
     pretrained_policy_name_or_path: str | None = None,
     dataset_stats=None,
     *,
-    allow_scid_dual_init: bool = False,
     strict_pretrained_loading: bool = False,
 ):
     """为原训练循环提供严格的增量Policy构造函数。"""
-    del allow_scid_dual_init, strict_pretrained_loading
+    del strict_pretrained_loading
     if pretrained_policy_name_or_path is None:
         raise ValueError(
             "增量入口不允许随机初始化；请提供init_policy_path或有效resume_path。"

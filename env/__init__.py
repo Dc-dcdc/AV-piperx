@@ -22,6 +22,24 @@ ENVS = {
         "observation_width": 640,
         "init_config": "sew_needle",
     },
+    "guided_vision/HookPackage-3Arms-v0": {
+        "entry_point": "env.task.hook_package_env:HookPackageEnv",
+        "num_arms": 3,
+        "episode_length": 400,
+        "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
+        "observation_height": 480,
+        "observation_width": 640,
+        "init_config": "hook_package",
+    },
+    "guided_vision/InsertPeg-3Arms-v0": {
+        "entry_point": "env.task.insert_peg_env:InsertPegEnv",
+        "num_arms": 3,
+        "episode_length": 400,
+        "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
+        "observation_height": 480,
+        "observation_width": 640,
+        "init_config": "insert_peg",
+    },
 }
 
 

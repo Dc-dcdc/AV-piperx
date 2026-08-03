@@ -1,0 +1,14 @@
+# @package _global_
+
+dataset_repo_id: av_piper_hook_package_3arms_online_rollout
+
+env:
+  name: guided_vision
+  task: HookPackage-3Arms-v0
+  state_dim: 20
+  action_dim: 20
+  fps: 25
+  episode_length: 400
+
+eval:
+  max_steps: ${env.episode_length}

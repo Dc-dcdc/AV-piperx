@@ -144,6 +144,10 @@ class EpisodeBuffer:
     initial_act: np.ndarray | None = None
     initial_mocap_pos: np.ndarray | None = None
     initial_mocap_quat: np.ndarray | None = None
+    # 无关节静态任务 body 的位置/姿态属于 MuJoCo model 状态，不在
+    # data.qpos 中；保存完整 body 初态以支持后续精确回放。
+    initial_model_body_pos: np.ndarray | None = None
+    initial_model_body_quat: np.ndarray | None = None
     obs_traces: dict[str, list[np.ndarray]] = field(default_factory=dict)
     depth_traces: dict[str, list[np.ndarray]] = field(default_factory=dict)
     joint_actions: list[np.ndarray] = field(default_factory=list)
@@ -533,6 +537,8 @@ def start_episode(
     buffer.initial_act = physics.data.act.copy()
     buffer.initial_mocap_pos = physics.data.mocap_pos.copy()
     buffer.initial_mocap_quat = physics.data.mocap_quat.copy()
+    buffer.initial_model_body_pos = physics.model.body_pos.copy()
+    buffer.initial_model_body_quat = physics.model.body_quat.copy()
     return buffer
 
 
@@ -634,6 +640,8 @@ def save_episode_arrays(buffer: EpisodeBuffer, cfg: DictConfig) -> dict[str, dic
         "initial_act": buffer.initial_act,
         "initial_mocap_pos": buffer.initial_mocap_pos,
         "initial_mocap_quat": buffer.initial_mocap_quat,
+        "initial_model_body_pos": buffer.initial_model_body_pos,
+        "initial_model_body_quat": buffer.initial_model_body_quat,
     }
     for key, value in optional_arrays.items():
         if value is not None:

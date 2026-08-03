@@ -1,0 +1,97 @@
+<mujoco model="hook_package_piper">
+    <include file="piperx_scene.xml"/>
+
+    <asset>
+        <material name="hook_wall_mat" rgba="0.40 0.40 0.40 1"/>
+        <material name="hook_mat" rgba="0.05 0.25 0.95 1"/>
+        <material name="package_mat" rgba="0.95 0.08 0.05 1"/>
+        <material name="success_marker_mat" rgba="0.10 0.90 0.20 0.35"/>
+    </asset>
+
+    <worldbody>
+        <body name="hook_wall" pos="0 0 0">
+            <geom
+                name="hook_wall_geom"
+                type="box"
+                pos="0 0.40 0.30"
+                size="0.40 0.01 0.30"
+                material="hook_wall_mat"
+                friction="0.8"/>
+        </body>
+
+        <!-- Hook固定在墙上，但环境可在reset时直接随机修改该静态body的位置。 -->
+        <body name="hook" pos="0 0.40 0.25">
+            <geom
+                name="hook_geom"
+                type="cylinder"
+                pos="0 0 0"
+                size="0.006 0.10"
+                euler="1.3 0 0"
+                material="hook_mat"
+                friction="1.0"
+                solref="0.01 1"/>
+            <!-- 仅用于几何成功判定和调试显示，不参与碰撞或刚体惯量。 -->
+            <geom
+                name="pin-hook"
+                type="cylinder"
+                pos="0 0 0"
+                size="0.005 0.075"
+                euler="1.3 0 0"
+                material="success_marker_mat"
+                contype="0"
+                conaffinity="0"
+                mass="0"
+                group="3"/>
+        </body>
+
+        <body name="package" pos="0 0 0">
+            <joint name="package_joint" type="free"/>
+            <geom
+                name="package-1"
+                type="box"
+                pos="0 -0.01 0.05"
+                size="0.05 0.015 0.05"
+                material="package_mat"
+                friction="0.8"
+                density="500"/>
+            <geom
+                name="package-2"
+                type="box"
+                pos="-0.015 0 0.115"
+                size="0.005 0.005 0.015"
+                material="package_mat"
+                friction="0.8"
+                density="500"
+                solref="0.01 1"/>
+            <geom
+                name="package-3"
+                type="box"
+                pos="0.015 0 0.115"
+                size="0.005 0.005 0.015"
+                material="package_mat"
+                friction="0.8"
+                density="500"
+                solref="0.01 1"/>
+            <geom
+                name="package-4"
+                type="box"
+                pos="0 0 0.125"
+                size="0.02 0.005 0.005"
+                material="package_mat"
+                friction="0.8"
+                density="500"
+                solref="0.01 1"/>
+            <!-- 包裹顶部挂孔中心的代理标记；只供几何成功判定使用。 -->
+            <geom
+                name="pin-package"
+                type="box"
+                pos="0 0 0.11"
+                size="0.01 0.003 0.01"
+                material="success_marker_mat"
+                contype="0"
+                conaffinity="0"
+                mass="0"
+                group="3"/>
+        </body>
+    </worldbody>
+</mujoco>

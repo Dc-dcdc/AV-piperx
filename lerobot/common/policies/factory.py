@@ -22,7 +22,60 @@ from lerobot.common.policies.policy_protocol import Policy
 from lerobot.common.utils.utils import get_safe_torch_device
 
 
+def _validate_eef_pose_loss_policy_support(hydra_cfg: DictConfig) -> None:
+    """防止不支持的策略静默忽略公共可微FK loss配置。"""
+    position_weight = float(
+        hydra_cfg.policy.get("eef_pose_position_loss_weight", 0.0)
+    )
+    rotation_weight = float(
+        hydra_cfg.policy.get("eef_pose_rotation_loss_weight", 0.0)
+    )
+    if position_weight == 0.0 and rotation_weight == 0.0:
+        return
+
+    supported_policies = {
+        "diffusion",
+        "dual_head_diffusion",
+        "coupled_dual_head_diffusion",
+    }
+    policy_name = str(hydra_cfg.policy.name)
+    if policy_name not in supported_policies:
+        raise ValueError(
+            "可微FK末端位姿监督当前仅支持"
+            "diffusion、dual_head_diffusion、"
+            "coupled_dual_head_diffusion；"
+            f"当前policy.name={policy_name!r}。请将"
+            "eef_pose_position_loss_weight和"
+            "eef_pose_rotation_loss_weight都设为0。"
+        )
+
+
+def _validate_view_action_representation_policy_support(
+    hydra_cfg: DictConfig,
+) -> None:
+    """防止不支持的策略静默忽略View动作表示配置。"""
+    representation = str(
+        hydra_cfg.policy.get("view_action_representation", "absolute")
+    )
+    if representation == "absolute":
+        return
+    supported_policies = {
+        "diffusion",
+        "dual_head_diffusion",
+        "coupled_dual_head_diffusion",
+    }
+    policy_name = str(hydra_cfg.policy.name)
+    if policy_name not in supported_policies:
+        raise ValueError(
+            "view_action_representation='delta_from_current'当前仅支持"
+            "diffusion、dual_head_diffusion和coupled_dual_head_diffusion；"
+            f"当前policy.name={policy_name!r}。"
+        )
+
+
 def _policy_cfg_from_hydra_cfg(policy_cfg_class, hydra_cfg):
+    _validate_eef_pose_loss_policy_support(hydra_cfg)
+    _validate_view_action_representation_policy_support(hydra_cfg)
     expected_kwargs = set(inspect.signature(policy_cfg_class).parameters)
     if not set(hydra_cfg.policy).issuperset(expected_kwargs):
         logging.warning(
@@ -61,13 +114,6 @@ def get_policy_and_config_classes(name: str) -> tuple[Policy, object]:
         from lerobot.common.policies.diffusion.modeling_dual_head_diffusion import DualHeadDiffusionPolicy
 
         return DualHeadDiffusionPolicy, DiffusionConfig
-    elif name == "scid_dual_head_diffusion":
-        from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
-        from lerobot.common.policies.diffusion.modeling_scid_dual_head_diffusion import (
-            SCIDDualHeadDiffusionPolicy,
-        )
-
-        return SCIDDualHeadDiffusionPolicy, DiffusionConfig
     elif name == "coupled_dual_head_diffusion":
         from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
         from lerobot.common.policies.diffusion.modeling_coupled_dual_head_diffusion import (
@@ -120,7 +166,6 @@ def make_policy(
     pretrained_policy_name_or_path: str | None = None,
     dataset_stats=None,
     *,
-    allow_scid_dual_init: bool = False,
     strict_pretrained_loading: bool = False,
 ) -> Policy:
     """Make an instance of a policy class.
@@ -135,9 +180,6 @@ def make_policy(
         dataset_stats: Dataset statistics to use for (un)normalization of inputs/outputs in the policy. Must
             be provided when initializing a new policy, and must not be provided when loading a pretrained
             policy. Therefore, this argument is mutually exclusive with `pretrained_policy_name_or_path`.
-        allow_scid_dual_init: Allow a raw ``dual_head_diffusion`` checkpoint to initialize SCID. This is
-            intended only for a fresh experiment (`init_policy_path`), never for resume/evaluation. The
-            migration validates that the only missing tensors are SCID's fixed transform buffers.
         strict_pretrained_loading: Require every tensor expected by the source policy to exist in the
             checkpoint. HIL fine-tuning should enable this to prevent silently random-initialized layers.
     """
@@ -152,58 +194,6 @@ def make_policy(
     if pretrained_policy_name_or_path is None:
         # Make a fresh policy.
         policy = policy_cls(policy_cfg, dataset_stats)
-    elif hydra_cfg.policy.name == "scid_dual_head_diffusion":
-        # SCID resume/evaluation must be exact: permissive loading could silently
-        # replace a missing transform with the constructor's zero-valued buffers.
-        if not allow_scid_dual_init:
-            source_policy = policy_cls.from_pretrained(
-                pretrained_policy_name_or_path,
-                strict=True,
-            )
-            policy = policy_cls(policy_cfg)
-            policy.load_state_dict(source_policy.state_dict(), strict=True)
-        else:
-            policy = policy_cls(policy_cfg)
-            try:
-                source_policy = policy_cls.from_pretrained(
-                    pretrained_policy_name_or_path,
-                    strict=True,
-                )
-                policy.load_state_dict(source_policy.state_dict(), strict=True)
-            except RuntimeError as scid_error:
-                # A raw dual-head checkpoint has the same encoder/U-Net tensors
-                # and intentionally lacks only the fixed SCID transform.
-                from lerobot.common.policies.diffusion.modeling_dual_head_diffusion import (
-                    DualHeadDiffusionPolicy,
-                )
-
-                try:
-                    source_policy = DualHeadDiffusionPolicy.from_pretrained(
-                        pretrained_policy_name_or_path,
-                        strict=True,
-                    )
-                    incompatible = policy.load_state_dict(
-                        source_policy.state_dict(),
-                        strict=False,
-                    )
-                except Exception as dual_error:
-                    raise RuntimeError(
-                        "Checkpoint is neither an exact SCID checkpoint nor a compatible "
-                        "raw dual-head checkpoint."
-                    ) from dual_error
-
-                allowed_missing = {
-                    "diffusion.scid_matrix",
-                    "diffusion.scid_bias",
-                    "diffusion.scid_residual_scale",
-                    "diffusion.scid_transform_fitted",
-                }
-                if set(incompatible.missing_keys) != allowed_missing or incompatible.unexpected_keys:
-                    raise RuntimeError(
-                        "Unsafe dual-to-SCID checkpoint migration: "
-                        f"missing={incompatible.missing_keys}, "
-                        f"unexpected={incompatible.unexpected_keys}."
-                    ) from scid_error
     else:
         # Load a pretrained policy and override the config if needed (for example, if there are inference-time
         # hyperparameters that we want to vary).
@@ -216,6 +206,23 @@ def make_policy(
             pretrained_policy_name_or_path,
             strict=strict_pretrained_loading,
         )
+        target_representation = str(
+            getattr(policy.config, "view_action_representation", "absolute")
+        )
+        source_representation = str(
+            getattr(
+                source_policy.config,
+                "view_action_representation",
+                "absolute",
+            )
+        )
+        if target_representation != source_representation:
+            raise ValueError(
+                "checkpoint的View动作表示与当前配置不一致，不能仅按相同形状"
+                "加载权重："
+                f"checkpoint={source_representation!r}, "
+                f"current={target_representation!r}。"
+            )
         policy.load_state_dict(source_policy.state_dict(), strict=True)
 
     policy.to(get_safe_torch_device(hydra_cfg.device))

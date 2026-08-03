@@ -15,6 +15,7 @@
         <camera_name>/
           000000.jpg
           000001.jpg
+    episode_000000_aug_00/      # 可选：由源episode 000000生成的第0条增强轨迹
 
 转换后的本地 LeRobot/HF 数据集格式:
   data/train-00000-of-00001.parquet         # 每一帧的 action、observation.state、timestamp、episode/frame/index 以及视频帧引用。
@@ -44,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -76,6 +78,9 @@ from lerobot.common.datasets.push_dataset_to_hub.utils import (  # noqa: E402
 
 DEFAULT_ENCODING = get_default_encoding()
 _ENCODING_CHECKED = False
+RAW_EPISODE_PATTERN = re.compile(
+    r"^episode_(?P<source>\d{6,})(?:_aug_(?P<variant>\d{2,}))?$"
+)
 
 
 # 检查本机 ffmpeg 是否支持指定的视频编码器。
@@ -177,6 +182,18 @@ def resolve_raw_dir(raw_dir: str | Path) -> Path:
 
 
 # 列出可转换的 episode 目录。
+def parse_raw_episode_name(name: str) -> tuple[int, int]:
+    """返回(source_episode, variant)，原始轨迹的variant记为-1。"""
+    match = RAW_EPISODE_PATTERN.fullmatch(str(name))
+    if match is None:
+        raise ValueError(
+            "episode目录必须形如episode_000003或"
+            f"episode_000003_aug_00，当前为{name!r}。"
+        )
+    variant = match.group("variant")
+    return int(match.group("source")), (-1 if variant is None else int(variant))
+
+
 def list_episode_dirs(raw_dir: Path) -> list[Path]:
     episodes_dir = raw_dir / "episodes"
     episode_dirs = [
@@ -186,7 +203,22 @@ def list_episode_dirs(raw_dir: Path) -> list[Path]:
     ]
     if not episode_dirs:
         raise FileNotFoundError(f"No episode_* folders with arrays.npz found in {episodes_dir}.")
-    return sorted(episode_dirs)
+    identities: dict[tuple[int, int], Path] = {}
+    for path in episode_dirs:
+        identity = parse_raw_episode_name(path.name)
+        if identity in identities:
+            raise RuntimeError(
+                "发现重复的source/variant episode目录: "
+                f"{identities[identity]}, {path}"
+            )
+        identities[identity] = path
+    return [
+        path
+        for _, path in sorted(
+            identities.items(),
+            key=lambda item: (item[0][0], item[0][1] + 1),
+        )
+    ]
 
 
 # 加载单条 episode 的 info.json 和 arrays.npz。
@@ -827,10 +859,10 @@ if __name__ == "__main__":
     ACTION_KEY = "joint_action"
 
     # 存放原始采集数据的目录
-    RAW_DIR = "outputs/4_data_collect/quest_teleop/quest_teleop_SewNeedle-3Arms-v0_rgb"
+    RAW_DIR = "outputs/4_data_collect/quest_teleop_recovery/quest_teleop_InsertCylinder-3Arms-v0_rgb_arm_recovery"
 
     # 本地 HF 数据集生成目录。
-    OUTPUT_DIR = "outputs/5_hf_datasets/quest_teleop_SewNeedle-3Arms-v0_rgb_joint"
+    OUTPUT_DIR = "outputs/5_hf_datasets/quest_teleop_InsertCylinder-3Arms-v0_rgb_arm_recovery"
 
     # 本地 HF数据目录 已存在时是否覆盖重建。
     OVERWRITE = True
@@ -838,8 +870,8 @@ if __name__ == "__main__":
     # 最多转换多少条 episode；None 表示全部转换。
     MAX_EPISODES = None
 
-    # 默认转换全部相机，方便同一份 HF 数据集复用于不同训练配置。
-    CAMERAS = None
+    # None 表示默认转换全部相机，方便同一份 HF 数据集复用于不同训练配置。
+    CAMERAS = "zed_cam_left,zed_cam_right"  # "zed_cam_left,zed_cam_right,wrist_cam_left,wrist_cam_right,overhead_cam,worms_eye_cam"
 
     convert_data_folder_to_hf(
         raw_dir=RAW_DIR,

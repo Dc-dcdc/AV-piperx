@@ -56,6 +56,22 @@ ROBOT_INIT_CONFIGS = {
         "right_base_pos": RIGHT_BASE_POS,
         "middle_base_pos": MIDDLE_BASE_POS,
     },
+    "hook_package": {
+        "left_arm_pose": LEFT_ARM_POSE,
+        "right_arm_pose": RIGHT_ARM_POSE,
+        "middle_arm_pose": MIDDLE_ARM_POSE,
+        "left_base_pos": [-0.55, 0.05, 0.0],
+        "right_base_pos": [0.55, 0.05, 0.0],
+        "middle_base_pos": MIDDLE_BASE_POS,
+    },
+    "insert_peg": {
+        "left_arm_pose": LEFT_ARM_POSE,
+        "right_arm_pose": RIGHT_ARM_POSE,
+        "middle_arm_pose": [0.0, 1.34, -1.1, 0.37, 0.0, 0.0],
+        "left_base_pos": [-0.55, 0.05, 0.0],
+        "right_base_pos": [0.55, 0.05, 0.0],
+        "middle_base_pos": MIDDLE_BASE_POS,
+    },
 }
 LEFT_JOINT_NAMES = [
     "left_waist",

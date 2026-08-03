@@ -63,6 +63,10 @@ class GuidedVisionEnv(gym.Env):
                 raise ValueError(f"找不到需要设置初始位置的 body: {body_name}")
             body.pos = np.asarray(base_pos, dtype=np.float64)
         self._physics = mjcf.Physics.from_mjcf_model(self._mjcf_root)    # 构建物理引擎
+        # 子任务若在 reset() 中直接修改 MuJoCo model.body_pos/body_quat，
+        # 应在子类中列出对应 body 名称。轨迹采集会保存完整 model body
+        # 初态，离线重放也会据此拒绝缺少该状态的旧数据，避免静默错位。
+        self.replay_model_body_names: tuple[str, ...] = ()
         self.observation_height = observation_height
         self.observation_width = observation_width
         self._mjcf_root.option.timestep = SIM_PHYSICS_DT                 
@@ -189,6 +193,55 @@ class GuidedVisionEnv(gym.Env):
 
         # return obs_dict
 
+    @staticmethod
+    def _validate_reset_position_ranges(
+        name: str,
+        xyz_ranges,
+    ) -> np.ndarray:
+        """检查并返回形状为(3,2)的XYZ初始位置范围。"""
+        ranges = np.asarray(xyz_ranges, dtype=np.float64)
+        if ranges.shape != (3, 2):
+            raise ValueError(
+                f"{name}必须为(3, 2)，当前为{ranges.shape}。"
+            )
+        if not np.isfinite(ranges).all():
+            raise ValueError(f"{name}包含NaN或Inf。")
+        if np.any(ranges[:, 0] > ranges[:, 1]):
+            raise ValueError(
+                f"{name}要求min<=max，当前为{ranges.tolist()}。"
+            )
+        return ranges
+
+    def _sample_reset_position(self, xyz_ranges) -> np.ndarray:
+        """从[[x_min,x_max],[y_min,y_max],[z_min,z_max]]采样初始位置。"""
+        ranges = self._validate_reset_position_ranges(
+            "xyz_ranges",
+            xyz_ranges,
+        )
+        return self.np_random.uniform(ranges[:, 0], ranges[:, 1])
+
+    def _set_free_joint_reset_pose(
+        self,
+        joint,
+        position,
+    ) -> None:
+        """将自由关节设为指定位置、单位四元数姿态并清零速度。"""
+        position = np.asarray(position, dtype=np.float64)
+        if position.shape != (3,) or not np.isfinite(position).all():
+            raise ValueError("自由关节初始位置必须为有限的三维向量。")
+        binding = self._physics.bind(joint)
+        binding.qpos = np.concatenate(
+            (position, np.array([1.0, 0.0, 0.0, 0.0]))
+        )
+        binding.qvel = np.zeros_like(binding.qvel)
+
+    def _set_body_reset_position(self, body, position) -> None:
+        """设置无关节静态body的初始位置。"""
+        position = np.asarray(position, dtype=np.float64)
+        if position.shape != (3,) or not np.isfinite(position).all():
+            raise ValueError("静态body初始位置必须为有限的三维向量。")
+        self._physics.bind(body).pos = position
+
     def reset(self, seed=None, options=None) -> tuple:
         super().reset(seed=seed)
         self._physics.reset()
@@ -307,7 +360,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="加载指定 Gym 任务环境或 MuJoCo XML，并拼接显示指定相机画面。")
     parser.add_argument(
         "--env-id",
-        default="guided_vision/SewNeedle-3Arms-v0",
+        default="guided_vision/InsertPeg-3Arms-v0",
         help="要加载的 Gym 环境 ID。默认加载插圆柱任务；传空字符串并指定 --xml 可直接查看 XML。",
     )
     parser.add_argument(

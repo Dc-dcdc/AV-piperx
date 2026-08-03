@@ -36,7 +36,11 @@ PRETRAIN_WANDB_PARAMETER_TAGS = (
     ("ema_start", "policy.ema_update_after_step"),        # EMA开始更新的训练步
     ("arm_dim", "policy.arm_action_dim"),                 # 双臂动作维度
     ("view_dim", "policy.view_action_dim"),               # 视角动作维度
+    ("view_repr", "policy.view_action_representation"),   # View输出为绝对关节或当前锚点增量
     ("view_weight", "policy.view_loss_weight"),           # 视角损失权重
+    ("eef_pos_weight", "policy.eef_pose_position_loss_weight"),  # 可微FK末端位置损失权重
+    ("eef_rot_weight", "policy.eef_pose_rotation_loss_weight"),  # 可微FK末端旋转损失权重
+    ("eef_pose_tmax", "policy.eef_pose_loss_max_timestep"),      # 启用末端位姿监督的最大扩散时间步
     ("coupling", "policy.coupling_mode"),                 # 双头瓶颈层token路由模式
     ("coupling_block", "policy.coupling_block_type"),     # scalar gate或role adaLN-Zero
     ("coupling_pos", "policy.coupling_use_temporal_pos_emb"),  # 耦合分支是否加入时间位置编码
@@ -52,7 +56,6 @@ PRETRAIN_WANDB_PARAMETER_TAGS = (
     ("output_v2a_scale", "policy.view_to_arm_output_scale"), # View最终轨迹修正Arm的scale
     ("output_a2v_scale", "policy.arm_to_view_output_scale"), # Arm最终轨迹修正View的scale
     ("output_limit", "policy.output_corrector_residual_limit"), # 单维归一化动作修正上限
-    ("scid_ridge", "policy.scid_ridge"),                  # SCID闭式Arm->View映射的岭正则
 )
 
 
@@ -157,6 +160,15 @@ def log_train_info(logger: Logger, info: dict, step: int, cfg: DictConfig, datas
         log_items.append(f"arm_loss:{info['arm_loss']:.3f}")
     if "view_loss" in info:
         log_items.append(f"view_loss:{info['view_loss']:.3f}")
+    if "view_delta_target_abs_mean_rad" in info:
+        log_items.append(
+            "view_delta:"
+            f"{info['view_delta_target_abs_mean_rad']:.4f}rad"
+        )
+    if "eef_position_error_m" in info:
+        log_items.append(f"eef_pos:{info['eef_position_error_m']:.4f}m")
+    if "eef_rotation_error_rad" in info:
+        log_items.append(f"eef_rot:{info['eef_rotation_error_rad']:.4f}rad")
     log_items.extend(
         [
             f"grdn:{grad_norm:.3f}",

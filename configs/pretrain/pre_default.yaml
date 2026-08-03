@@ -36,6 +36,7 @@ seed: ???
 # datsets are provided.
 dataset_local_dir: null   # 可以从本地数据集加载
 dataset_repo_id: lerobot/pusht
+view_delta_stats_cache_dir: outputs/buffer/view_action_delta_stats  # View增量统计缓存；不修改数据集原始stats。
 video_backend: pyav # 视频解码引擎，读取视频文件转化为图像张量
 
 eval:
@@ -105,9 +106,20 @@ training:
 
 policy:
   do_mask_loss_for_padding: false
+  # 单头/双头Diffusion策略的View动作语义：absolute保持原绝对关节目标；
+  # delta_from_current 使整个未来动作块相对本次重规划的当前View关节。
+  # 默认保留absolute，启用新实验时通过policy.view_action_representation覆盖。
+  view_action_representation: absolute
   # 所有Diffusion预训练策略共用的EMA衰减系数；仅在对应策略use_ema=true时生效。
   # 越接近1越平滑、滞后越明显，例如0.999约对应最近1000次更新的平滑窗口。
   ema_decay: 0.999
+  # 可微FK末端位姿监督公共配置。支持diffusion、dual_head_diffusion、
+  # coupled_dual_head_diffusion训练链路。
+  # 两个系数均为0时不创建FK模块、不重建x0，也不增加训练计算量。
+  eef_pose_position_loss_weight: 0.0  # 末端位置平方误差权重，误差单位为m²。  1.0
+  eef_pose_rotation_loss_weight: 0.0  # SO(3)测地角平方误差权重，单位为rad²。  0.01
+  # 仅对t<=该值的低噪声样本启用位姿监督；null表示所有扩散时间步都启用。
+  eef_pose_loss_max_timestep: 20
 
 wandb:
   enable: true

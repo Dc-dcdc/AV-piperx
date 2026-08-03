@@ -120,7 +120,6 @@ lerobot/common/policies/diffusion/modeling_coupled_dual_head_diffusion.py
 lerobot/common/policies/diffusion/modeling_diffusion.py
 lerobot/common/policies/diffusion/modeling_dual_head_diffusion.py
 lerobot/common/policies/diffusion/modeling_post_diffusion_output_corrector.py
-lerobot/common/policies/diffusion/modeling_scid_dual_head_diffusion.py
 lerobot/common/policies/diffusion/modeling_two_model_diffusion.py
 lerobot/common/policies/tdmpc/configuration_tdmpc.py
 lerobot/common/policies/tdmpc/modeling_tdmpc.py
@@ -167,7 +166,6 @@ tests/test_quest_pose_filter.py
 tests/test_replanning_dqn.py
 tests/test_replanning_dqn_train.py
 tests/test_replanning_fixed_step_eval.py
-tests/test_scid_dual_head_diffusion.py
 tests/test_sew_needle_env.py
 tests/test_vector_info.py
 train/__init__.py
@@ -202,7 +200,6 @@ train/s1_pretrain/eval/output_corrector_ablation.py
 train/s1_pretrain/eval/vector_info.py
 train/s1_pretrain/train/__init__.py
 train/s1_pretrain/train/optimizer_utils.py
-train/s1_pretrain/train/scid_transform.py
 train/s1_pretrain/train/train_human_in_loop.py
 train/s1_pretrain/train/train_pretrain.py
 train/s1_pretrain/train/train_pretrain_collect_data.py

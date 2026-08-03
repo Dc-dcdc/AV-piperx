@@ -51,7 +51,6 @@ from train.s1_pretrain.train.optimizer_utils import (
     partition_optimizer_parameters,
 )
 from train.s1_pretrain.train.ema import PolicyEMA
-from train.s1_pretrain.train.scid_transform import initialize_scid_transform_from_dataset
 from lerobot.common.utils.utils import (
     format_big_number,
     get_safe_torch_device,
@@ -95,7 +94,6 @@ PRETRAIN_WANDB_PARAMETER_TAGS = (
     ("coupling_ffn_ratio", "policy.coupling_ffn_ratio"),
     ("v2a_scale", "policy.view_to_arm_coupling_scale"),   # View上下文注入Arm的外部缩放
     ("a2v_scale", "policy.arm_to_view_coupling_scale"),   # Arm上下文注入View的外部缩放
-    ("scid_ridge", "policy.scid_ridge"),                 # SCID闭式Arm->View映射的岭正则
     ("iwr", "training.iwr.enabled"),                     # 是否使用论文式 IWR
     ("iwr_i_bs", "training.iwr.intervention_batch_size"),
     ("iwr_r_bs", "training.iwr.robot_batch_size"),
@@ -286,7 +284,6 @@ def make_optimizer_and_scheduler(cfg, policy):
     elif cfg.policy.name in [
         "diffusion",
         "dual_head_diffusion",
-        "scid_dual_head_diffusion",
         "coupled_dual_head_diffusion",
         "two_model_diffusion",
     ]:
@@ -735,7 +732,6 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
     if cfg.policy.name in [
         "diffusion",
         "dual_head_diffusion",
-        "scid_dual_head_diffusion",
         "coupled_dual_head_diffusion",
         "two_model_diffusion",
     ] and not any("images" in k for k in delta_timestamps_dict.keys()):
@@ -830,7 +826,6 @@ def validate_pretrained_policy_compatibility(model_dir: Path, cfg: DictConfig) -
     fields = list(BASE_POLICY_COMPATIBILITY_FIELDS)
     if current_policy_name in {
         "dual_head_diffusion",
-        "scid_dual_head_diffusion",
         "coupled_dual_head_diffusion",
         "two_model_diffusion",
     }:
@@ -1401,10 +1396,6 @@ def train_human_in_loop(cfg: DictConfig, out_dir: str | None = None, job_name: s
         hydra_cfg=cfg,
         dataset_stats=None,
         pretrained_policy_name_or_path=str(policy_load_path),
-        allow_scid_dual_init=(
-            cfg.policy.name == "scid_dual_head_diffusion"
-            and not cfg.resume
-        ),
         strict_pretrained_loading=True,
     )
     policy.to(device)
@@ -1416,27 +1407,6 @@ def train_human_in_loop(cfg: DictConfig, out_dir: str | None = None, job_name: s
             ema.decay,
             ema.update_after_step,
         )
-
-    if cfg.policy.name == "scid_dual_head_diffusion":
-        scid_fit = initialize_scid_transform_from_dataset(
-            policy,
-            offline_dataset,
-            resume=bool(cfg.resume),
-        )
-        if scid_fit is None:
-            logging.info("SCID变换已从checkpoint严格恢复，跳过重新拟合。")
-        else:
-            diagnostics = scid_fit.diagnostics
-            logging.info(
-                "SCID变换拟合完成: frames=%d, mean_R2=%.4f, "
-                "cross_corr=%.4f->%.4f, condition=%.3e, scale=%s",
-                diagnostics["num_frames"],
-                diagnostics["view_r2_mean"],
-                diagnostics["raw_cross_corr_norm"],
-                diagnostics["residual_cross_corr_norm"],
-                diagnostics["condition_number"],
-                [round(value, 6) for value in diagnostics["residual_scale"]],
-            )
 
     # 3.2 无论是不是 resume，都必须先根据模型初始化出全新的优化器！
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)

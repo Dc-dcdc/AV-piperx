@@ -62,6 +62,10 @@ class EpisodeBuffer:
     initial_act: np.ndarray | None = None
     initial_mocap_pos: np.ndarray | None = None
     initial_mocap_quat: np.ndarray | None = None
+    # MuJoCo 无关节静态 body（例如 InsertCylinder 容器）的位置不在
+    # data.qpos 中，需要额外保存 model 侧初态才能精确离线重放。
+    initial_model_body_pos: np.ndarray | None = None
+    initial_model_body_quat: np.ndarray | None = None
     video_writer: AsyncEpisodeVideoWriter | None = None
     video_paths: dict[str, Path] = field(default_factory=dict)
     final_info: dict = field(default_factory=dict)
@@ -336,6 +340,16 @@ def save_episode_arrays(buffer: EpisodeBuffer, cfg: DictConfig) -> dict[str, dic
         arrays["initial_mocap_pos"] = np.asarray(buffer.initial_mocap_pos, dtype=np.float64)
     if buffer.initial_mocap_quat is not None:
         arrays["initial_mocap_quat"] = np.asarray(buffer.initial_mocap_quat, dtype=np.float64)
+    if buffer.initial_model_body_pos is not None:
+        arrays["initial_model_body_pos"] = np.asarray(
+            buffer.initial_model_body_pos,
+            dtype=np.float64,
+        )
+    if buffer.initial_model_body_quat is not None:
+        arrays["initial_model_body_quat"] = np.asarray(
+            buffer.initial_model_body_quat,
+            dtype=np.float64,
+        )
     if cfg.save_pose_action:
         arrays["pose_action"] = np.asarray(buffer.pose_actions, dtype=np.float32)
     depth_key_map = {}
@@ -461,6 +475,32 @@ def record_transition(
 def restore_episode_initial_state(buffer: EpisodeBuffer, physics) -> bool:
     if buffer.initial_qpos is None or buffer.initial_qvel is None:
         return False
+
+    model_body_values = (
+        buffer.initial_model_body_pos,
+        buffer.initial_model_body_quat,
+    )
+    if any(value is None for value in model_body_values) and any(
+        value is not None for value in model_body_values
+    ):
+        raise ValueError(
+            "initial_model_body_pos和initial_model_body_quat必须同时存在。"
+        )
+    if buffer.initial_model_body_pos is not None:
+        if physics.model.body_pos.shape != buffer.initial_model_body_pos.shape:
+            raise ValueError(
+                "initial_model_body_pos形状与当前MuJoCo模型不一致: "
+                f"model={physics.model.body_pos.shape}, "
+                f"saved={buffer.initial_model_body_pos.shape}"
+            )
+        if physics.model.body_quat.shape != buffer.initial_model_body_quat.shape:
+            raise ValueError(
+                "initial_model_body_quat形状与当前MuJoCo模型不一致: "
+                f"model={physics.model.body_quat.shape}, "
+                f"saved={buffer.initial_model_body_quat.shape}"
+            )
+        physics.model.body_pos[:] = buffer.initial_model_body_pos
+        physics.model.body_quat[:] = buffer.initial_model_body_quat
 
     physics.data.qpos[:] = buffer.initial_qpos
     physics.data.qvel[:] = buffer.initial_qvel
@@ -955,12 +995,19 @@ def run(cfg: DictConfig) -> None:
                             pose_action_filter.reset()
                             episode_buffer = start_episode(run_dir, episode_index)
                             episode_buffer.initial_time = float(physics.data.time)
+                            # 从专家轨迹中获取初始状态
                             episode_buffer.initial_qpos = physics.data.qpos.copy()
                             episode_buffer.initial_qvel = physics.data.qvel.copy()
                             episode_buffer.initial_ctrl = physics.data.ctrl.copy()
                             episode_buffer.initial_act = physics.data.act.copy()
                             episode_buffer.initial_mocap_pos = physics.data.mocap_pos.copy()
                             episode_buffer.initial_mocap_quat = physics.data.mocap_quat.copy()
+                            episode_buffer.initial_model_body_pos = (
+                                physics.model.body_pos.copy()
+                            )
+                            episode_buffer.initial_model_body_quat = (
+                                physics.model.body_quat.copy()
+                            )
                             recording = True
                             waiting_success_confirm = False
                             skip_recording_this_loop = True
@@ -1307,7 +1354,7 @@ def quest_teleop_collect_cli(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     default_args = [
-        "max_steps_per_episode=400",                  # 最大步长
+        "max_steps_per_episode=350",                  # 最大步长
         "head_control=true",                          # 是否使用头显控制中间臂
         "lock_pitch=False",                            # 是否锁定中间臂 pitch 角，true 时禁用抬头低头
         "lock_roll=true",                             # 是否锁定中间臂 link6 转轴对应的 roll

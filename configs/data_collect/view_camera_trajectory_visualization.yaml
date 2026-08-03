@@ -1,0 +1,50 @@
+# 主动视觉固定关节偏移的真实相机轨迹可视化配置。
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+# 增强raw run根目录；脚本会读取metadata.json并按source_episode组织原始/增强轨迹。
+input_run_dir: outputs/4_data_collect/quest_teleop_augmented/quest_teleop_SewNeedle-3Arms-v0_rgb_view_aug
+# null时选择编号最小且同时具有原始轨迹和增强变体的source；也可指定如3。
+source_episode: 3
+# null表示绘制该source的全部增强变体；也可写成[0, 2, 4]。
+variant_indices: null
+# null时使用input_run_dir/metadata.json中的env_id；显式值必须与metadata一致。
+env_id: null
+
+# raw arrays.npz中保存实际关节状态的字段；View为后6维[14:20]。
+state_key: observation_state
+view_action_start: 14
+view_action_dim: 6
+# 每隔多少帧做一次FK；1表示使用全部帧，且脚本始终补上最后一帧。
+frame_stride: 1
+
+# 输出会自动追加<run名称>/source_episode=<编号>/。
+output_dir: outputs/4_data_collect/view_trajectory_visualization
+
+plot:
+  # world绘制绝对世界坐标；source_start以原轨迹起点作为坐标原点，更便于观察偏移。
+  coordinate_frame: source_start
+  # 是否额外绘制左右ZED轨迹和稀疏双目基线；关闭时主图只画双目几何中心。
+  show_stereo_rails: false
+  # 每条轨迹绘制多少个相机光轴箭头，以及原轨迹与增强轨迹之间的对应连线数量。
+  arrow_count: 5
+  connector_count: 3
+  # null时按轨迹空间范围自动确定光轴箭头长度；也可指定世界坐标单位m。
+  arrow_length_m: null
+  elevation_deg: 24.0
+  azimuth_deg: -55.0
+  dpi: 240
+
+# 只进行FK，不渲染图像；服务器默认使用egl，避免DISPLAY变量存在但X11不可用时的GLFW警告。
+# 本地图形桌面若没有EGL，可覆盖为mujoco_gl=glfw。
+mujoco_gl: egl
+render_device: null
+
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false
+  output_subdir: null

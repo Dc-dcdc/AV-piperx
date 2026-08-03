@@ -130,9 +130,6 @@ policy:
   coupling_ffn_ratio: 2.0
   view_to_arm_coupling_scale: 1.0
   arm_to_view_coupling_scale: 1.0
-  scid_ridge: 1.0e-3
-  scid_residual_eps: 1.0e-6
-  scid_clamp_reconstructed_view: true
 
 eval:
   seed: 1400

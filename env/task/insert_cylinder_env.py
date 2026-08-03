@@ -10,12 +10,14 @@ class InsertCylinderEnv(GuidedVisionEnv):
     """Piper 挡板遮挡下的圆柱放入容器任务环境。"""
 
     def __init__(self, **kwargs):
-        self.success_xy_threshold = float(kwargs.pop("success_xy_threshold", 0.012))
-        self.success_z_threshold = float(kwargs.pop("success_z_threshold", 0.025))
-        self.cylinder_target_z = float(kwargs.pop("cylinder_target_z", 0.04))
-        self.enable_reward_debug = bool(kwargs.pop("enable_reward_debug", False))
+        self.cylinder_position_ranges = self._validate_reset_position_ranges("cylinder_position_ranges", kwargs.pop("cylinder_position_ranges", [[0.045, 0.045], [0.05, 0.25], [0.01, 0.01]]))  # 圆柱初始XYZ范围，单位m。
+        self.container_position_ranges = self._validate_reset_position_ranges("container_position_ranges", kwargs.pop("container_position_ranges", [[-0.045, -0.045], [0.05, 0.25], [0.00, 0.00]]))  # 容器初始XYZ范围，单位m。
+        self.success_xy_threshold = float(kwargs.pop("success_xy_threshold", 0.012))  # 圆柱底部到容器中心的最大平面误差，单位m。
+        self.success_z_threshold = float(kwargs.pop("success_z_threshold", 0.025))  # 预留的垂直误差阈值，当前成功判定未使用。
+        self.cylinder_target_z = float(kwargs.pop("cylinder_target_z", 0.04))  # 计算圆柱目标距离时采用的目标高度，单位m。
+        self.enable_reward_debug = bool(kwargs.pop("enable_reward_debug", False))  # 是否记录奖励阶段、接触和距离信息。
 
-        xml_path = kwargs.pop("xml_path", os.path.join(XML_DIR, "task_insert_cylinder_piper.xml"))
+        xml_path = kwargs.pop("xml_path", os.path.join(XML_DIR, "task_insert_cylinder_piper.xml"))  # MuJoCo任务XML路径。
         super().__init__(xml_path, **kwargs)
 
         self._cylinder_joint = self._mjcf_root.find("joint", "insert_cylinder_joint")
@@ -30,6 +32,9 @@ class InsertCylinderEnv(GuidedVisionEnv):
         ):
             if element is None:
                 raise ValueError(f"Piper insert cylinder XML 缺少必要元素: {name}")
+        # 容器没有 joint；reset() 直接随机修改 model.body_pos，因此它不会
+        # 出现在 data.qpos 中，必须由轨迹初态额外保存并在回放前恢复。
+        self.replay_model_body_names = ("cylinder_container",)
         self._prev_metrics = {}
         self.right_has_grasped = False
         self.left_has_received = False
@@ -181,26 +186,22 @@ class InsertCylinderEnv(GuidedVisionEnv):
     def reset(self, seed=None, options=None) -> tuple:
         """重置机器人、圆柱和容器初始位置。"""
         super().reset(seed=seed, options=options)
-        rng = self.np_random
 
-        x_range = [0.045, 0.045]
-        y_range = [0.05, 0.25]
-        z_range = [0.01, 0.01]
-        ranges = np.vstack([x_range, y_range, z_range])
-        cylinder_position = rng.uniform(ranges[:, 0], ranges[:, 1])
-        cylinder_quat = np.array([1, 0, 0, 0])
+        cylinder_position = self._sample_reset_position(
+            self.cylinder_position_ranges
+        )
+        container_position = self._sample_reset_position(
+            self.container_position_ranges
+        )
 
-        self._physics.bind(self._cylinder_joint).qpos = np.concatenate([cylinder_position, cylinder_quat])
-        self._physics.bind(self._cylinder_joint).qvel = np.zeros(6)
-
-        container_position = np.array([
-            rng.uniform(-0.045, -0.045),
-            rng.uniform(0.05, 0.25),
-            0.0,
-        ], dtype=np.float64)
-        self._physics.bind(self._container_body).pos = container_position
-
-
+        self._set_free_joint_reset_pose(
+            self._cylinder_joint,
+            cylinder_position,
+        )
+        self._set_body_reset_position(
+            self._container_body,
+            container_position,
+        )
         self._physics.forward()
 
         self.terminated = False

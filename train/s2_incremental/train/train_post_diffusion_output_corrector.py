@@ -1249,10 +1249,9 @@ def make_output_corrector_policy(
     pretrained_policy_name_or_path: str | None = None,
     dataset_stats=None,
     *,
-    allow_scid_dual_init: bool = False,
     strict_pretrained_loading: bool = False,
 ):
-    del allow_scid_dual_init, strict_pretrained_loading
+    del strict_pretrained_loading
     if pretrained_policy_name_or_path is None:
         raise ValueError(
             "输出修正器入口不允许随机初始化，必须使用init_policy_path或resume_path。"

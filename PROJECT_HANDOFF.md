@@ -183,49 +183,6 @@ arm_to_view_coupling_scale: 0.5
 前缀更新/后缀瓶颈不变、双向梯度、端到端前向及严格checkpoint兼容测试；尚未有训练
 成功率结果，不能预先声称优于无耦合双扩散头。
 
-### 4.7 SCID Schur补创新双扩散
-
-2026-07-17 新增独立策略 `scid_dual_head_diffusion`，核心文件：
-
-```text
-lerobot/common/policies/diffusion/modeling_scid_dual_head_diffusion.py
-train/s1_pretrain/train/scid_transform.py
-configs/pretrain/policy/pre_zed_scid_dual_head_diffusion.yaml
-configs/finetune/policy/ft_zed_scid_dual_head_diffusion.yaml
-tests/test_scid_dual_head_diffusion.py
-```
-
-SCID不与FULL/RBAC叠加。它保留共享视觉编码器和两个独立UNet，将第二头的扩散变量从原始View动作改为创新残差：
-
-```text
-R = V - (G A + b)
-R_scaled = R / residual_scale
-V_hat = G A_hat + b + residual_scale * R_scaled_hat
-```
-
-实现边界：
-
-- `G[6,14]`、`b[6]`和`residual_scale[6]`在Policy实际使用的min-max归一化动作坐标中拟合。
-- 拟合直接读取底层HF dataset的原始单帧`action`列，不展开horizon、不计episode边界padding、不解码图片。
-- 三个变换量和`scid_transform_fitted`作为persistent buffers保存在checkpoint中，不参与梯度更新。
-- fresh训练自动拟合；SCID resume/评估必须严格恢复已有变换，禁止静默重拟合。
-- HIL专用`pretrained_model_path`可受控加载原始`dual_head_diffusion`权重；
-  只允许缺少四个SCID buffers，随后从当前训练集拟合。
-- 对外仍输出原始20维Arm/View动作，动作队列、反归一化和实机接口不变。
-- DPPO chain保留`(A,R_scaled)`计算likelihood，仅发送环境前解码成`(A,V)`；联合ratio仍覆盖14+6维潜变量。
-- 事件重规划DQN的完整动作采样已统一调用`combine_action_heads()`：耦合策略行为不变，独立dual和SCID也能生成正确的原始View动作。
-- 当前第一版只支持`action: min_max`，重建View默认截断到归一化范围`[-1,1]`。
-
-对当前36,170帧训练数据的全量拟合诊断（不是留出集性能）：
-
-```text
-mean View R2 = 0.8078
-Arm-View cross-correlation Frobenius norm: 4.3637 -> 0.0403
-residual_scale = [0.6719, 0.7190, 0.8577, 0.7874, 0.6111, 0.5105]
-```
-
-这些数值只证明闭式坐标分解在训练数据上成立，不能代替策略成功率实验。
-
 ## 5. DPPO 现状
 
 ### 5.1 共享数学实现
@@ -597,7 +554,6 @@ tests/test_pretrain_eval_metrics.py
 tests/test_replanning_dqn.py
 tests/test_replanning_dqn_train.py
 tests/test_replanning_fixed_step_eval.py
-tests/test_scid_dual_head_diffusion.py
 tests/test_vector_info.py
 ```
 
@@ -624,12 +580,6 @@ OK
 - 固定执行步长评估使用新 `SimpleNamespace` 配置完成1 episode/1 step 冒烟测试，成功生成 JSON/CSV/Markdown 报告。
 
 冒烟测试不等于正式性能实验。
-
-2026-07-17 SCID验证：
-
-- SCID独立测试12项通过。
-- replanning DQN、coupled dual-head与DPPO相关回归36项通过。
-- 全量`unittest discover`中96项通过；`test_logger_wandb_resume`因当前AV-piper环境未安装`pytest`而在导入阶段报错，与SCID代码无关。
 
 ## 13. 当前未提交工作树提醒
 

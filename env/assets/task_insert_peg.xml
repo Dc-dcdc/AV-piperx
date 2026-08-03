@@ -1,0 +1,76 @@
+<mujoco model="insert_peg_piper">
+    <include file="piperx_scene.xml"/>
+
+    <asset>
+        <material name="peg_mat" rgba="0.95 0.08 0.05 1"/>
+        <material name="hole_mat" rgba="0.05 0.25 0.95 1"/>
+        <material name="insert_marker_mat" rgba="0.10 0.90 0.20 0.20"/>
+    </asset>
+
+    <worldbody>
+        <!-- 右臂抓取的长方体Peg，长轴为局部X轴。 -->
+        <body name="peg" pos="0.15 0 0.01">
+            <joint name="peg_joint" type="free"/>
+            <geom
+                name="peg"
+                type="box"
+                size="0.08 0.01 0.01"
+                material="peg_mat"
+                friction="1.0"
+                solref="0.01 1"
+                mass="0.08"/>
+        </body>
+
+        <!-- 左臂抓取的方形插座，内部通道同样沿局部X轴。 -->
+        <body name="hole" pos="-0.15 0 0.021">
+            <joint name="hole_joint" type="free"/>
+            <geom
+                name="hole-1"
+                type="box"
+                pos="0 0 -0.02"
+                size="0.08 0.018 0.002"
+                material="hole_mat"
+                friction="1.0"
+                solref="0.01 1"
+                mass="0.04"/>
+            <geom
+                name="hole-2"
+                type="box"
+                pos="0 0 0.02"
+                size="0.08 0.018 0.002"
+                material="hole_mat"
+                friction="1.0"
+                solref="0.01 1"
+                mass="0.04"/>
+            <geom
+                name="hole-3"
+                type="box"
+                pos="0 0.02 0"
+                size="0.08 0.002 0.018"
+                material="hole_mat"
+                friction="1.0"
+                solref="0.01 1"
+                mass="0.04"/>
+            <geom
+                name="hole-4"
+                type="box"
+                pos="0 -0.02 0"
+                size="0.08 0.002 0.018"
+                material="hole_mat"
+                friction="1.0"
+                solref="0.01 1"
+                mass="0.04"/>
+
+            <!-- 仅用于显示插座内部目标区域，不参与碰撞和成功判定。 -->
+            <geom
+                name="insert_target_marker"
+                type="box"
+                size="0.04 0.01 0.01"
+                material="insert_marker_mat"
+                contype="0"
+                conaffinity="0"
+                mass="0"
+                group="3"/>
+        </body>
+    </worldbody>
+</mujoco>

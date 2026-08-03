@@ -36,6 +36,15 @@ from huggingface_hub import PyTorchModelHubMixin
 from torch import Tensor, nn
 
 from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.common.policies.diffusion.view_action_representation import (
+    VIEW_ACTION_ABSOLUTE,
+    VIEW_ACTION_DELTA_FROM_CURRENT,
+    decode_actions_delta_from_current,
+    encode_actions_delta_from_current,
+    extract_current_view_anchor,
+    prepare_output_dataset_stats,
+    resolve_dual_head_action_dims,
+)
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.utils import (
     get_device_from_parameters,
@@ -83,22 +92,219 @@ class DiffusionPolicy(
         self.normalize_inputs = Normalize(
             config.input_shapes, config.input_normalization_modes, dataset_stats
         )
+        output_dataset_stats = prepare_output_dataset_stats(config, dataset_stats)
         self.normalize_targets = Normalize(
-            config.output_shapes, config.output_normalization_modes, dataset_stats
+            config.output_shapes,
+            config.output_normalization_modes,
+            output_dataset_stats,
         )
         self.unnormalize_outputs = Unnormalize(
-            config.output_shapes, config.output_normalization_modes, dataset_stats
+            config.output_shapes,
+            config.output_normalization_modes,
+            output_dataset_stats,
         )
 
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
         self._queues = None
 
         self.diffusion = DiffusionModel(config)
+        self._initialize_view_action_representation()
+        self._initialize_eef_pose_supervision()
 
         self.expected_image_keys = [k for k in config.input_shapes if k.startswith("observation.image")]
         self.use_env_state = "observation.environment_state" in config.input_shapes
 
         self.reset()
+
+    def _initialize_view_action_representation(self) -> None:
+        """初始化单头20维输出中的Arm/View切片及无参数编解码语义。"""
+        self.arm_action_dim, self.view_action_dim = (
+            resolve_dual_head_action_dims(self.config)
+        )
+        self.view_action_representation = str(
+            getattr(
+                self.config,
+                "view_action_representation",
+                VIEW_ACTION_ABSOLUTE,
+            )
+        )
+        if self.view_action_representation == VIEW_ACTION_DELTA_FROM_CURRENT:
+            state_dim = int(self.config.input_shapes["observation.state"][0])
+            required_state_dim = self.arm_action_dim + self.view_action_dim
+            if state_dim < required_state_dim:
+                raise ValueError(
+                    "delta_from_current模式要求observation.state包含对应的"
+                    f"Arm/View关节，至少需要{required_state_dim}维，当前为"
+                    f"{state_dim}维。"
+                )
+
+    @property
+    def uses_view_delta_from_current(self) -> bool:
+        return self.view_action_representation == VIEW_ACTION_DELTA_FROM_CURRENT
+
+    def _extract_current_view_anchor(self, observation_state: Tensor) -> Tensor:
+        return extract_current_view_anchor(
+            observation_state,
+            arm_action_dim=self.arm_action_dim,
+            view_action_dim=self.view_action_dim,
+        )
+
+    def _encode_actions_for_model(
+        self,
+        absolute_actions: Tensor,
+        view_anchor: Tensor,
+    ) -> Tensor:
+        return encode_actions_delta_from_current(
+            absolute_actions,
+            view_anchor,
+            arm_action_dim=self.arm_action_dim,
+            view_action_dim=self.view_action_dim,
+        )
+
+    def _decode_actions_for_environment(
+        self,
+        model_actions: Tensor,
+        view_anchor: Tensor,
+    ) -> Tensor:
+        return decode_actions_delta_from_current(
+            model_actions,
+            view_anchor,
+            arm_action_dim=self.arm_action_dim,
+            view_action_dim=self.view_action_dim,
+        )
+
+    def _initialize_eef_pose_supervision(self) -> None:
+        """按loss系数创建训练期FK；双系数为0时保持完全关闭。"""
+        self.eef_pose_position_loss_weight = float(
+            getattr(self.config, "eef_pose_position_loss_weight", 0.0)
+        )
+        self.eef_pose_rotation_loss_weight = float(
+            getattr(self.config, "eef_pose_rotation_loss_weight", 0.0)
+        )
+        self.eef_pose_loss_enabled = (
+            self.eef_pose_position_loss_weight > 0
+            or self.eef_pose_rotation_loss_weight > 0
+        )
+        if self.eef_pose_loss_enabled:
+            from lerobot.common.policies.diffusion.eef_pose_loss import (
+                PiperEndEffectorPoseLoss,
+            )
+
+            self.eef_pose_loss_module: nn.Module | None = (
+                PiperEndEffectorPoseLoss()
+            )
+        else:
+            # 明确不实例化FK模块，保证两个系数为0时没有额外矩阵计算。
+            self.eef_pose_loss_module = None
+
+    def _unnormalize_actions_with_grad(self, normalized_actions: Tensor) -> Tensor:
+        """以可微方式恢复物理关节角；官方Unnormalize仅用于无梯度推理。"""
+        mode = self.config.output_normalization_modes["action"]
+        buffer = getattr(self.unnormalize_outputs, "buffer_action")
+        if mode == "mean_std":
+            mean = buffer["mean"]
+            std = buffer["std"]
+            if torch.isinf(mean).any() or torch.isinf(std).any():
+                raise RuntimeError("末端位姿监督无法使用未初始化的action统计量。")
+            return normalized_actions * std + mean
+        if mode == "min_max":
+            minimum = buffer["min"]
+            maximum = buffer["max"]
+            if torch.isinf(minimum).any() or torch.isinf(maximum).any():
+                raise RuntimeError("末端位姿监督无法使用未初始化的action统计量。")
+            return (normalized_actions + 1.0) * 0.5 * (
+                maximum - minimum
+            ) + minimum
+        raise ValueError(
+            "末端位姿监督不支持action归一化模式"
+            f"{mode!r}。"
+        )
+
+    def _add_eef_pose_supervision(
+        self,
+        diffusion_loss: Tensor,
+        predicted_x0: Tensor,
+        timesteps: Tensor,
+        target_actions: Tensor,
+        action_is_pad: Tensor,
+        view_anchor: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """把单头U-Net的干净动作预测转换为可微FK辅助监督。"""
+        if self.eef_pose_loss_module is None:
+            raise RuntimeError("FK监督开启，但Piper FK模块尚未初始化。")
+
+        predicted_actions = self._unnormalize_actions_with_grad(predicted_x0)
+        if self.uses_view_delta_from_current:
+            if view_anchor is None:
+                raise RuntimeError(
+                    "delta_from_current模式计算FK损失时缺少当前View锚点。"
+                )
+            # FK监督始终消费环境语义的绝对关节角。
+            predicted_actions = self._decode_actions_for_environment(
+                predicted_actions,
+                view_anchor,
+            )
+        is_active = self.diffusion.eef_pose_timestep_is_active(timesteps)
+        valid_roles = is_active[:, None, None].expand(
+            -1,
+            predicted_actions.shape[1],
+            self.eef_pose_loss_module.num_roles,
+        )
+        if action_is_pad is not None:
+            valid_roles = valid_roles & (~action_is_pad).unsqueeze(-1)
+
+        pose_losses = self.eef_pose_loss_module(
+            predicted_actions,
+            target_actions,
+            valid_roles,
+            compute_position=self.eef_pose_position_loss_weight > 0,
+            compute_rotation=self.eef_pose_rotation_loss_weight > 0,
+        )
+        zero = diffusion_loss.new_zeros(())
+        weighted_position_loss = zero
+        if "eef_position_loss" in pose_losses:
+            weighted_position_loss = (
+                self.eef_pose_position_loss_weight
+                * pose_losses["eef_position_loss"]
+            )
+        weighted_rotation_loss = zero
+        if "eef_rotation_loss" in pose_losses:
+            weighted_rotation_loss = (
+                self.eef_pose_rotation_loss_weight
+                * pose_losses["eef_rotation_loss"]
+            )
+
+        output_dict = {
+            "loss": (
+                diffusion_loss
+                + weighted_position_loss
+                + weighted_rotation_loss
+            ),
+        }
+        if "eef_position_loss" in pose_losses:
+            output_dict["eef_position_loss"] = pose_losses[
+                "eef_position_loss"
+            ].detach()
+            output_dict["eef_position_error_m"] = pose_losses[
+                "eef_position_error_m"
+            ]
+            output_dict["eef_position_weighted_loss"] = (
+                weighted_position_loss.detach()
+            )
+        if "eef_rotation_loss" in pose_losses:
+            output_dict["eef_rotation_loss"] = pose_losses[
+                "eef_rotation_loss"
+            ].detach()
+            output_dict["eef_rotation_error_rad"] = pose_losses[
+                "eef_rotation_error_rad"
+            ]
+            output_dict["eef_rotation_weighted_loss"] = (
+                weighted_rotation_loss.detach()
+            )
+        output_dict["eef_pose_active_role_fraction"] = (
+            valid_roles.float().mean().detach()
+        )
+        return output_dict
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -125,6 +331,15 @@ class DiffusionPolicy(
 
         This requires `n_action_steps <= horizon - n_obs_steps + 1`.
         """
+        view_anchor = None
+        if (
+            self.uses_view_delta_from_current
+            and len(self._queues["action"]) == 0
+        ):
+            # 必须在输入归一化前读取本次重规划时刻的真实View关节。
+            view_anchor = self._extract_current_view_anchor(
+                batch["observation.state"]
+            )
         batch = self.normalize_inputs(batch)
         if len(self.expected_image_keys) > 0:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -139,6 +354,16 @@ class DiffusionPolicy(
 
             # TODO(rcadene): make above methods return output dictionary?
             actions = self.unnormalize_outputs({"action": actions})["action"]
+            if self.uses_view_delta_from_current:
+                if view_anchor is None:
+                    raise RuntimeError(
+                        "生成新的View增量动作块时没有捕获当前关节锚点。"
+                    )
+                # 整个chunk以同一个重规划锚点解码，队列始终保存绝对动作。
+                actions = self._decode_actions_for_environment(
+                    actions,
+                    view_anchor,
+                )
 
             self._queues["action"].extend(actions.transpose(0, 1))
 
@@ -147,13 +372,45 @@ class DiffusionPolicy(
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Run the batch through the model and compute the loss for training or validation."""
+        target_actions = batch["action"] if self.eef_pose_loss_enabled else None
+        view_anchor = None
+        view_delta_target = None
+        if self.uses_view_delta_from_current:
+            view_anchor = self._extract_current_view_anchor(
+                batch["observation.state"]
+            )
+            batch = dict(batch)
+            batch["action"] = self._encode_actions_for_model(
+                batch["action"],
+                view_anchor,
+            )
+            view_delta_target = batch["action"][..., self.arm_action_dim :]
         batch = self.normalize_inputs(batch)
         if len(self.expected_image_keys) > 0:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
         batch = self.normalize_targets(batch)
-        loss = self.diffusion.compute_loss(batch)
-        return {"loss": loss}
+        result = self.diffusion.compute_loss(
+            batch,
+            return_predicted_x0=self.eef_pose_loss_enabled,
+        )
+        if not self.eef_pose_loss_enabled:
+            output_dict = {"loss": result}
+        else:
+            diffusion_loss, predicted_x0, timesteps = result
+            output_dict = self._add_eef_pose_supervision(
+                diffusion_loss,
+                predicted_x0,
+                timesteps,
+                target_actions,
+                batch["action_is_pad"],
+                view_anchor,
+            )
+        if view_delta_target is not None:
+            output_dict["view_delta_target_abs_mean_rad"] = (
+                view_delta_target.detach().abs().mean()
+            )
+        return output_dict
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -204,6 +461,48 @@ class DiffusionModel(nn.Module):
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
             self.num_inference_steps = config.num_inference_steps
+        eef_pose_loss_max_timestep = getattr(
+            config,
+            "eef_pose_loss_max_timestep",
+            None,
+        )
+        self.eef_pose_loss_max_timestep = (
+            None
+            if eef_pose_loss_max_timestep is None
+            else int(eef_pose_loss_max_timestep)
+        )
+
+    def _prediction_to_x0(
+        self,
+        noisy_trajectory: Tensor,
+        prediction: Tensor,
+        timesteps: Tensor,
+    ) -> Tensor:
+        """把epsilon/sample预测还原成归一化的干净动作 ``x_0``。"""
+        if self.config.prediction_type == "sample":
+            return prediction
+        if self.config.prediction_type != "epsilon":
+            raise ValueError(
+                f"Unsupported prediction type {self.config.prediction_type}"
+            )
+        alpha_cumprod = self.noise_scheduler.alphas_cumprod.to(
+            device=noisy_trajectory.device,
+            dtype=noisy_trajectory.dtype,
+        )[timesteps]
+        expand_shape = (timesteps.shape[0],) + (1,) * (
+            noisy_trajectory.ndim - 1
+        )
+        alpha_cumprod = alpha_cumprod.reshape(expand_shape)
+        return (
+            noisy_trajectory
+            - torch.sqrt((1.0 - alpha_cumprod).clamp_min(0.0)) * prediction
+        ) / torch.sqrt(alpha_cumprod.clamp_min(1e-12))
+
+    def eef_pose_timestep_is_active(self, timesteps: Tensor) -> Tensor:
+        """返回每个batch样本是否处于允许FK监督的低噪声阶段。"""
+        if self.eef_pose_loss_max_timestep is None:
+            return torch.ones_like(timesteps, dtype=torch.bool)
+        return timesteps <= self.eef_pose_loss_max_timestep
 
     # ========= inference  ============
     def conditional_sample(
@@ -287,7 +586,12 @@ class DiffusionModel(nn.Module):
 
         return actions
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+    def compute_loss(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        return_predicted_x0: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
         """
         This function expects `batch` to have (at least):
         {
@@ -350,7 +654,15 @@ class DiffusionModel(nn.Module):
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
 
-        return loss.mean()
+        reduced_loss = loss.mean()
+        if not return_predicted_x0:
+            return reduced_loss
+        predicted_x0 = self._prediction_to_x0(
+            noisy_trajectory,
+            pred,
+            timesteps,
+        )
+        return reduced_loss, predicted_x0, timesteps
 
 
 class SpatialSoftmax(nn.Module):

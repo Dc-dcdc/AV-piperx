@@ -496,9 +496,7 @@ def forward_dppo_from_global_cond(self, global_cond: torch.Tensor, return_chain=
         self.diffusion.view_action_dim,
         return_chain,
     )
-    # For SCID, the second sampled head is innovation space.  Keep the
-    # recorded chain in (Arm, innovation) coordinates for likelihoods, and
-    # decode only the action trajectory sent to the environment.
+    # 统一通过模型接口组合两个动作头，兼容普通双头与耦合双头。
     normalized_actions = self.diffusion.combine_action_heads(
         arm_actions,
         view_actions,
@@ -774,7 +772,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             raise TypeError(
                 f"双头DPPO需要DualHeadDiffusionPolicy，实际加载为{type(actor).__name__}；"
                 "请确认checkpoint的policy.name为dual_head_diffusion或"
-                "coupled_dual_head_diffusion或scid_dual_head_diffusion。"
+                "coupled_dual_head_diffusion。"
             )
         actor_device = get_device_from_parameters(actor)
         if actor_device != device:

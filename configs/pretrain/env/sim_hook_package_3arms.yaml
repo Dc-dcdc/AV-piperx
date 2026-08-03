@@ -1,0 +1,20 @@
+# @package _global_
+
+dataset_repo_id: Dc-dc/quest_teleop_HookPackage-3Arms-v0_rgb_joint
+fps: 25
+
+eval:
+  # PiperX MuJoCo与多相机渲染默认使用同步环境，服务器确认稳定后可再开启并行。
+  use_async_envs: false
+  max_steps: ${env.episode_length}
+
+env:
+  name: guided_vision
+  task: HookPackage-3Arms-v0
+  state_dim: 20
+  action_dim: 20
+  fps: ${fps}
+  episode_length: 400
+
+wandb:
+  project: ${env.task}_pretrain

@@ -446,7 +446,7 @@ def infer_full_joint_chunk(
             global_cond=global_cond,
             generator=generator,
         )
-    # Raw dual/coupled直接拼接；SCID在这里把innovation解码为原始View动作。
+    # 通过统一接口组合普通双头或耦合双头的Arm/View动作。
     normalized_actions = policy.diffusion.combine_action_heads(
         arm_actions,
         view_head_actions,

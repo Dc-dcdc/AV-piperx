@@ -41,7 +41,6 @@ from train.s1_pretrain.train.optimizer_utils import (
     partition_optimizer_parameters,
 )
 from train.s1_pretrain.train.ema import PolicyEMA
-from train.s1_pretrain.train.scid_transform import initialize_scid_transform_from_dataset
 from lerobot.common.utils.utils import (
     format_big_number,
     get_safe_torch_device,
@@ -153,7 +152,6 @@ def make_optimizer_and_scheduler(cfg, policy):
     elif cfg.policy.name in [
         "diffusion",
         "dual_head_diffusion",
-        "scid_dual_head_diffusion",
         "coupled_dual_head_diffusion",
         "two_model_diffusion",
     ]:
@@ -510,7 +508,6 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
     if cfg.policy.name in [
         "diffusion",
         "dual_head_diffusion",
-        "scid_dual_head_diffusion",
         "coupled_dual_head_diffusion",
         "two_model_diffusion",
     ] and not any("images" in k for k in delta_timestamps_dict.keys()):
@@ -722,26 +719,6 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
             ema.decay,
             ema.update_after_step,
         )
-
-    if cfg.policy.name == "scid_dual_head_diffusion":
-        scid_fit = initialize_scid_transform_from_dataset(
-            policy,
-            offline_dataset,
-            resume=bool(cfg.resume),
-        )
-        if scid_fit is None:
-            logging.info("SCID变换已从checkpoint严格恢复，跳过重新拟合。")
-        else:
-            diagnostics = scid_fit.diagnostics
-            logging.info(
-                "SCID变换拟合完成: frames=%d, mean_R2=%.4f, "
-                "cross_corr=%.4f->%.4f, condition=%.3e",
-                diagnostics["num_frames"],
-                diagnostics["view_r2_mean"],
-                diagnostics["raw_cross_corr_norm"],
-                diagnostics["residual_cross_corr_norm"],
-                diagnostics["condition_number"],
-            )
 
     # 3.2 无论是不是 resume，都必须先根据模型初始化出全新的优化器！
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)

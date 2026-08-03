@@ -50,10 +50,18 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.transforms import get_image_transforms
 from lerobot.common.datasets.utils import hf_transform_to_torch, unflatten_dict
+from lerobot.common.datasets.view_delta_stats import (
+    load_or_compute_view_delta_stats,
+)
 from lerobot.common.datasets.video_utils import VideoFrame  # noqa: F401  注册本地 parquet 中的 VideoFrame 字段
 # 复用 LeRobot 的其他核心组件
 from lerobot.common.logger import Logger
 from lerobot.common.policies.factory import make_policy # 用于获取训练策略模型
+from lerobot.common.policies.diffusion.view_action_representation import (
+    VIEW_ACTION_DELTA_FROM_CURRENT,
+    VIEW_ACTION_DELTA_STATS_KEY,
+    resolve_dual_head_action_dims,
+)
 from lerobot.common.policies.utils import get_device_from_parameters
 from lerobot.common.policies.policy_protocol import PolicyWithUpdate
 from train.s1_pretrain.train.optimizer_utils import (
@@ -61,7 +69,6 @@ from train.s1_pretrain.train.optimizer_utils import (
     partition_optimizer_parameters,
 )
 from train.s1_pretrain.train.ema import PolicyEMA
-from train.s1_pretrain.train.scid_transform import initialize_scid_transform_from_dataset
 from train.s1_pretrain.train.wandb_logging import (
     add_wandb_parameter_tags,
     configure_wandb_runtime,
@@ -285,7 +292,6 @@ def make_optimizer_and_scheduler(cfg, policy):
     elif cfg.policy.name in [
         "diffusion",
         "dual_head_diffusion",
-        "scid_dual_head_diffusion",
         "coupled_dual_head_diffusion",
         "two_model_diffusion",
     ]:
@@ -504,7 +510,6 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
     if cfg.policy.name in [
         "diffusion",
         "dual_head_diffusion",
-        "scid_dual_head_diffusion",
         "coupled_dual_head_diffusion",
         "two_model_diffusion",
     ] and not any("images" in k for k in delta_timestamps_dict.keys()):
@@ -620,6 +625,23 @@ def build_resume_config(cfg: DictConfig) -> tuple[DictConfig, Path | None]:
     snapshot_cfg_copy = OmegaConf.create(
         OmegaConf.to_container(snapshot_cfg, resolve=False)
     )
+    # 旧快照缺少该字段时，其真实语义必然是绝对View动作。必须在merge前
+    # 显式补为absolute，不能让当前配置中的delta值悄悄改变旧权重语义。
+    if (
+        OmegaConf.select(
+            snapshot_cfg_copy,
+            "policy.view_action_representation",
+            default=None,
+        )
+        is None
+    ):
+        OmegaConf.update(
+            snapshot_cfg_copy,
+            "policy.view_action_representation",
+            "absolute",
+            merge=False,
+            force_add=True,
+        )
     effective_cfg = OmegaConf.merge(current_cfg_copy, snapshot_cfg_copy)
     for config_path in (
         *RESUME_CONTROL_CONFIG_PATHS,
@@ -1011,7 +1033,76 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # 🌟 3. 初始化模型与优化器 (顺序极其重要！)
     # ==========================================
     logging.info("🧠 正在初始化 Diffusion Policy...")
-    
+
+    # 新训练的View相对动作模式需要与实际action horizon一致的派生统计量。
+    # resume时normalizer统计已保存在checkpoint中，不应重新扫描或覆盖。
+    view_action_representation = str(
+        getattr(cfg.policy, "view_action_representation", "absolute")
+    )
+    if (
+        policy_load_path is None
+        and view_action_representation == VIEW_ACTION_DELTA_FROM_CURRENT
+    ):
+        if str(cfg.policy.name) not in {
+            "diffusion",
+            "dual_head_diffusion",
+            "coupled_dual_head_diffusion",
+        }:
+            raise ValueError(
+                "delta_from_current当前仅支持diffusion、"
+                "dual_head_diffusion和coupled_dual_head_diffusion，"
+                f"当前policy.name={cfg.policy.name!r}。"
+            )
+        state_delta_timestamps = resolved_delta_timestamps.get(
+            "observation.state",
+            [],
+        )
+        if (
+            not state_delta_timestamps
+            or abs(float(state_delta_timestamps[-1])) > 1e-8
+        ):
+            raise ValueError(
+                "delta_from_current要求observation.state时间轴的最后一项为0，"
+                "以保证batch[:, -1]就是当前真实View关节；当前时间轴为"
+                f"{state_delta_timestamps}。"
+            )
+        arm_action_dim, view_action_dim = resolve_dual_head_action_dims(
+            cfg.policy
+        )
+        configured_cache_dir = clean_optional_path(
+            cfg.get("view_delta_stats_cache_dir", None)
+        )
+        if configured_cache_dir is None:
+            configured_cache_dir = "outputs/buffer/view_action_delta_stats"
+        cache_dir = Path(configured_cache_dir).expanduser()
+        if not cache_dir.is_absolute():
+            cache_dir = ROOT_DIR / cache_dir
+        view_delta_stats, stats_cache_path, stats_metadata = (
+            load_or_compute_view_delta_stats(
+                offline_dataset,
+                action_delta_timestamps=resolved_delta_timestamps["action"],
+                arm_action_dim=arm_action_dim,
+                view_action_dim=view_action_dim,
+                include_padding=not bool(
+                    getattr(cfg.policy, "do_mask_loss_for_padding", False)
+                ),
+                cache_dir=cache_dir,
+            )
+        )
+        offline_dataset.stats[VIEW_ACTION_DELTA_STATS_KEY] = view_delta_stats
+        logging.info(
+            "View动作使用当前锚点增量表示: arm_dim=%d, view_dim=%d, "
+            "stats_cache=%s, targets=%d, padding_fraction=%.4f, "
+            "delta_min=%s, delta_max=%s",
+            arm_action_dim,
+            view_action_dim,
+            stats_cache_path,
+            int(stats_metadata.get("valid_or_included_count", 0)),
+            float(stats_metadata.get("padding_fraction", 0.0)),
+            view_delta_stats["min"].tolist(),
+            view_delta_stats["max"].tolist(),
+        )
+
     # 3.1 resume加载online权重；resume=false使用当前policy/env随机初始化。
     policy = make_policy(
         hydra_cfg=cfg,
@@ -1029,27 +1120,6 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
             ema.decay,
             ema.update_after_step,
         )
-
-    if cfg.policy.name == "scid_dual_head_diffusion":
-        scid_fit = initialize_scid_transform_from_dataset(
-            policy,
-            offline_dataset,
-            resume=bool(cfg.resume),
-        )
-        if scid_fit is None:
-            logging.info("SCID变换已从checkpoint严格恢复，跳过重新拟合。")
-        else:
-            diagnostics = scid_fit.diagnostics
-            logging.info(
-                "SCID变换拟合完成: frames=%d, mean_R2=%.4f, "
-                "cross_corr=%.4f->%.4f, condition=%.3e, scale=%s",
-                diagnostics["num_frames"],
-                diagnostics["view_r2_mean"],
-                diagnostics["raw_cross_corr_norm"],
-                diagnostics["residual_cross_corr_norm"],
-                diagnostics["condition_number"],
-                [round(value, 6) for value in diagnostics["residual_scale"]],
-            )
 
     # 3.2 无论是不是 resume，都必须先根据模型初始化出全新的优化器！
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -1503,12 +1573,12 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
-        "dataset_local_dir=outputs/5_hf_datasets/quest_teleop_insert_cylinder_3arms_rgb_joint",
+        "dataset_local_dir=outputs/5_hf_datasets/quest_teleop_InsertCylinder-3Arms-v0_rgb_arm_recovery",
         "dataset_repo_id=Dc-dc/quest_teleop_SewNeedle-3Arms-v0_rgb_joint",
         # 全新训练时使用下面的默认配置组；resume=true 时会在 Hydra 启动前
         # 自动替换为原实验 .hydra/hydra.yaml 中记录的 env/policy。
         "env=sim_insert_cylinder_3arms",
-        "policy=pre_zed_coupled_dual_head_diffusion",
+        "policy=pre_zed_diffusion",
         # resume=false按当前env/policy全新训练；resume=true严格恢复原实验。
         "resume=false",
         "resume_path='outputs/2_pretrain/train/2026-07-21/23-22-46_InsertCylinder-3Arms-v0_pre_zed_coupled_dual_head_diffusion/checkpoints/100000_loss=0.0087_sr=53.0_ar=556.51'",
