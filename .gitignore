@@ -1,5 +1,6 @@
 outputs/
-tests/
+# 仅忽略仓库根目录的单元测试；real_robot/tests/ 仍正常纳入版本控制。
+/tests/
 src/
 datasets/
 !lerobot/common/datasets/
