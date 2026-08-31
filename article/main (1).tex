@@ -1,0 +1,341 @@
+\documentclass[letterpaper, 10 pt, conference]{ieeeconf}  % Comment this line out if you need a4paper
+
+%\documentclass[a4paper, 10pt, conference]{ieeeconf}      % Use this line for a4 paper
+
+\IEEEoverridecommandlockouts                              % This command is only needed if 
+                                                          % you want to use the \thanks command
+
+\overrideIEEEmargins                                      % Needed to meet printer requirements.
+\usepackage{cite}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath}
+%In case you encounter the following error:
+%Error 1010 The PDF file may be corrupt (unable to open PDF file) OR
+%Error 1000 An error occurred while parsing a contents stream. Unable to analyze the PDF file.
+%This is a known problem with pdfLaTeX conversion filter. The file cannot be opened with acrobat reader
+%Please use one of the alternatives below to circumvent this error by uncommenting one or the other
+%\pdfobjcompresslevel=0
+%\pdfminorversion=4
+
+% See the \addtolength command later in the file to balance the column lengths
+% on the last page of the document
+
+% The following packages can be found on http:\\www.ctan.org
+%\usepackage{graphics} % for pdf, bitmapped graphics files
+%\usepackage{epsfig} % for postscript graphics files
+%\usepackage{mathptmx} % assumes new font selection scheme installed
+%\usepackage{times} % assumes new font selection scheme installed
+%\usepackage{amsmath} % assumes amsmath package installed
+%\usepackage{amssymb}  % assumes amsmath package installed
+
+\title{\LARGE \bf
+AV-RePAIR: Role-Isolated, Task-Trajectory-Aligned Recovery Augmentation for Robotic Manipulation with Active Vision
+
+}
+
+
+\author{Albert Author$^{1}$ and Bernard D. Researcher$^{2}$% <-this % stops a space
+\thanks{*This work was not supported by any organization}% <-this % stops a space
+\thanks{$^{1}$Albert Author is with Faculty of Electrical Engineering, Mathematics and Computer Science,
+        University of Twente, 7500 AE Enschede, The Netherlands
+        {\tt\small albert.author@papercept.net}}%
+\thanks{$^{2}$Bernard D. Researcheris with the Department of Electrical Engineering, Wright State University,
+        Dayton, OH 45435, USA
+        {\tt\small b.d.researcher@ieee.org}}%
+}
+
+
+\begin{document}
+
+
+
+\maketitle
+\thispagestyle{empty}
+\pagestyle{empty}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{abstract}
+Active vision (AV) autonomously adjusts the camera pose to mitigate occlusions and acquire more informative visual observations for robotic manipulation. However, AV policies trained via imitation learning are susceptible to viewpoint-induced covariate shift: errors in predicted viewpoint-control actions alter the distribution of subsequent visual observations, thereby compounding prediction errors in both viewpoint control and manipulation. To address this issue, we propose AV-RePAIR (Active-Vision Recovery via Perturbation and Task-Trajectory Alignment for Individual Roles), a role-isolated recovery-data augmentation method for active visual manipulation. AV-RePAIR defines two functionally distinct control roles within a unified policy: viewpoint control and bimanual manipulation. During recovery-data generation, each perturbation is confined to a single control role while the other role executes time-synchronized expert actions, reducing cross-role ambiguity in recovery supervision.
+Rather than using the pre-perturbation state as a fixed recovery target, AV-RePAIR aligns each recovery step with the corresponding state on the advancing expert trajectory.
+Across simulation and real-robot experiments, AV-RePAIR improves task success rates by 21--23 percentage points over the expert-only baseline under standard closed-loop evaluation, demonstrating the effectiveness of role-isolated, task-trajectory-aligned recovery augmentation for reliable active visual manipulation.
+\end{abstract}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{INTRODUCTION}
+Vision-based policies for robotic manipulation commonly rely on fixed
+cameras~\cite{chiDiffusionPolicyVisuomotor2025,
+dreczkowskiLearningThousandTasks2025}, wrist-mounted
+cameras~\cite{chiUniversalManipulationInterface2024,
+diPaloDINOBotRobotManipulation2024}, or
+both~\cite{zhaoLearningFineGrainedBimanual2023,
+wangOneShotDualArm2025}.
+However, none of these configurations can independently adapt the viewpoint to changing visibility requirements. Consequently, task-relevant regions may become occluded, causing critical visual information to be lost during execution~\cite{wangObserveThenAct2025,xiongVisionActionLearning2025}.
+By contrast, active vision (AV) treats the camera pose as a controllable variable, allowing the robot to adapt its viewpoint as the task unfolds~\cite{zengViewPlanningRobot2020}. 
+
+In practice, the utility of a viewpoint varies with the current task stage, scene configuration, and ongoing manipulation, making task-dependent viewpoint-control behavior difficult to specify explicitly.
+A natural solution is to learn task-dependent viewpoint control from synchronized teleoperation demonstrations. Such demonstrations provide coordinated supervision for camera motion and manipulation without requiring manually specified view-selection objectives or task rewards, and recent studies have demonstrated the effectiveness of this paradigm~\cite{chuangActiveVisionMight2025,sunOptimizingActivePerception2025}.
+Nevertheless, the resulting policies remain susceptible to covariate shift, a fundamental limitation of imitation learning from expert demonstrations~\cite{spencerFeedbackImitationLearning2021}. 
+In particular, viewpoint-control errors amplify this vulnerability by altering the camera pose and, consequently, shifting the distribution of subsequent visual observations that condition both viewpoint-control and manipulation predictions.
+
+
+Existing methods mitigate covariate shift by extending supervision beyond nominal expert trajectories, typically through expert-mediated correction or perturbation-based augmentation~\cite{tsujiSurveyImitationLearning2026}. However, representative approaches either require expert involvement to collect corrective data~\cite{rossReductionImitationLearning,laskeyDARTNoiseInjection} or rely on a static-scene assumption that restricts augmentation to trajectory segments without robot--object interaction~\cite{zhouNeRFPalmYour2023a}. Consequently, recovery supervision for viewpoint-induced covariate shift remains underexplored, particularly in systems with an independently controlled viewpoint arm.
+% In this context, recovery-data generation presents two key challenges. First, viewpoint deviations alter the sensing configuration and subsequent visual observations, whereas manipulation deviations primarily change the robot--object configuration. When both roles are perturbed simultaneously, these deviations co-occur, making it difficult to isolate the effect of either perturbation. Second, the unperturbed role continues along the expert trajectory during recovery. Returning the perturbed role to its pre-perturbation state would therefore place the two roles at different stages of the task.
+
+To address this gap, we propose Active-Vision Recovery via Perturbation and Task-Trajectory Alignment for Individual Roles (AV-RePAIR), a recovery-data augmentation method for active visual manipulation. 
+AV-RePAIR treats viewpoint control and bimanual manipulation as functionally distinct control roles within a unified policy. During recovery-data generation, each perturbation is confined to one role while the other continues to execute time-synchronized expert actions, allowing the induced deviation and corresponding recovery supervision to be attributed to the perturbed role. Moreover, rather than returning the perturbed role to its pre-perturbation state, AV-RePAIR derives recovery targets from the corresponding states on the advancing expert trajectory, thereby maintaining temporal alignment with ongoing task progress.
+The main contributions of this work are summarized as follows.
+
+\begin{itemize}
+\item[1)]
+We propose AV-RePAIR, a role-isolated recovery-data augmentation method that generates recovery supervision to mitigate viewpoint-induced covariate shift in systems with an independently controlled viewpoint arm.
+\item[2)]
+Task-trajectory alignment is introduced to maintain the temporal consistency of recovery supervision with ongoing task progress.
+\item[3)]
+Simulation and real-robot experiments demonstrate improved closed-loop task success and validate the effectiveness of the proposed components through ablation studies.
+\end{itemize}
+
+\section{RELATED WORK}
+
+
+\subsection{AV for Robotic Manipulation}
+Early work on AV for robotic manipulation primarily formulated viewpoint selection as a task-driven view-planning problem~\cite{zengViewPlanningRobot2020}. Within this formulation, next-best views were selected to improve surface reconstruction quality around planned contact points~\cite{arrudaActiveVisionDexterous2016}, reduce uncertainty in grasp pose estimates~\cite{morrisonMultiViewPickingNextbestview2019}, or reveal occluded parts of the target object~\cite{breyerClosedLoopNextBestViewPlanning2022}. 
+However, these approaches typically rely on explicit scene representations and hand-engineered view-selection objectives.
+
+More recently, data-driven methods have increasingly integrated viewpoint control with learned manipulation policies. For example, reinforcement learning methods either sequentially couple a camera next-best-view policy with a gripper next-best-pose policy~\cite{wangObserveThenAct2025} or jointly infer viewpoint-control and manipulation actions~\cite{wangOneModelTwo2025}. Meanwhile, demonstration-based systems such as AV-ALOHA learn active viewpoint control together with bimanual manipulation from synchronized teleoperation demonstrations~\cite{chuangActiveVisionMight2025}. Similarly, Sun et al.~\cite{sunOptimizingActivePerception2025} train a diffusion policy to jointly predict manipulation actions and desired positions of the viewpoint arm. In addition, ObAct~\cite{wangObserverActorActiveVision2026} and See2Act~\cite{wangLearningSeeLearning2026} optimize or refine camera viewpoints during inference. 
+While these methods demonstrate the benefits of integrating learned viewpoint control with manipulation, imitation-learning approaches in this line of work do not explicitly address closed-loop error propagation caused by viewpoint-control errors.
+
+
+\subsection{Mitigating Covariate Shift in Imitation Learning}
+A prevalent strategy for mitigating covariate shift in imitation learning is interactive data aggregation~\cite{spencerFeedbackImitationLearning2021}. Under this strategy, the Dataset Aggregation (DAgger)~\cite{rossReductionImitationLearning} algorithm collects states encountered during policy rollouts, queries an expert for the corresponding actions, and incorporates the resulting state--action pairs into the training dataset. To reduce the associated supervisory burden, gated variants such as HG-DAgger~\cite{kellyHGDAggerInteractiveImitation2019} and Diff-DAgger~\cite{leeDiffDAggerUncertaintyEstimation2025} restrict expert queries or interventions to selected states. Nevertheless, these methods still require repeated online policy rollouts and continued expert availability. 
+
+Alternatively, perturbation-based corrective augmentation generates recovery data from deliberately induced deviations.
+For example, DART~\cite{laskeyDARTNoiseInjection} injects optimized noise into supervisor actions during demonstration collection, prompting the supervisor to compensate for the induced deviations and thereby provide corrective demonstrations.
+In contrast, SPARTN~\cite{zhouNeRFPalmYour2023a} performs fully offline augmentation by perturbing eye-in-hand camera poses, rendering the resulting observations with trajectory-specific NeRFs, and computing corrective actions. 
+However, SPARTN assumes a static scene and therefore restricts augmentation to trajectory segments without robot--object interaction, limiting its direct applicability to multi-stage manipulation tasks with evolving robot--object configurations~\cite{zhouNeRFPalmYour2023a}. 
+% Overall, covariate shift in AV policies trained via imitation learning remains largely unexplored, particularly in systems with an independently controlled viewpoint arm.
+Taken together, these methods do not explicitly provide recovery supervision for errors in independently controlled viewpoint arms during ongoing robot--object interaction.
+
+% \subsection{Problem Formulation}
+
+% The active visual manipulation system comprises an independently controlled viewpoint arm and two manipulation arms. At time step $t$, the unified policy predicts two role-specific action
+% streams according to
+% \begin{equation}
+%     \left(
+%         \hat{\mathbf{a}}_t^{\mathrm{v}},
+%         \hat{\mathbf{a}}_t^{\mathrm{m}}
+%     \right)
+%     =
+%     \pi_{\theta}(\mathbf{o}_t),
+%     \label{eq:dual_role_policy}
+% \end{equation}
+% where $\pi_{\theta}$ denotes the active visual manipulation policy,
+% and $\mathbf{o}_t$ represents the current visual and robot joint configuration. The outputs $\hat{\mathbf{a}}_t^{\mathrm{v}}$ and
+% $\hat{\mathbf{a}}_t^{\mathrm{m}}$ denote the predicted
+% viewpoint-control and bimanual manipulation actions, respectively.
+
+
+
+\section{Problem Statement}
+\label{sec:problem_statement}
+
+Synchronized expert demonstrations enable a unified policy to coordinate an independently controlled viewpoint arm with two manipulation arms along nominal task trajectories. However, these demonstrations provide limited corrective supervision once prediction errors drive the system away from the demonstrated trajectories during closed-loop execution. Addressing this gap requires augmenting the demonstrations with recovery examples, but generating such examples for the viewpoint and manipulation arms presents two key challenges.
+
+\textit{1) Role Ambiguity in Recovery Supervision:}
+Viewpoint deviations change subsequent visual observations by altering the camera pose, whereas manipulation deviations do so by altering the robot--object configuration. When both roles are perturbed simultaneously, these changes co-occur, making it difficult to isolate the effect of either perturbation and rendering role-specific recovery supervision ambiguous.
+
+\textit{2) Temporal Misalignment of Recovery Targets:}
+Correcting a deviation in either control role typically requires multiple control steps, during which the task and the reference trajectory continue to advance. As a result, a recovery target fixed at the pre-perturbation state can become outdated, making the recovered configuration inconsistent with both the other role and the current task state.
+
+These challenges limit the direct application of conventional corrective augmentation to active visual manipulation. Accordingly, AV-RePAIR constructs role-isolated and temporally aligned recovery supervision to mitigate viewpoint-induced covariate shift in systems with an independently controlled viewpoint arm, without requiring additional online expert supervision.
+
+
+
+
+\section{The Proposed AV-RePAIR Method}
+\subsection{Overview}
+AV-RePAIR decomposes a unified active-vision manipulation policy into two functionally distinct roles: viewpoint control and bimanual manipulation. A shared visual encoder extracts a common perceptual representation that conditions two role-specific diffusion branches, which generate viewpoint-control and bimanual manipulation trajectories, respectively.
+\subsection{Role-Isolated Recovery Data Generation}
+% 详细描述：
+% 扰动锚点采样；
+% View 或 Arm 角色选择；
+% 一次仅扰动一个角色；
+% 未受扰角色执行时间同步的专家动作；
+% View、Arm 和 Mixed 恢复数据的生成方式；
+% Arm 扰动目标选择所使用的30帧 RMS 速度规则。
+% 这是角色隔离设计的主要章节。
+\subsection{Task-Trajectory-Aligned Recovery}
+% 说明：
+% 不将受扰角色拉回扰动前的旧状态；
+% 第 \(k\) 个恢复步以当前任务时刻 \(t+k\) 的专家状态作为参考；
+% 实际状态与同期专家状态之间的偏差；
+% 恢复终止条件和最大恢复步数；
+% 如何保持受扰角色与持续推进任务的时间同步。
+% 建议在这里给出核心公式和时间轴示意图。
+
+\section{Experiments}
+% 为了和AV-RePAIR公平比较，建议匹配“新增transition总数”，而不是DART轨迹条数
+\subsection{Experimental Setup}
+
+% Add to the preamble:
+% \usepackage{booktabs}
+% \usepackage{multirow}
+
+\begin{table*}[t]
+    \centering
+    \caption{Task success rates (\%) under standard closed-loop evaluation. No external perturbations are introduced during evaluation. Each method is independently trained and evaluated over 100 trials per task.}
+    \label{tab:main_results}
+    \renewcommand{\arraystretch}{1.0}
+    \begin{tabular*}{\textwidth}{
+        @{\extracolsep{\fill}}
+        lcccccc
+        @{}
+    }
+        \toprule
+        \multirow{2}{*}{\textbf{Method}}
+        & \multicolumn{4}{c}{\textbf{Simulation}}
+        & \multicolumn{2}{c}{\textbf{Real Robot}} \\
+        \cmidrule(lr){2-5}
+        \cmidrule(lr){6-7}
+        & \textbf{Cylinder Transfer}
+        & \textbf{Thread Needle}
+        & \textbf{Peg Insertion}
+        & \textbf{Simulation 4}
+        & \textbf{Real Task 1}
+        & \textbf{Real Task 2} \\
+        \midrule
+        Expert-only
+        & 70 & 57 & 62
+        & XX.X & XX.X & XX.X \\
+
+        DART
+        & XX.X & XX.X & XX.X
+        & XX.X & XX.X & XX.X \\
+        
+        
+        AV-RePAIR
+        & 93 & 78 & 84
+        & XX.X & XX.X & XX.X \\
+        \bottomrule
+    \end{tabular*}
+\end{table*}
+
+
+\begin{table*}[t]
+    \centering
+    \caption{Ablation results under standard closed-loop evaluation in simulation. Success rates (\%) are measured over 100 trials per task without externally injected perturbations.}
+    \label{tab:recovery_ablation}
+    \renewcommand{\arraystretch}{1.0}
+    \begin{tabular*}{\textwidth}{
+        @{\extracolsep{\fill}}
+        lcccc
+        @{}
+    }
+        \toprule
+        \textbf{Variant}
+        & \textbf{Cylinder Transfer}
+        & \textbf{Thread Needle}
+        & \textbf{Peg Insertion}
+        & \textbf{Simulation 4} \\
+        \midrule
+
+        Viewpoint-Control Recovery
+        & 83 & 67 & 81 & XX.X \\
+
+        Manipulation Recovery
+        & 79 & 72 & 79 & XX.X \\
+
+        Joint-Role Recovery
+        & 76 & 63 & 78 &XX.X  \\
+
+        Static-Reference Role-Isolated Recovery
+        & XX.X & XX.X & XX.X & XX.X \\
+
+        \midrule
+        \textbf{AV-RePAIR}
+        & 93 & 78  & 84 & XX.X \\
+
+        \bottomrule
+    \end{tabular*}
+\end{table*}
+
+Use this sample document as your LaTeX source file to create your document. Save this file as {\bf root.tex}. You have to make sure to use the cls file that came with this distribution. If you use a different style file, you cannot expect to get required margins. Note also that when you are creating your out PDF file, the source file is only part of the equation. {\it Your \TeX\ $\rightarrow$ PDF filter determines the output file size. Even if you make all the specifications to output a letter file in the source - if your filter is set to produce A4, you will only get A4 output. }
+
+It is impossible to account for all possible situation, one would encounter using \TeX. If you are using multiple \TeX\ files you must make sure that the ``MAIN`` source file is called root.tex - this is particularly important if your conference is using PaperPlaza's built in \TeX\ to PDF conversion tool.
+
+\subsection{Headings, etc}
+
+Text heads organize the topics on a relational, hierarchical basis. For example, the paper title is the primary text head because all subsequent material relates and elaborates on this one topic. If there are two or more sub-topics, the next level head (uppercase Roman numerals) should be used and, conversely, if there are not at least two sub-topics, then no subheads should be introduced. Styles named ÒHeading 1Ó, ÒHeading 2Ó, ÒHeading 3Ó, and ÒHeading 4Ó are prescribed.
+
+\subsection{Figures and Tables}
+
+Positioning Figures and Tables: Place figures and tables at the top and bottom of columns. Avoid placing them in the middle of columns. Large figures and tables may span across both columns. Figure captions should be below the figures; table heads should appear above the tables. Insert figures and tables after they are cited in the text. Use the abbreviation ÒFig. 1Ó, even at the beginning of a sentence.
+
+\begin{table}[htbp]
+\caption{An Example of a Table}
+\label{table_example}
+\begin{center}
+\begin{tabular}{|c||c|}
+\hline
+One & Two\\
+\hline
+Three & Four\\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+
+   \begin{figure}[thpb]
+      \centering
+      \framebox{\parbox{3in}{We suggest that you use a text box to insert a graphic (which is ideally a 300 dpi TIFF or EPS file, with all fonts embedded) because, in an document, this method is somewhat more stable than directly inserting a picture.
+}}
+      %\includegraphics[scale=1.0]{figurefile}
+      \caption{Inductance of oscillation winding on amorphous
+       magnetic core versus DC bias magnetic field}
+      \label{figurelabel}
+   \end{figure}
+   
+
+Figure Labels: Use 8 point Times New Roman for Figure labels. Use words rather than symbols or abbreviations when writing Figure axis labels to avoid confusing the reader. As an example, write the quantity ÒMagnetizationÓ, or ÒMagnetization, MÓ, not just ÒMÓ. If including units in the label, present them within parentheses. Do not label axes only with units. In the example, write ÒMagnetization (A/m)Ó or ÒMagnetization {A[m(1)]}Ó, not just ÒA/mÓ. Do not label axes with a ratio of quantities and units. For example, write ÒTemperature (K)Ó, not ÒTemperature/K.Ó
+
+\section{CONCLUSIONS}
+
+A conclusion section is not required. Although a conclusion may review the main points of the paper, do not replicate the abstract as the conclusion. A conclusion might elaborate on the importance of the work or suggest applications and extensions. 
+
+\addtolength{\textheight}{-12cm}   % This command serves to balance the column lengths
+                                  % on the last page of the document manually. It shortens
+                                  % the textheight of the last page by a suitable amount.
+                                  % This command does not take effect until the next page
+                                  % so it should come on the page before the last. Make
+                                  % sure that you do not shorten the textheight too much.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section*{APPENDIX}
+
+Appendixes should appear before the acknowledgment.
+
+\section*{ACKNOWLEDGMENT}
+
+The preferred spelling of the word ÒacknowledgmentÓ in America is without an ÒeÓ after the ÒgÓ. Avoid the stilted expression, ÒOne of us (R. B. G.) thanks . . .Ó  Instead, try ÒR. B. G. thanksÓ. Put sponsor acknowledgments in the unnumbered footnote on the first page.
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+References are important to the reader; therefore, each citation must be complete and correct. If at all possible, references should be commonly available publications.
+
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+\end{document}

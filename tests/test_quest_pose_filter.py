@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from data_collect.quest_pose_filter import (
+from data_collect.expert_data_collection.quest_pose_filter import (
     QuestPoseActionFilter,
     QuestPoseFilterConfig,
     quaternion_angle_rad,

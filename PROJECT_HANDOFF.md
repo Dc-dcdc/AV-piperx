@@ -319,12 +319,12 @@ train/s1_pretrain/eval/vector_info.py
 
 新增：
 
-- `data_collect/episode_seeding.py`
-- `data_collect/collection_run_state.py`
+- `data_collect/expert_data_collection/episode_seeding.py`
+- `data_collect/expert_data_collection/collection_run_state.py`
 
 修改：
 
-- `data_collect/quest_policy_collect.py`
+- `data_collect/expert_data_collection/quest_policy_collect.py`
 - `configs/data_collect/quest_policy_collect.yaml`
 
 当前 seed 策略：
@@ -589,7 +589,7 @@ OK
 - `configs/data_collect/*`
 - `configs/pretrain/*`
 - `configs/finetune/*`
-- `data_collect/quest_policy_collect.py`
+- `data_collect/expert_data_collection/quest_policy_collect.py`
 - `env/assets/piperx_sim.xml`（仅增加执行器 PD 公式注释）
 - `train/s1_pretrain/*`
 - `train/s3_finetune/*`

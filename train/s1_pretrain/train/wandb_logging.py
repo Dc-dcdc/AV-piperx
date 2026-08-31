@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import logging
+from pathlib import PurePosixPath
 
 from omegaconf import DictConfig, OmegaConf
 
 from lerobot.common.logger import Logger
 from lerobot.common.utils.utils import format_big_number
+
+
+WANDB_TAG_MAX_LENGTH = 64  # W&B单个run标签允许的最大字符数
 
 
 PRETRAIN_WANDB_PARAMETER_TAGS = (
@@ -16,8 +20,16 @@ PRETRAIN_WANDB_PARAMETER_TAGS = (
     ("lr", "training.lr"),                                # 主网络学习率
     ("backbone_lr", "training.lr_backbone"),              # 视觉底座学习率
     ("steps", "training.offline_steps"),                  # 预训练总步数
+    ("epochs", "training.offline_epochs"),                # 用户配置的epoch预算
+    ("steps_per_epoch", "training.steps_per_epoch"),      # Sampler解析的每epoch步数
+    ("eval_epochs", "training.eval_freq_epochs"),         # epoch模式评估周期
+    ("eval_start", "training.eval_start_epoch"),          # epoch模式开始评估的轮次
+    ("save_epochs", "training.save_freq_epochs"),         # epoch模式保存周期
     ("lr_scheduler", "training.lr_scheduler"),            # 学习率调度器
     ("lr_warmup", "training.lr_warmup_steps"),            # 学习率预热步数
+    ("lr_decay_epochs", "training.lr_decay_epochs"),      # 余弦衰减到下限的epoch
+    ("lr_decay_steps", "training.lr_decay_steps"),        # 余弦衰减到下限的全局step
+    ("min_lr_ratio", "training.min_lr_ratio"),            # 学习率下限/初始学习率
     ("weight_decay", "training.weight_decay"),            # 权重衰减
     ("grad_clip", "training.grad_clip_norm"),             # 梯度裁剪阈值
     ("amp", "use_amp"),                                   # 是否使用混合精度
@@ -96,6 +108,41 @@ def _format_wandb_tag_value(value) -> str:
     return str(value).replace(" ", "_")
 
 
+def _sanitize_wandb_tag(value) -> str | None:
+    """生成合法的W&B标签；超长时保留更有区分度的末尾部分。"""
+
+    tag = str(value).strip().replace(" ", "_")
+    if not tag:
+        return None
+    if len(tag) <= WANDB_TAG_MAX_LENGTH:
+        return tag
+
+    truncation_marker = "..."
+    suffix_length = WANDB_TAG_MAX_LENGTH - len(truncation_marker)
+    return f"{truncation_marker}{tag[-suffix_length:]}"
+
+
+def _dataset_name_tags(cfg: DictConfig) -> list[str]:
+    """从本地路径或HF repo id中提取数据集名称，避免把完整路径作为tag上传。"""
+
+    dataset_value = OmegaConf.select(cfg, "dataset_local_dir", default=None)
+    if dataset_value in (None, "null", "none", ""):
+        dataset_value = OmegaConf.select(cfg, "dataset_repo_id", default=None)
+    if dataset_value in (None, "null", "none", ""):
+        return []
+
+    values = dataset_value if OmegaConf.is_list(dataset_value) else [dataset_value]
+    tags = []
+    for value in values:
+        text = str(value).replace("\\", "/").rstrip("/")
+        if not text or text.lower() in {"null", "none"}:
+            continue
+        dataset_tag = _sanitize_wandb_tag(PurePosixPath(text).name)
+        if dataset_tag is not None:
+            tags.append(dataset_tag)
+    return tags
+
+
 def add_wandb_parameter_tags(logger: Logger, cfg: DictConfig) -> None:
     """把实际生效的预训练关键配置追加到当前 W&B run 标签。"""
 
@@ -112,6 +159,7 @@ def add_wandb_parameter_tags(logger: Logger, cfg: DictConfig) -> None:
     else:
         configured_tags = list(configured_tags)
 
+    dataset_tags = _dataset_name_tags(cfg)  # 只保留数据集目录名/repo名，不上传完整路径
     parameter_tags = []  # 从关键配置自动生成的参数tags
     for tag_name, config_path in PRETRAIN_WANDB_PARAMETER_TAGS:
         value = OmegaConf.select(cfg, config_path, default=None)  # 当前配置路径对应的实际值
@@ -119,18 +167,64 @@ def add_wandb_parameter_tags(logger: Logger, cfg: DictConfig) -> None:
             parameter_tags.append(f"{tag_name}:{_format_wandb_tag_value(value)}")
 
     existing_tags = list(wandb_run.tags or ())  # W&B初始化时已有的tags
-    wandb_run.tags = tuple(
-        dict.fromkeys([*existing_tags, *map(str, configured_tags), *parameter_tags])
-    )
+    raw_tags = [
+        *existing_tags,
+        *map(str, configured_tags),
+        *dataset_tags,
+        *parameter_tags,
+    ]
+    valid_tags = []
+    for raw_tag in raw_tags:
+        tag = _sanitize_wandb_tag(raw_tag)
+        if tag is not None:
+            valid_tags.append(tag)
+
+    # W&B会在任一标签不合法时拒绝整批更新，因此提交前统一清洗并去重。
+    wandb_run.tags = tuple(dict.fromkeys(valid_tags))
+    logging.info("W&B标签已更新: count=%d, tags=%s", len(wandb_run.tags), list(wandb_run.tags))
 
 
 def _add_progress_metrics(info: dict, step: int, cfg: DictConfig, dataset) -> tuple[float, float, float]:
     """Append dataset progress metrics to the payload sent to W&B."""
 
-    num_samples = (step + 1) * cfg.training.batch_size  # 已训练样本数
-    avg_samples_per_ep = dataset.num_samples / dataset.num_episodes  # 每条episode平均样本数
+    batch_size = int(cfg.training.batch_size)
+    effective_num_samples = OmegaConf.select(
+        cfg,
+        "training.effective_num_samples",
+        default=dataset.num_samples,
+    )
+    steps_per_epoch = OmegaConf.select(
+        cfg,
+        "training.steps_per_epoch",
+        default=None,
+    )
+    if steps_per_epoch is None:
+        num_samples = (step + 1) * batch_size
+        num_epochs = num_samples / dataset.num_samples
+    else:
+        steps_per_epoch = int(steps_per_epoch)
+        completed_epochs, batches_in_epoch = divmod(step + 1, steps_per_epoch)
+        drop_last = bool(
+            OmegaConf.select(
+                cfg,
+                "training.resolved_drop_last",
+                default=True,
+            )
+        )
+        samples_per_epoch = (
+            steps_per_epoch * batch_size
+            if drop_last
+            else int(effective_num_samples)
+        )
+        partial_samples = min(
+            batches_in_epoch * batch_size,
+            samples_per_epoch,
+        )
+        num_samples = completed_epochs * samples_per_epoch + partial_samples
+        num_epochs = completed_epochs + partial_samples / samples_per_epoch
+
+    avg_samples_per_ep = effective_num_samples / dataset.num_episodes  # 每条episode平均有效样本数
     num_episodes = num_samples / avg_samples_per_ep  # 约等于已遍历episode数
-    num_epochs = num_samples / dataset.num_samples  # 约等于已遍历数据集轮数
 
     info["step"] = step  # 上传到train/step或eval/step
     info["num_samples"] = num_samples  # 上传累计样本数

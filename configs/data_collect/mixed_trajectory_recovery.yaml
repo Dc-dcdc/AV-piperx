@@ -1,0 +1,116 @@
+# Arm与View在同一锚点独立完整扰动、同窗收缩回专家轨迹的Mixed Recovery配置。
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+# ===== 1. 输入、输出与任务 =====
+input_run_dir: outputs/4_data_collect/quest_teleop/quest_teleop_InsertPeg-3Arms-v0_rgb
+# 与旧扰动幅度的Mixed数据定义不兼容，必须使用新的输出目录。
+output_run_dir: outputs/4_data_collect/quest_teleop_recovery/InsertPeg-3Arms/quest_teleop_InsertPeg-3Arms-v0_rgb_mixed_random_recovery_6+0
+env_id: null
+include_original: true
+resume: true
+max_source_episodes: null
+source_episode_indices: null
+continue_on_error: true
+
+# ===== 2. 恢复事件采样 =====
+# 字段名称、结构和语义与View/Arm单源恢复保持一致。
+event_sampling:
+  mode: random
+  # 与Arm/View单角色配置保持一致，每条合格源轨迹保存6个恢复分支。
+  recovery_branches_per_source: 6
+  injection_probability_per_frame: 0.015
+  # 与Arm/View单角色配置一致，成功锚点至少间隔5帧。
+  min_injection_interval_steps: 5
+  exclude_initial_steps: 16
+  normalized_regions:
+    - start: 0.35
+      end: 0.47
+      injection_probability_per_frame: 0.10
+      min_injection_interval_steps: 5
+
+# ===== 3. 主运动臂选择 =====
+arm_selection:
+  mode: local_motion
+  lookback_steps: 0
+  lookahead_steps: 30
+  min_rms_velocity_rad_s: 0.02
+
+# ===== 4. Arm与View独立完整扰动 =====
+seed: 20260804
+arm_joint_noise:
+  distribution: truncated_gaussian
+  # 与Arm/View单角色恢复配置逐关节使用相同的约65%扰动尺度。
+  std_rad: [0.016, 0.016, 0.016, 0.026, 0.026, 0.032]
+  max_abs_rad: [0.040, 0.040, 0.040, 0.065, 0.065, 0.080]
+  min_normalized_l2: 0.5
+  joint_limit_margin_rad: 0.005
+  max_sampling_attempts: 1000
+view_joint_noise:
+  distribution: truncated_gaussian
+  # 与Arm/View单角色恢复配置逐关节使用相同的约65%扰动尺度。
+  std_rad: [0.016, 0.016, 0.016, 0.026, 0.026, 0.032]
+  max_abs_rad: [0.040, 0.040, 0.040, 0.065, 0.065, 0.080]
+  min_normalized_l2: 0.5
+  joint_limit_margin_rad: 0.005
+  max_sampling_attempts: 1000
+
+# ===== 5. Arm恢复速度上限自动统计 =====
+# 名称、结构和语义与Arm单源恢复保持一致。
+auto_velocity:
+  percentile: 90.0
+  floor_rad_s: [0.050, 0.050, 0.050, 0.050, 0.050, 0.050]
+  scale: 1.0
+
+# ===== 6. 同步建立与共同恢复窗口 =====
+recovery:
+  min_steps: 30
+  max_steps: 40
+  # 与View单源配置相同；用于限制View五次恢复曲线的附加峰值速度。
+  max_extra_velocity_rad_s: [0.292, 0.266, 0.160, 0.090, 0.366, 0.149]
+  # Arm和View分别相对同一时刻专家状态验收，二者都需满足该阈值。
+  success_max_abs_error_rad: 0.004
+  success_stable_steps: 3
+  # 取Arm/View单源配置中的较大值，等待二者同时稳定恢复。
+  max_extra_zero_offset_steps: 10
+  # 与单角色恢复一致，稳定恢复后立即停止记录，不追加专家跟随帧。
+  post_recovery_steps: 0
+  # Arm/View共用同一个锚点前平滑建立窗口。
+  unrecorded_setup_steps: 15
+
+# ===== 7. 重放、扰动和恢复质量检查 =====
+validation:
+  max_arm_joint_abs_error: 0.002
+  max_gripper_abs_error: 0.005
+  max_view_joint_abs_error: 0.0001
+  # 只有另一只Arm和夹爪属于未扰动角色；受扰Arm与View按实际偏移规则验收。
+  branch_max_other_arm_joint_abs_error: 0.002
+  branch_max_gripper_abs_error: 0.020
+  # 同一锚点失败时Arm/View一起重采；耗尽后搜索同域邻近锚点。
+  max_branch_attempts: 10
+
+# ===== 8. 双目视频 =====
+cameras: [zed_cam_left, zed_cam_right]
+render_height: 480
+render_width: 640
+fps: 25
+video:
+  codec: libx264
+  pixel_format: yuv420p
+  crf: 23
+  gop: 2
+  macro_block_size: 1
+
+# ===== 9. MuJoCo服务器渲染 =====
+mujoco_gl: auto
+render_device: null
+
+# ===== 10. Hydra输出控制 =====
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false
+  output_subdir: null

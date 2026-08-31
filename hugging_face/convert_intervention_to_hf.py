@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """将策略运行中的人在环轨迹转换为本地 LeRobot/HF 数据集。
 
-输入目录应来自 ``data_collect/quest_policy_collect.py``，每条 episode 的
+输入目录应来自 ``data_collect/expert_data_collection/quest_policy_collect.py``，每条 episode 的
 ``arrays.npz`` 中需要包含至少：
 
   joint_action          # 最终执行到 env.step 的完整动作

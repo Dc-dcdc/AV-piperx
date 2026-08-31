@@ -1,0 +1,245 @@
+{
+    "AI Models": {
+        "info": [
+            "MULTI CLASS MEDIUM DETECTION is not optimized",
+            "MULTI CLASS ACCURATE DETECTION is not optimized",
+            "HUMAN BODY FAST DETECTION is not optimized",
+            "HUMAN BODY MEDIUM DETECTION is not optimized",
+            "HUMAN BODY ACCURATE DETECTION is not optimized",
+            "HUMAN BODY 38 FAST DETECTION is not optimized",
+            "HUMAN BODY 38 MEDIUM DETECTION is not optimized",
+            "HUMAN BODY 38 ACCURATE DETECTION is not optimized",
+            "PERSON HEAD DETECTION is not optimized",
+            "PERSON HEAD ACCURATE DETECTION is not optimized",
+            "REID ASSOCIATION is not optimized",
+            "NEURAL LIGHT DEPTH is not optimized",
+            "NEURAL DEPTH is not optimized",
+            "NEURAL PLUS DEPTH is not optimized"
+        ],
+        "valid": [
+            "MULTI CLASS DETECTION is optimized"
+        ]
+    },
+    "CUDA Operations": {
+        "cudaDeviceCount": 1,
+        "cudaDriverVersion": 13000,
+        "cudaDriverVersionString": "13.0",
+        "cudaGetDeviceCountResult": 0,
+        "cudaRuntimeLoaded": true,
+        "cudaRuntimeVersion": 12080,
+        "cudaRuntimeVersionString": "12.8",
+        "cudaTestVersion": "1.0",
+        "gpuTests": [
+            {
+                "clockRateMHz": 2640,
+                "computeCapability": "8.9",
+                "computeCapabilityMajor": 8,
+                "computeCapabilityMinor": 9,
+                "freeResult": 0,
+                "freeSuccess": true,
+                "gpuId": 0,
+                "gpuName": "NVIDIA GeForce RTX 4080 SUPER",
+                "mallocResult": 0,
+                "mallocSuccess": true,
+                "memcpyD2HResult": 0,
+                "memcpyD2HSuccess": true,
+                "memcpyH2DResult": 0,
+                "memcpyH2DSuccess": true,
+                "memoryBusWidthBits": 256,
+                "memoryClockRateMHz": 11501,
+                "memsetResult": 0,
+                "memsetSuccess": true,
+                "multiProcessorCount": 80,
+                "pciBusId": 1,
+                "pciDeviceId": 0,
+                "pciDomainId": 0,
+                "setDeviceResult": 0,
+                "testElements": 1048576,
+                "testPassed": true,
+                "testSizeBytes": 4194304,
+                "totalGlobalMemMB": 15921,
+                "validationPassed": true
+            }
+        ],
+        "testSizeMB": 1,
+        "valid": [
+            "<b>GPU 0 (NVIDIA GeForce RTX 4080 SUPER):</b> CUDA operations working correctly"
+        ]
+    },
+    "Graphics Card": {
+        "deviceCount": 1,
+        "deviceDriverVersion": 13000,
+        "devices": [
+            {
+                "arch": "Ada Lovelace",
+                "computeCapability": "8.9",
+                "cores": 10240,
+                "name": "NVIDIA GeForce RTX 4080 SUPER",
+                "totalMemoryBytes": "16694575104",
+                "totalMemoryMB": 15921.1875
+            }
+        ],
+        "glx_info": "OpenGL vendor string: NVIDIA Corporation\nOpenGL renderer string: NVIDIA GeForce RTX 4080 SUPER/PCIe/SSE2\nOpenGL core profile version string: 4.6.0 NVIDIA 580.173.02\nOpenGL core profile shading language version string: 4.60 NVIDIA\nOpenGL core profile context flags: (none)\nOpenGL core profile profile mask: core profile\nOpenGL core profile extensions:\nOpenGL version string: 4.6.0 NVIDIA 580.173.02\nOpenGL shading language version string: 4.60 NVIDIA\nOpenGL context flags: (none)\nOpenGL profile mask: (none)\nOpenGL extensions:\nOpenGL ES profile version string: OpenGL ES 3.2 NVIDIA 580.173.02\nOpenGL ES profile shading language version string: OpenGL ES GLSL ES 3.20\nOpenGL ES profile extensions:\n",
+        "initResult": 0,
+        "valid": [
+            "<b>Graphics card: </b> NVIDIA GeForce RTX 4080 SUPER"
+        ]
+    },
+    "Processor": {
+        "OS": "Ubuntu 22.04.5 LTS ",
+        "avxSupported": true,
+        "coreCount": "",
+        "cpu": " Intel(R) Core(TM) i9-14900KF",
+        "datetime": "2026-08-30 15时58分41秒",
+        "hyperThreading": "0",
+        "motherboard": "PRIME Z790-P, ASUSTeK COMPUTER INC.",
+        "ramCapacity": "33.424048",
+        "ramUsage": "",
+        "ramUsed": "30.792221",
+        "threadCount": "0",
+        "valid": [
+            "<b>Motherboard: </b> PRIME Z790-P, ASUSTeK COMPUTER INC."
+        ],
+        "warning": [
+            "Unable to identify your processor, make sure that it fits the requirements."
+        ]
+    },
+    "USB Camera": {
+        "CorruptedFirmware": [
+        ],
+        "InternalDevicesCount (GMSL)": [
+        ],
+        "InternalDevicesCount (USB)": [
+        ],
+        "MCUDetected": [
+        ],
+        "Serial Number": [
+        ],
+        "USBList": [
+            {
+                "USBMode": 3,
+                "USB_path": "/6",
+                "bDescriptorType": 1,
+                "bDeviceProtocol": 1,
+                "bLength": 18,
+                "bMaxPacketSize0": 9,
+                "bNumConfigurations": 1,
+                "bcdDevice": "1.0",
+                "bcdUSB": "3.0",
+                "bcdUSBClass": 239,
+                "bcdUSBSubClass": 2,
+                "busNumber": 2,
+                "device": "ZED mini",
+                "iManufacturer": 1,
+                "iProduct": 2,
+                "iSerial": 0,
+                "idProduct": "0xf682",
+                "idVendor": "0x2b03"
+            },
+            {
+                "USBMode": 2,
+                "USB_path": "/7",
+                "bDescriptorType": 1,
+                "bDeviceProtocol": 0,
+                "bLength": 18,
+                "bMaxPacketSize0": 64,
+                "bNumConfigurations": 1,
+                "bcdDevice": "2.7",
+                "bcdUSB": "2.0",
+                "bcdUSBClass": 0,
+                "bcdUSBSubClass": 0,
+                "busNumber": 1,
+                "device": "ZED mini MCU",
+                "iManufacturer": 1,
+                "iProduct": 2,
+                "iSerial": 3,
+                "idProduct": "0xf681",
+                "idVendor": "0x2b03"
+            },
+            {
+                "USB_path": "/2",
+                "idProduct": "0x19af",
+                "idVendor": "0x0b05"
+            },
+            {
+                "USB_path": "/13",
+                "idProduct": "0x0608",
+                "idVendor": "0x05e3"
+            },
+            {
+                "USB_path": "/11/4",
+                "idProduct": "0xc34b",
+                "idVendor": "0x046d"
+            },
+            {
+                "USB_path": "/11/3",
+                "idProduct": "0xc09d",
+                "idVendor": "0x046d"
+            },
+            {
+                "USB_path": "/11",
+                "idProduct": "0x0608",
+                "idVendor": "0x05e3"
+            }
+        ],
+        "USBMode": [
+        ],
+        "ZED Camera Module Detected": [
+        ],
+        "ZED MCU Module Detected": [
+        ],
+        "ZEDCount": [
+        ],
+        "ZEDDetected": [
+        ],
+        "ZEDs": [
+        ],
+        "camera": [
+        ],
+        "resolutions": [
+        ],
+        "sensors": [
+        ],
+        "valid": [
+            "<b>Camera: </b>ZED-M",
+            "<b>USB Bandwidth: </b> OK",
+            "<b>USB Bandwidth: </b> OK"
+        ]
+    },
+    "ZED SDK": {
+        "CUDA Toolkit version": "V12.8.61 -->located in /usr/local/cuda-12.8/bin/nvcc",
+        "CUDA loading": false,
+        "GPU Driver Version": "Driver Version                                         : 580.173.02",
+        "GPU Performance": "    Performance State                                  : P8",
+        "ZED SDK Version (Diag)": "5.3.0",
+        "ZED SDK Version (RT)": "5.3.0",
+        "ai": {
+            "checkAI": true,
+            "cudaVersion": 12080,
+            "tensorVersion": 100900
+        },
+        "binFiles": [
+            "libsl_ai.so",
+            "libsl_zed.so"
+        ],
+        "resourcesFiles": [
+            "neural_depth_5.3.model",
+            "neural_depth_light_5.3.model",
+            "objects_accurate_3.2.model",
+            "objects_medium_3.2.model",
+            "objects_performance_3.2.model",
+            "person_head_accurate_2.6.model",
+            "person_head_performance_2.6.model",
+            "person_reid_1.4.model",
+            "skeleton_body18_3.2.model",
+            "skeleton_body38_3.5.model"
+        ],
+        "resourcesFilesExpected": [
+            "objects_performance_3.2"
+        ],
+        "valid": [
+            "<b>ZED SDK version:</b> 5.3.0",
+            "<b>CUDA version:</b> V12.8.61"
+        ]
+    }
+}

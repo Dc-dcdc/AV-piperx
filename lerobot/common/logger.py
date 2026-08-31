@@ -207,6 +207,15 @@ class Logger:
                 "eval/*",
                 step_metric="eval/checkpoint_step",
             )
+            # 保留上面的checkpoint step视图，同时额外生成以已完成epoch为
+            # 横轴的成功率曲线。两套指标使用不同命名空间，避免一个指标
+            # 同时绑定两个step_metric。官方W&B会为该标量自动创建折线图。
+            wandb.define_metric("eval_by_epoch/epoch", hidden=True)
+            wandb.define_metric(
+                "eval_by_epoch/success_rate_percent",
+                step_metric="eval_by_epoch/epoch",
+                summary="max",
+            )
             self._wandb = wandb
 
     @classmethod
@@ -361,7 +370,30 @@ class Logger:
             if mode == "eval":
                 # 同步评估默认等于当前step；异步评估可在d中显式传入
                 # checkpoint_step，从而与实际被评估的模型快照严格对齐。
-                payload.setdefault("eval/checkpoint_step", int(step))
+                checkpoint_step = int(
+                    payload.setdefault("eval/checkpoint_step", int(step))
+                )
+                steps_per_epoch = OmegaConf.select(
+                    self._cfg,
+                    "training.steps_per_epoch",
+                    default=None,
+                )
+                success_rate_percent = payload.get(
+                    "eval/success_rate_percent"
+                )
+                if (
+                    steps_per_epoch is not None
+                    and int(steps_per_epoch) > 0
+                    and success_rate_percent is not None
+                ):
+                    # checkpoint_step从0开始，因此用已完成更新数step+1换算。
+                    checkpoint_epoch = (
+                        checkpoint_step + 1
+                    ) / int(steps_per_epoch)
+                    payload["eval_by_epoch/epoch"] = checkpoint_epoch
+                    payload[
+                        "eval_by_epoch/success_rate_percent"
+                    ] = float(success_rate_percent)
             if payload:
                 self._wandb.log(payload, step=step)
 

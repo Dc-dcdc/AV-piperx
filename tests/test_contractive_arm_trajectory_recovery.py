@@ -1,18 +1,29 @@
 import numpy as np
 import pytest
+from omegaconf import OmegaConf
 
-from data_collect.augment_view_joint_trajectories import ACTION_DIM, VIEW_SLICE
-from data_collect.generate_contractive_arm_recovery_trajectories import (
+from data_collect.recovery_data_generation.trajectory_replay_common import (
+    ACTION_DIM,
+    VIEW_SLICE,
+    build_static_anchor_reference_state,
+    resolve_recovery_base_action,
+    resolve_recovery_timeline_step,
+)
+from data_collect.recovery_data_generation.arm_recovery_trajectories import (
     ARM_DIM,
+    ArmRecoveryBranchError,
     GRIPPER_INDICES,
     LEFT_ARM_SLICE,
     RIGHT_ARM_SLICE,
     _arm_recovery_action,
     _arm_velocity_percentile,
-    _assign_balanced_arms,
+    _build_arm_recovery_candidates,
     _local_arm_feasible_offset_bounds,
     _sample_arm_recovery_offset,
+    _select_active_arm,
+    _validate_recovery_unperturbed_roles,
 )
+from data_collect.recovery_data_generation.view_recovery_trajectories import ModelRiskAnchor
 
 
 @pytest.mark.parametrize(
@@ -47,17 +58,174 @@ def test_arm_recovery_action_rejects_unknown_side():
         )
 
 
-def test_balanced_arm_assignment_is_deterministic_and_globally_balanced():
-    identities = [(episode, variant) for episode in range(7) for variant in range(5)]
+def test_static_hold_drift_is_only_validated_at_recovery_end():
+    cfg = OmegaConf.create(
+        {
+            "validation": {
+                "branch_max_other_arm_joint_abs_error": 0.002,
+                "branch_max_gripper_abs_error": 0.020,
+                "branch_max_view_joint_abs_error": 0.0001,
+                "static_hold_max_other_arm_joint_drift_rad": 0.010,
+                "static_hold_max_gripper_drift": 0.030,
+                "static_hold_max_view_joint_drift_rad": 0.006,
+            }
+        }
+    )
+    transient_errors = {
+        "other_arm": 0.020,
+        "gripper": 0.040,
+        "view": 0.010,
+    }
 
-    first = _assign_balanced_arms(identities, seed=20260802)
-    repeated = _assign_balanced_arms(list(reversed(identities)), seed=20260802)
+    _validate_recovery_unperturbed_roles(
+        transient_errors,
+        cfg,
+        trajectory_alignment_mode="static_anchor_wait",
+        final=False,
+    )
 
-    assert first == repeated
-    counts = {side: list(first.values()).count(side) for side in ("left", "right")}
-    assert abs(counts["left"] - counts["right"]) <= 1
-    ordered_sides = [first[key] for key in sorted(first)]
-    assert all(left != right for left, right in zip(ordered_sides, ordered_sides[1:]))
+    with pytest.raises(ArmRecoveryBranchError, match="Arm 恢复结束.*other_arm"):
+        _validate_recovery_unperturbed_roles(
+            transient_errors,
+            cfg,
+            trajectory_alignment_mode="static_anchor_wait",
+            final=True,
+        )
+
+
+def test_moving_expert_still_validates_every_recovery_step():
+    cfg = OmegaConf.create(
+        {
+            "validation": {
+                "branch_max_other_arm_joint_abs_error": 0.002,
+                "branch_max_gripper_abs_error": 0.020,
+                "branch_max_view_joint_abs_error": 0.0001,
+            }
+        }
+    )
+    errors = {"other_arm": 0.003, "gripper": 0.0, "view": 0.0}
+
+    with pytest.raises(ArmRecoveryBranchError, match="Arm 恢复.*other_arm"):
+        _validate_recovery_unperturbed_roles(
+            errors,
+            cfg,
+            trajectory_alignment_mode="moving_expert",
+            final=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("side", "selected_slice", "other_slice"),
+    [
+        ("left", LEFT_ARM_SLICE, RIGHT_ARM_SLICE),
+        ("right", RIGHT_ARM_SLICE, LEFT_ARM_SLICE),
+    ],
+)
+def test_static_anchor_arm_action_holds_every_unperturbed_channel(
+    side, selected_slice, other_slice
+):
+    source_actions = np.stack(
+        [np.full(ACTION_DIM, frame + 100, dtype=np.float64) for frame in range(50)]
+    )
+    source_states = np.stack(
+        [np.full(ACTION_DIM, frame, dtype=np.float64) for frame in range(50)]
+    )
+    reference, _ = resolve_recovery_timeline_step(
+        "static_anchor_wait", recovery_anchor_frame=12, source_frame=12
+    )
+    static_reference = build_static_anchor_reference_state(
+        expert_state=source_states[reference],
+        actual_state=np.full(ACTION_DIM, -3.0),
+        perturbed_indices=selected_slice,
+    )
+    base_action = resolve_recovery_base_action(
+        "static_anchor_wait",
+        expert_action=source_actions[reference],
+        expert_state=static_reference,
+    )
+    recovered = _arm_recovery_action(
+        base_action, np.full(ARM_DIM, 0.1), side
+    )
+
+    np.testing.assert_allclose(recovered[selected_slice], 12.1)
+    np.testing.assert_allclose(recovered[other_slice], -3.0)
+    np.testing.assert_allclose(recovered[GRIPPER_INDICES], -3.0)
+    np.testing.assert_allclose(recovered[VIEW_SLICE], -3.0)
+
+
+def test_requested_active_arm_is_honored_but_must_have_local_motion():
+    states = np.zeros((50, ACTION_DIM), dtype=np.float64)
+    states[:, LEFT_ARM_SLICE] = np.arange(50)[:, None] * 0.02
+    states[:, RIGHT_ARM_SLICE] = np.arange(50)[:, None] * 0.005
+
+    selected = _select_active_arm(
+        states=states,
+        event_frame=10,
+        fps=25,
+        lookback_steps=0,
+        lookahead_steps=10,
+        min_rms_velocity_rad_s=0.02,
+        requested_side="right",
+    )
+    assert selected is not None
+    assert selected.side == "right"
+
+    rejected = _select_active_arm(
+        states=states,
+        event_frame=10,
+        fps=25,
+        lookback_steps=0,
+        lookahead_steps=10,
+        min_rms_velocity_rad_s=0.2,
+        requested_side="right",
+    )
+    assert rejected is None
+
+
+def test_arm_model_risk_candidates_honor_manifest_side_and_local_interval():
+    states = np.zeros((100, ACTION_DIM), dtype=np.float64)
+    states[:, LEFT_ARM_SLICE] = np.arange(100)[:, None] * 0.02
+    states[:, RIGHT_ARM_SLICE] = np.arange(100)[:, None] * 0.005
+    cfg = OmegaConf.create(
+        {
+            "seed": 20260802,
+            "fps": 25,
+            "event_sampling": {
+                "mode": "model_risk",
+                "exclude_initial_steps": 16,
+                "fallback_radius_steps": 2,
+                "fallback_to_random": False,
+                "min_injection_interval_steps": 5,
+                "score_key": "arm_joint_score_smoothed",
+                "normalized_regions": [],
+            },
+            "arm_selection": {
+                "lookback_steps": 0,
+                "lookahead_steps": 10,
+                "min_rms_velocity_rad_s": 0.02,
+            },
+        }
+    )
+    anchors = [
+        ModelRiskAnchor(
+            2, 40, 0.8, "right", 100, 0, "model_risk", "0" * 64
+        )
+    ]
+
+    candidates, inactive = _build_arm_recovery_candidates(
+        states=states,
+        source_episode=2,
+        setup_steps=10,
+        required_tail_steps=20,
+        cfg=cfg,
+        model_risk_anchors=anchors,
+    )
+
+    assert inactive == []
+    assert candidates[0].event.frame == 40
+    assert {candidate.event.frame for candidate in candidates} == set(range(38, 43))
+    assert all(candidate.motion_selection.side == "right" for candidate in candidates)
+    assert len({candidate.domain_key for candidate in candidates}) == 1
 
 
 def test_arm_velocity_percentile_combines_both_arms_without_episode_boundaries():

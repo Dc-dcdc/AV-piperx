@@ -1,5 +1,7 @@
 import unittest
 
+from omegaconf import OmegaConf
+
 from lerobot.common.logger import Logger
 
 
@@ -19,6 +21,9 @@ class LoggerEvalStepTest(unittest.TestCase):
     def make_logger(self):
         logger = Logger.__new__(Logger)
         logger._wandb = _FakeWandb()
+        logger._cfg = OmegaConf.create(
+            {"training": {"steps_per_epoch": 50}}
+        )
         return logger
 
     def test_async_eval_uses_checkpoint_step_as_custom_axis(self):
@@ -48,6 +53,45 @@ class LoggerEvalStepTest(unittest.TestCase):
         payload, wandb_step = logger._wandb.log_calls[0]
         self.assertEqual(wandb_step, 200)
         self.assertEqual(payload["eval/checkpoint_step"], 200)
+
+    def test_success_rate_is_also_logged_against_evaluated_epoch(self):
+        logger = self.make_logger()
+
+        logger.log_dict(
+            {
+                "success_rate_percent": 80.0,
+                "checkpoint_step": 99,
+                "evaluation_lag_steps": 51,
+            },
+            step=150,
+            mode="eval",
+        )
+
+        payload, wandb_step = logger._wandb.log_calls[0]
+        self.assertEqual(wandb_step, 150)
+        self.assertEqual(payload["eval/checkpoint_step"], 99)
+        self.assertEqual(payload["eval_by_epoch/epoch"], 2.0)
+        self.assertEqual(
+            payload["eval_by_epoch/success_rate_percent"],
+            80.0,
+        )
+
+    def test_epoch_success_metric_is_skipped_without_epoch_budget(self):
+        logger = self.make_logger()
+        logger._cfg = OmegaConf.create({"training": {}})
+
+        logger.log_dict(
+            {"success_rate_percent": 80.0},
+            step=99,
+            mode="eval",
+        )
+
+        payload, _ = logger._wandb.log_calls[0]
+        self.assertNotIn("eval_by_epoch/epoch", payload)
+        self.assertNotIn(
+            "eval_by_epoch/success_rate_percent",
+            payload,
+        )
 
     def test_async_video_uses_evaluated_checkpoint_step(self):
         logger = self.make_logger()

@@ -1,299 +1,87 @@
+# AV-piper client/runtime environment (Linux x86_64 + NVIDIA GPU).
+#
+# Design rules:
+# - Conda only owns Python and packaging tools. Native Python packages come
+#   from wheels built on the target client; do not copy an existing env.
+# - PyTorch uses direct links to the official CUDA 12.4 wheels. The host only
+#   needs a compatible NVIDIA driver; do not add cuda-version/cuda-runtime.
+# - Before creating the environment or launching training on Linux, use:
+#     ulimit -S -s 65536
+# - Create the environment without inheriting ~/.local packages:
+#     PYTHONNOUSERSITE=1 conda env create -f environment.yml
+# - After creation, install this repository with:
+#     conda run -n AV-piper python -m pip install -e .
+
 name: AV-piper
+
 channels:
   - defaults
-  - conda-forge
-  - nvidia
-  - pytorch
+  # Ignore extra channels from the client's .condarc; mixing defaults and
+  # conda-forge was one source of ABI drift in the old full export.
+  - nodefaults
+
 dependencies:
-  - _libgcc_mutex=0.1=main
-  - _openmp_mutex=5.1=1_gnu
-  - aom=3.12.1=h7934f7d_0
-  - blas=1.0=mkl
-  - brotlicffi=1.2.0.0=py310h7354ed3_0
-  - bzip2=1.0.8=h5eee18b_6
-  - ca-certificates=2026.2.25=hbd8a1cb_0
-  - cairo=1.18.4=h44eff21_0
-  - certifi=2026.2.25=pyhd8ed1ab_0
-  - cffi=2.0.0=py310h4eded50_1
-  - charset-normalizer=3.4.4=py310h06a4308_0
-  - cuda-cudart=12.4.127=0
-  - cuda-cupti=12.4.127=0
-  - cuda-libraries=12.4.1=0
-  - cuda-nvrtc=12.4.127=0
-  - cuda-nvtx=12.4.127=0
-  - cuda-opencl=12.9.19=0
-  - cuda-runtime=12.4.1=0
-  - cuda-version=12.9=3
-  - dav1d=1.2.1=h5eee18b_0
-  - expat=2.7.4=h7354ed3_0
-  - ffmpeg=4.2.2=h20bf706_0
-  - filelock=3.20.3=py310h06a4308_0
-  - fontconfig=2.15.0=h2c49b7f_0
-  - freetype=2.14.1=hf5b9546_0
-  - fribidi=1.0.16=h9fb5f84_0
-  - giflib=5.2.2=h5eee18b_0
-  - gmp=6.3.0=h6a678d5_0
-  - gmpy2=2.2.2=py310ha78e65c_0
-  - gnutls=3.6.15=he1e5248_0
-  - graphite2=1.3.14=h295c915_1
-  - harfbuzz=12.3.0=h79d275a_1
-  - icu=73.1=h6a678d5_0
-  - idna=3.11=py310h06a4308_0
-  - jinja2=3.1.6=py310h06a4308_0
-  - jpeg=9f=h5ce9db8_0
-  - lame=3.100=hbd0596d_1
-  - lcms2=2.17=heab6991_0
-  - ld_impl_linux-64=2.44=h153f514_2
-  - lerc=4.0.0=h6a678d5_0
-  - libavif=1.3.0=h3539ee5_0
-  - libcublas=12.4.5.8=0
-  - libcufft=11.2.1.3=0
-  - libcufile=1.14.1.1=4
-  - libcurand=10.3.10.19=0
-  - libcusolver=11.6.1.9=0
-  - libcusparse=12.3.1.170=0
-  - libdeflate=1.22=h5eee18b_0
-  - libdrm=2.4.125=hb03c661_1
-  - libexpat=2.7.4=h7354ed3_0
-  - libffi=3.4.4=h6a678d5_1
-  - libgcc=15.2.0=h69a1729_7
-  - libgcc-ng=15.2.0=h166f726_7
-  - libglib=2.86.3=h8b17d9a_0
-  - libgomp=15.2.0=h4751f2c_7
-  - libhwloc=2.12.1=default_hf1bbc79_1000
-  - libiconv=1.18=h75a1612_0
-  - libidn2=2.3.4=h5eee18b_0
-  - libjpeg-turbo=2.0.0=h9bf148f_0
-  - libllvm21=21.1.8=h5ad376a_0
-  - libnpp=12.2.5.30=0
-  - libnsl=2.0.0=h5eee18b_0
-  - libnvfatbin=12.9.82=0
-  - libnvjitlink=12.4.127=0
-  - libnvjpeg=12.3.1.117=0
-  - libopenjpeg=2.5.4=hee96239_1
-  - libopus=1.6.1=h9f10d21_0
-  - libpciaccess=0.18=hb9d3cd8_0
-  - libpng=1.6.55=h22898a0_0
-  - libstdcxx=15.2.0=h39759b7_7
-  - libstdcxx-ng=15.2.0=hc03a8fd_7
-  - libtasn1=4.21.0=h27ab2c4_0
-  - libtiff=4.7.1=h029b1ac_0
-  - libunistring=0.9.10=h27cfd23_0
-  - libuuid=1.41.5=h5eee18b_0
-  - libvpx=1.7.0=h439df22_0
-  - libwebp=1.6.0=h089d785_0
-  - libwebp-base=1.6.0=hb7bb969_0
-  - libxcb=1.17.0=h9b100fa_0
-  - libxml2=2.13.9=h2c43086_0
-  - libzlib=1.3.1=hb25bd0a_0
-  - llvm-openmp=14.0.6=h9e868ea_0
-  - lz4-c=1.9.4=h6a678d5_1
-  - markupsafe=3.0.2=py310h5eee18b_0
-  - mesalib=25.3.5=h8cca3c9_0
-  - mkl-service=2.5.2=py310hacdc0fc_0
-  - mkl_fft=2.1.1=py310h8fe796d_0
-  - mkl_random=1.3.0=py310h505adc9_0
-  - mpc=1.3.1=h5eee18b_0
-  - mpfr=4.2.1=h5eee18b_0
-  - mpmath=1.3.0=py310h06a4308_0
-  - ncurses=6.5=h7934f7d_0
-  - nettle=3.7.3=hbbd107a_1
-  - networkx=3.4.2=py310h06a4308_0
-  - ocl-icd=2.3.3=h47b2149_0
-  - opencl-headers=2025.07.22=hfb20e49_0
-  - openh264=2.1.1=h4ff587b_0
-  - openssl=3.6.2=h35e630c_0
-  - packaging=25.0=py310h06a4308_1
-  - pcre2=10.46=hf426167_0
-  - pillow=12.1.1=py310h8263a33_0
-  - pip=26.0.1=pyhc872135_0
-  - pixman=0.46.4=h7934f7d_0
-  - pthread-stubs=0.3=h0ce48e5_1
-  - pycparser=2.23=py310h06a4308_0
-  - pysocks=1.7.1=py310h06a4308_1
-  - python=3.10.19=h6fa692b_0
-  - pytorch=2.5.1=py3.10_cuda12.4_cudnn9.1.0_0
-  - pytorch-cuda=12.4=hc786d27_7
-  - pytorch-mutex=1.0=cuda
-  - pyyaml=6.0.3=py310h591646f_0
-  - readline=8.3=hc2a1206_0
-  - requests=2.32.5=py310h06a4308_1
-  - setuptools=80.10.2=py310h06a4308_0
-  - spirv-tools=2026.1=hb700be7_0
-  - sqlite=3.51.1=h3e8d24a_1
-  - tbb-devel=2022.3.0=h698db13_0
-  - tk=8.6.15=h54e0aa7_0
-  - torchaudio=2.5.1=py310_cu124
-  - torchtriton=3.1.0=py310
-  - torchvision=0.20.1=py310_cu124
-  - typing_extensions=4.15.0=py310h06a4308_0
-  - urllib3=2.6.3=py310h06a4308_0
-  - wheel=0.46.3=py310h06a4308_0
-  - x264=1!157.20191217=h7b6447c_0
-  - xorg-libx11=1.8.12=h9b100fa_1
-  - xorg-libxau=1.0.12=h9b100fa_0
-  - xorg-libxdmcp=1.1.5=h9b100fa_0
-  - xorg-libxext=1.3.6=h9b100fa_0
-  - xorg-libxrandr=1.5.5=hb03c661_0
-  - xorg-libxrender=0.9.12=h9b100fa_0
-  - xorg-libxshmfence=1.3.3=hb9d3cd8_0
-  - xorg-xorgproto=2024.1=h5eee18b_1
-  - xz=5.8.2=h448239c_0
-  - yaml=0.2.5=h7b6447c_0
-  - zlib=1.3.1=hb25bd0a_0
-  - zstd=1.5.7=h11fc155_0
+  - python=3.10
+  # pip 26.0.1 crashed inside its vendored packaging resolver on one client.
+  # Keep the last 25.x release until the client image has been validated.
+  - pip=25.3
+  - setuptools=80.10.2
+  - wheel=0.46.3
   - pip:
-      - absl-py==2.4.0
-      - aiohappyeyeballs==2.6.1
-      - aiohttp==3.13.3
-      - aioice==0.10.2
-      - aiortc==1.14.0
-      - aiosignal==1.4.0
-      - annotated-doc==0.0.4
-      - annotated-types==0.7.0
-      - antlr4-python3-runtime==4.9.3
-      - anyio==4.12.1
-      - asciitree==0.3.3
-      - asttokens==3.0.1
-      - async-timeout==5.0.1
-      - attrs==25.4.0
-      - av==16.1.0
-      - beautifulsoup4==4.14.3
-      - blinker==1.9.0
-      - click==8.3.1
-      - cloudpickle==3.1.2
-      - cmake==4.2.3
-      - cryptography==46.0.5
-      - cython==3.2.4
+      # Official PyTorch 2.5.1 CUDA 12.4 wheels for CPython 3.10/Linux x86_64.
+      # Direct URLs prevent pip from searching the PyTorch index for every
+      # unrelated package in this environment.
+      - torch @ https://download.pytorch.org/whl/cu124/torch-2.5.1%2Bcu124-cp310-cp310-linux_x86_64.whl
+      - torchvision @ https://download.pytorch.org/whl/cu124/torchvision-0.20.1%2Bcu124-cp310-cp310-linux_x86_64.whl
+
+      # Numerical/data stack. NumPy 1.26 keeps the vendored LeRobot code and
+      # the selected Numba/Zarr versions on their tested pre-NumPy-2 ABI.
+      - numpy==1.26.4
+      - scipy==1.15.3
+      - numba==0.64.0
+      - pandas==2.3.3
+      - pyarrow==23.0.1
       - datasets==4.7.0
-      - decorator==5.2.1
-      - deepdiff==8.6.1
-      - diffusers==0.37.0
-      - dill==0.4.0
-      - dm-control==1.0.37
-      - dm-env==1.6
-      - dm-tree==0.1.9
-      - dnspython==2.8.0
-      # - AV-piper==0.1.0
-      - einops==0.8.2
-      - etils==1.13.0
-      - exceptiongroup==1.3.1
-      - executing==2.2.1
-      - farama-notifications==0.0.4
-      - fasteners==0.20
-      - flask==3.1.3
-      - frozenlist==1.8.0
-      - fsspec==2026.2.0
-      - gdown==5.2.1
-      - gitdb==4.0.12
-      - gitpython==3.1.46
-      - glfw==2.10.0
-      - google-api-core==2.30.0
-      - google-auth==2.49.0
-      - google-cloud-core==2.5.0
-      - google-cloud-firestore==2.24.0
-      - google-crc32c==1.8.0
-      - googleapis-common-protos==1.73.0
-      - grpcio==1.78.0
-      - grpcio-status==1.78.0
-      # - gym-guided-vision==0.1.0
-      - gymnasium==1.2.3
-      - h11==0.16.0
       - h5py==3.16.0
-      - hf-xet==1.4.3
-      - httpcore==1.0.9
-      - httpx==0.28.1
-      - huggingface-hub==1.14.0
-      - hydra-core==1.3.2
-      - ifaddr==0.2.0
+      - numcodecs==0.13.1
+      - zarr==2.18.3
+
+      # MuJoCo/PyMJCF. The old export declared lxml 6.0.2 while the working
+      # process was actually loading lxml 6.1.1 from ~/.local; pin the real
+      # working version and disable user-site overrides below.
+      - mujoco==3.5.0
+      - dm-control==1.0.37
+      - lxml==6.1.1
+      - glfw==2.10.0
+      - PyOpenGL==3.1.10
+      - gymnasium==1.2.3
+
+      # Vision/video and simulation utilities.
+      - av==16.1.0
+      - opencv-python==4.9.0.80
       - imageio==2.37.3
       - imageio-ffmpeg==0.6.0
-      - importlib-metadata==8.7.1
-      - importlib-resources==6.5.2
-      - intel-cmplr-lib-ur==2024.2.1
-      - intel-openmp==2024.2.1
-      - ipython==8.38.0
-      - itsdangerous==2.2.0
-      - jedi==0.19.2
-      - labmaze==1.0.6
-      # LeRobot 0.1.0 的本地修改版已 vendoring 到项目的 ./lerobot，随 AV-piper 一起安装。
-      - llvmlite==0.46.0
-      - lxml==6.0.2
-      - markdown-it-py==4.0.0
-      - matplotlib-inline==0.2.1
-      - mdurl==0.1.2
-      - mkl==2024.0.0
-      - mkl-include==2024.0.0
-      # mjlab==1.5.0 pulls mujoco~=3.10.0 and torch>=2.7.0, which breaks
-      # the Gym/dm_control stack pinned below. Install mjlab in a separate env
-      # for train/s3_finetune/*mjlab* workflows.
-      # - mjlab==1.5.0
-      - mujoco==3.5.0
-      - multidict==6.7.1
-      - multiprocess==0.70.18
-      - numba==0.64.0
-      - numcodecs==0.13.1
-      - numpy==1.26.4
-      - omegaconf==2.3.0
-      - onemkl-license==2025.3.1
-      - opencv-python==4.9.0.80
-      - orderly-set==5.5.0
-      - pandas==2.3.3
-      - parso==0.8.6
-      - pexpect==4.9.0
-      - platformdirs==4.9.4
-      - prompt-toolkit==3.0.52
-      - propcache==0.4.1
-      - proto-plus==1.27.1
-      - protobuf==6.33.5
-      - psutil==7.2.2
-      - ptyprocess==0.7.0
-      - pure-eval==0.2.3
-      - pyarrow==23.0.1
-      - pyasn1==0.6.2
-      - pyasn1-modules==0.4.2
-      - pydantic==2.12.5
-      - pydantic-core==2.41.5
-      - pyee==13.0.1
+      - Pillow==12.1.1
       - pygame==2.6.1
-      - pygments==2.19.2
-      - pylibsrtp==1.0.0
       - pymunk==7.2.0
-      - pyopengl==3.1.10
-      - pyopenssl==25.3.0
-      - pyparsing==3.3.2
-      - python-dateutil==2.9.0.post0
-      - pytz==2026.1.post1
-      # - pyzed==4.1
-      - regex==2026.2.28
-      - rerun-sdk==0.23.1
-      - rich==14.3.3
-      - rsa==4.9.1
+      - matplotlib>=3.8,<4
+
+      # Training, configuration, serialization, and experiment logging.
+      - diffusers==0.37.0
+      - einops==0.8.2
+      - hydra-core==1.3.2
+      - omegaconf==2.3.0
+      - PyYAML==6.0.3
+      - huggingface-hub==1.14.0
       - safetensors==0.7.0
-      - scipy==1.15.3
-      - sentry-sdk==2.54.0
-      - shellingham==1.5.4
-      - six==1.17.0
-      - smmap==5.0.3
-      - socksio==1.0.0
-      - soupsieve==2.8.3
-      - stack-data==0.6.3
-      - sympy==1.13.1
-      - tbb==2021.13.1
-      - tcmlib==1.4.1
       - termcolor==3.3.0
       - tqdm==4.67.3
-      - traitlets==5.14.3
-      - typer==0.24.1
-      - typing-inspection==0.4.2
-      - tzdata==2025.3
-      - umf==1.0.3
-      - util==0.0.1
       - wandb==0.25.1
-      - wcwidth==0.6.0
-      - werkzeug==3.1.6
-      - wrapt==2.1.2
-      - xxhash==3.6.0
-      - yarl==1.23.0
-      - zarr==2.18.3
-      - zipp==3.23.0
+
+      # Repository test runner (also useful for client smoke tests).
+      - pytest>=8,<9
+
+# Prevent ~/.local/site-packages from silently overriding the environment.
+# This exposed the old lxml mismatch between the working host and the client.
+variables:
+  PYTHONNOUSERSITE: "1"

@@ -3,6 +3,7 @@
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com" # 强行指向国内镜像站
 import copy
 import json
+import math
 import os
 import shutil
 import sys
@@ -68,7 +69,16 @@ from train.s1_pretrain.train.optimizer_utils import (
     is_visual_backbone_parameter,
     partition_optimizer_parameters,
 )
+from train.s1_pretrain.train.lr_scheduler import (
+    make_cosine_with_floor_scheduler,
+    resolve_lr_decay_steps,
+)
 from train.s1_pretrain.train.ema import PolicyEMA
+from train.s1_pretrain.train.training_schedule import (
+    evaluation_has_started,
+    should_evaluate,
+    should_save_checkpoint,
+)
 from train.s1_pretrain.train.wandb_logging import (
     add_wandb_parameter_tags,
     configure_wandb_runtime,
@@ -163,27 +173,9 @@ def resolve_grad_scaler_enabled(cfg: DictConfig, device: torch.device, amp_dtype
     raise ValueError("use_grad_scaler 只能是 auto/true/false。")
 
 
-def should_run_periodic_step(step: int, total_steps: int, freq: int | None) -> bool:
-    """训练最后一步也执行周期任务，避免尾部 checkpoint/eval 被漏掉。"""
-    is_last_step = step == total_steps - 1
-    if is_last_step:
-        return True
-    return bool(freq and freq > 0 and step > 0 and step % freq == 0)
-
-
 def should_checkpoint_or_eval(step: int, cfg: DictConfig) -> bool:
     """提前判断本 step 是否真的需要进入较重的评估/保存逻辑。"""
-    total_steps = int(cfg.training.offline_steps)
-    should_eval = should_run_periodic_step(
-        step,
-        total_steps,
-        int(getattr(cfg.training, "eval_freq", 0)),
-    )
-    save_freq = int(getattr(cfg.training, "save_freq", 10000))
-    should_checkpoint = bool(getattr(cfg.training, "save_checkpoint", False)) and (
-        should_run_periodic_step(step, total_steps, save_freq)
-    )
-    return should_eval or should_checkpoint
+    return should_evaluate(step, cfg) or should_save_checkpoint(step, cfg)
 
 
 def process_async_eval_results(
@@ -245,7 +237,7 @@ def make_train_dataloader_kwargs(
         "shuffle": shuffle,
         "sampler": sampler,
         "pin_memory": (device.type != "cpu"),
-        "drop_last": True,
+        "drop_last": bool(cfg.training.resolved_drop_last),
     }
     if num_workers > 0:
         dataloader_kwargs["persistent_workers"] = bool(
@@ -257,6 +249,125 @@ def make_train_dataloader_kwargs(
             if prefetch_factor > 0:
                 dataloader_kwargs["prefetch_factor"] = prefetch_factor
     return dataloader_kwargs
+
+
+def resolve_offline_training_budget(
+    cfg: DictConfig,
+    *,
+    effective_num_samples: int,
+) -> tuple[int, int]:
+    """按实际Sampler长度解析每个epoch步数和总训练步数。
+
+    ``offline_epochs`` 为 null 时保持固定 ``offline_steps`` 语义；设置为
+    正整数时默认保留最后的小batch，确保每个epoch覆盖全部有效样本。
+    """
+
+    effective_num_samples = int(effective_num_samples)
+    batch_size = int(cfg.training.batch_size)
+    if effective_num_samples <= 0:
+        raise ValueError(
+            "有效训练样本数必须为正数，当前为"
+            f"{effective_num_samples}。请检查数据集和episode边界采样配置。"
+        )
+    if batch_size <= 0:
+        raise ValueError(f"training.batch_size必须为正整数，当前为{batch_size}。")
+
+    configured_epochs = OmegaConf.select(
+        cfg,
+        "training.offline_epochs",
+        default=None,
+    )
+    configured_drop_last = OmegaConf.select(
+        cfg,
+        "training.drop_last",
+        default=None,
+    )
+    if configured_drop_last is None:
+        # epoch模式要求真正遍历全部有效样本；固定step模式保持旧行为。
+        drop_last = configured_epochs is None
+    elif isinstance(configured_drop_last, bool):
+        drop_last = configured_drop_last
+    else:
+        raise ValueError(
+            "training.drop_last必须为true、false或null，当前为"
+            f"{configured_drop_last!r}。"
+        )
+
+    steps_per_epoch = (
+        effective_num_samples // batch_size
+        if drop_last
+        else (effective_num_samples + batch_size - 1) // batch_size
+    )
+    if steps_per_epoch <= 0:
+        raise ValueError(
+            "有效训练样本数小于batch_size，且DataLoader使用drop_last=True，"
+            "因此每个epoch没有可用batch: "
+            f"samples={effective_num_samples}, batch_size={batch_size}。"
+        )
+
+    if configured_epochs is None:
+        total_steps = int(cfg.training.offline_steps)
+        if total_steps <= 0:
+            raise ValueError(
+                "training.offline_steps必须为正整数，当前为"
+                f"{total_steps}。"
+            )
+        resolved_epochs = total_steps / steps_per_epoch
+        budget_source = "offline_steps"
+    else:
+        if isinstance(configured_epochs, bool):
+            raise ValueError("training.offline_epochs必须为正整数，不能是布尔值。")
+        epoch_value = float(configured_epochs)
+        if not math.isfinite(epoch_value) or not epoch_value.is_integer() or epoch_value <= 0:
+            raise ValueError(
+                "training.offline_epochs必须为正整数或null，当前为"
+                f"{configured_epochs!r}。"
+            )
+        resolved_epochs = int(epoch_value)
+        total_steps = int(resolved_epochs * steps_per_epoch)
+        cfg.training.offline_steps = total_steps
+        budget_source = "offline_epochs"
+
+    OmegaConf.update(
+        cfg,
+        "training.effective_num_samples",
+        effective_num_samples,
+        merge=False,
+        force_add=True,
+    )
+    OmegaConf.update(
+        cfg,
+        "training.resolved_drop_last",
+        drop_last,
+        merge=False,
+        force_add=True,
+    )
+    OmegaConf.update(
+        cfg,
+        "training.steps_per_epoch",
+        steps_per_epoch,
+        merge=False,
+        force_add=True,
+    )
+    OmegaConf.update(
+        cfg,
+        "training.resolved_offline_epochs",
+        float(resolved_epochs),
+        merge=False,
+        force_add=True,
+    )
+    logging.info(
+        "训练预算: source=%s, effective_samples=%d, batch_size=%d, "
+        "drop_last=%s, steps_per_epoch=%d, epochs=%.6g, offline_steps=%d",
+        budget_source,
+        effective_num_samples,
+        batch_size,
+        drop_last,
+        steps_per_epoch,
+        float(resolved_epochs),
+        total_steps,
+    )
+    return steps_per_epoch, total_steps
 
 
 def tensor_to_float(value) -> float:
@@ -358,15 +469,37 @@ def make_optimizer_and_scheduler(cfg, policy):
             eps=cfg.training.adam_eps,
             weight_decay=cfg.training.weight_decay,
         )
-        from diffusers.optimization import get_scheduler
+        if cfg.training.lr_scheduler == "cosine_with_floor":
+            decay_steps = resolve_lr_decay_steps(cfg)
+            min_lr_ratio = float(
+                OmegaConf.select(cfg, "training.min_lr_ratio", default=0.01)
+            )
+            lr_scheduler = make_cosine_with_floor_scheduler(
+                optimizer,
+                num_warmup_steps=cfg.training.lr_warmup_steps,
+                num_decay_steps=decay_steps,
+                min_lr_ratio=min_lr_ratio,
+            )
+            logging.info(
+                "学习率调度器=cosine_with_floor; warmup_steps=%d, "
+                "decay_end_step=%d, min_lr_ratio=%g; "
+                "main_lr_floor=%g, backbone_lr_floor=%g",
+                int(cfg.training.lr_warmup_steps),
+                decay_steps,
+                min_lr_ratio,
+                float(cfg.training.lr) * min_lr_ratio,
+                float(getattr(cfg.training, "lr_backbone", 1e-5)) * min_lr_ratio,
+            )
+        else:
+            from diffusers.optimization import get_scheduler
 
-        #使用了diffusers库中的get_scheduler函数来创建一个学习率调度器
-        lr_scheduler = get_scheduler(
-            cfg.training.lr_scheduler,
-            optimizer=optimizer,
-            num_warmup_steps=cfg.training.lr_warmup_steps, #预热步数，前num_warmup_steps步，学习率会从0线性增加到cfg.training.lr指定的初始学习率，这有助于模型在训练初期更稳定地收敛。
-            num_training_steps=cfg.training.offline_steps, #总训练步数
-        )
+            # 保留Diffusers原有调度器，兼容现有配置和历史实验。
+            lr_scheduler = get_scheduler(
+                cfg.training.lr_scheduler,
+                optimizer=optimizer,
+                num_warmup_steps=cfg.training.lr_warmup_steps,
+                num_training_steps=cfg.training.offline_steps,
+            )
 
 
     elif cfg.policy.name == "tdmpc": #对于TDMPC模型，我们使用了Adam优化器来更新模型的参数
@@ -537,10 +670,14 @@ RESUME_CURRENT_CONFIG_PATHS = (
     "training.offline_steps",         # 本次训练计划达到的总离线训练步数
     "training.eval_freq",             # 每隔多少训练步执行一次评估
     "training.save_freq",             # 每隔多少训练步保存一次快照
+    "training.eval_freq_epochs",      # epoch模式每隔多少轮执行一次评估
+    "training.save_freq_epochs",      # epoch模式每隔多少轮保存一次快照
+    "training.eval_start_epoch",      # epoch模式从第几轮开始执行周期评估
     "training.log_freq",              # 每隔多少训练步记录一次训练日志
     "training.num_workers",           # DataLoader 并行加载数据的进程数
     "training.persistent_workers",    # 是否让 DataLoader worker 跨轮次常驻
     "training.prefetch_factor",       # 每个 DataLoader worker 预取的 batch 数
+    "eval.async_enabled",             # 是否使用独立进程并发执行训练评估
     "eval.device",                    # 模型评估使用的计算设备
     "eval.batch_size",                # 并行评估时同时运行的环境数量
     "eval.n_episodes",                # 每次评估执行的 episode 总数
@@ -652,6 +789,22 @@ def build_resume_config(cfg: DictConfig) -> tuple[DictConfig, Path | None]:
             effective_cfg,
             config_path,
             _copy_config_value(current_value),
+            merge=False,
+            force_add=True,
+        )
+
+    # 当前命令显式设置epoch预算时允许扩展续训目标；当前值为null时保留
+    # epoch模式快照中的原设置，避免无意切回固定步数。
+    current_offline_epochs = OmegaConf.select(
+        cfg,
+        "training.offline_epochs",
+        default=None,
+    )
+    if current_offline_epochs is not None:
+        OmegaConf.update(
+            effective_cfg,
+            "training.offline_epochs",
+            _copy_config_value(current_offline_epochs),
             merge=False,
             force_add=True,
         )
@@ -908,11 +1061,49 @@ def load_local_lerobot_dataset(
 
 
 
-# ✅ 这是一个完美且内存安全的 PyTorch 无限数据生成器
-def get_infinite_dataloader(dataloader):
-    while True:
-        for batch in dataloader:
-            yield batch
+def iterate_training_batches(
+    dataloader,
+    *,
+    start_step: int,
+    total_steps: int,
+):
+    """按真实DataLoader遍历产生全局step、epoch和batch。
+
+    一个DataLoader迭代器完整耗尽后才进入下一个epoch。断点位于epoch中间时，
+    会先跳过该epoch中已经完成的batch，再从checkpoint的下一个step继续。
+    """
+
+    steps_per_epoch = len(dataloader)
+    if steps_per_epoch <= 0:
+        raise ValueError("DataLoader每个epoch至少需要一个batch。")
+    start_step = int(start_step)
+    total_steps = int(total_steps)
+    if start_step < 0 or total_steps < 0 or start_step > total_steps:
+        raise ValueError(
+            "训练step范围非法: "
+            f"start_step={start_step}, total_steps={total_steps}。"
+        )
+
+    start_epoch, start_batch = divmod(start_step, steps_per_epoch)
+    total_epochs = (total_steps + steps_per_epoch - 1) // steps_per_epoch
+    for epoch_index in range(start_epoch, total_epochs):
+        epoch_iterator = iter(dataloader)
+        for batch_index in range(steps_per_epoch):
+            dataloading_start = time.perf_counter()
+            try:
+                batch = next(epoch_iterator)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    "DataLoader实际batch数少于len(dataloader): "
+                    f"expected={steps_per_epoch}, stopped_at={batch_index}。"
+                ) from exc
+            dataloading_s = time.perf_counter() - dataloading_start
+            if epoch_index == start_epoch and batch_index < start_batch:
+                continue
+            step = epoch_index * steps_per_epoch + batch_index
+            if step >= total_steps:
+                return
+            yield step, epoch_index, batch_index, batch, dataloading_s
 
 
 
@@ -925,10 +1116,9 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     init_logging() #初始化日志
     logging.info(pformat(OmegaConf.to_container(cfg))) #打印配置cfg
 
-    # 初始化日志记录器与设备
+    # Logger需要记录按数据集解析后的真实offline_steps，因此在挂载数据集并
+    # 解析epoch预算后再创建；设备和随机种子可以先初始化。
     configure_wandb_runtime(cfg)
-    logger = Logger(cfg, out_dir, wandb_job_name=job_name)
-    add_wandb_parameter_tags(logger, cfg)
     set_global_seed(cfg.seed)
     device = get_safe_torch_device(cfg.device, log=True)
 
@@ -988,6 +1178,47 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         offline_dataset,
         cfg.get("override_dataset_stats"),
     )
+
+    # 在创建优化器和LR调度器前，根据真实Sampler长度解析epoch预算。
+    # 启用drop_n_last_frames时，epoch只统计Sampler保留的训练起点。
+    raw_drop_n_last_frames = cfg.training.get("drop_n_last_frames", 0) or 0
+    drop_n_last_frames_value = float(raw_drop_n_last_frames)
+    if (
+        not math.isfinite(drop_n_last_frames_value)
+        or not drop_n_last_frames_value.is_integer()
+        or drop_n_last_frames_value < 0
+    ):
+        raise ValueError(
+            "training.drop_n_last_frames必须为非负整数，当前为"
+            f"{raw_drop_n_last_frames!r}。"
+        )
+    drop_n_last_frames = int(drop_n_last_frames_value)
+    if drop_n_last_frames:
+        shuffle = False
+        sampler = EpisodeAwareSampler(
+            offline_dataset.episode_data_index,
+            drop_n_last_frames=drop_n_last_frames,
+            shuffle=True,
+        )
+        effective_num_samples = len(sampler)
+    else:
+        shuffle = True
+        sampler = None
+        effective_num_samples = len(offline_dataset)
+    resolve_offline_training_budget(
+        cfg,
+        effective_num_samples=effective_num_samples,
+    )
+
+    # Hydra在进入训练函数前已保存组合配置；epoch解析改变offline_steps后需要
+    # 覆盖为实际配置，保证断点续训、checkpoint和实验排查一致。
+    if out_dir is not None:
+        effective_config_path = Path(out_dir) / ".hydra" / "config.yaml"
+        effective_config_path.parent.mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(cfg, effective_config_path)
+
+    logger = Logger(cfg, out_dir, wandb_job_name=job_name)
+    add_wandb_parameter_tags(logger, cfg)
     # # 使用官方函数解析并挂载到 cfg，这样 make_dataset 内部才能正确读取
     # resolve_delta_timestamps(cfg)
     
@@ -1226,17 +1457,6 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # ==========================================
     # 如果配置中指定了丢弃最后n帧数据，就使用EpisodeAwareSampler采样器，并且不进行shuffle，这样可以确保在每个训练周期内，模型不会看到每个episode的最后n帧数据，
     # 这对于某些任务可能有帮助，比如那些episode的最后几帧可能包含一些特殊的状态或者奖励信号，丢弃它们可以让模型更好地学习到一般性的行为模式。
-    if cfg.training.get("drop_n_last_frames"): 
-        shuffle = False
-        sampler = EpisodeAwareSampler( 
-            offline_dataset.episode_data_index,
-            drop_n_last_frames=cfg.training.get("drop_n_last_frames"),
-            shuffle=True,
-        )
-    else:
-        shuffle = True
-        sampler = None
-
     dataloader_kwargs = make_train_dataloader_kwargs(cfg, device, shuffle, sampler)
     dataloader = DataLoader(offline_dataset, **dataloader_kwargs)
     logging.info(
@@ -1247,11 +1467,15 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         dataloader_kwargs["pin_memory"],
     )
     
-    # 使用 Python 内置的 cycle 将其变为无限迭代器，使用 next(dl_iter) 进行取出一个batch的数据
-    # dl_iter = cycle(dataloader) #会存有历史数据，导致显存溢出
-    dl_iter = iter(get_infinite_dataloader(dataloader)) 
     log_trainable_parameter_counts(policy)
-    logging.info(f"预训练目标步数: {cfg.training.offline_steps}")
+    logging.info(
+        "预训练目标: epochs=%s, steps_per_epoch=%d, offline_steps=%d, "
+        "eval_start_epoch=%s",
+        getattr(cfg.training, "offline_epochs", None),
+        len(dataloader),
+        int(cfg.training.offline_steps),
+        getattr(cfg.training, "eval_start_epoch", 0),
+    )
 
     # ==========================================
     # 🌟 5. 动态拼接环境 ID 并创建环境
@@ -1324,13 +1548,19 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     logging.info("🔥 开始预训练 (模仿学习阶段)...")
     
     log_freq = int(getattr(cfg.training, "log_freq", 0))
-    # 从 start_step 开始，避免覆盖之前的进度！
-    for step in range(start_step, cfg.training.offline_steps):
-        start_time = time.perf_counter()
-        
-        # 获取数据并推入 GPU
-        batch = next(dl_iter) # 取出一个batch的数据
-        dataloading_s = time.perf_counter() - start_time # 计算数据加载时间
+    # DataLoader完整遍历一次才进入下一个epoch；全局step继续用于学习率、
+    # checkpoint命名和断点续训，保持已有产物兼容。
+    for (
+        step,
+        epoch_index,
+        batch_index,
+        batch,
+        dataloading_s,
+    ) in iterate_training_batches(
+        dataloader,
+        start_step=start_step,
+        total_steps=int(cfg.training.offline_steps),
+    ):
         for key in batch: # 这里的key对应的是类别，如action/observation
             if isinstance(batch[key], torch.Tensor):
                 # 最好加上非阻塞传输non_blocking，并确保原有的引用随着循环覆盖而消失
@@ -1356,6 +1586,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         )
         if collect_metrics:
             train_info["dataloading_s"] = dataloading_s
+            train_info["epoch"] = epoch_index + 1
 
         if async_evaluator is not None:
             process_async_eval_results(
@@ -1393,18 +1624,8 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
             else:
                 total_steps = int(cfg.training.offline_steps)
                 is_last_step = step == total_steps - 1
-                eval_due = should_run_periodic_step(
-                    step,
-                    total_steps,
-                    int(getattr(cfg.training, "eval_freq", 0)),
-                )
-                save_due = bool(
-                    getattr(cfg.training, "save_checkpoint", False)
-                ) and should_run_periodic_step(
-                    step,
-                    total_steps,
-                    int(getattr(cfg.training, "save_freq", 10000)),
-                )
+                eval_due = should_evaluate(step, cfg)
+                save_due = should_save_checkpoint(step, cfg)
 
                 if eval_due and not async_evaluator.has_capacity:
                     skip_if_busy = bool(
@@ -1514,7 +1735,16 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
                         step,
                         train_info["loss"],
                         checkpoint_path,
+                        include_in_top_k=evaluation_has_started(step, cfg),
                     )
+
+        if batch_index + 1 == len(dataloader):
+            logging.info(
+                "完成epoch %d/%s: global_step=%d",
+                epoch_index + 1,
+                getattr(cfg.training, "offline_epochs", "step-budget"),
+                step,
+            )
 
     if async_evaluator is not None:
         if bool(getattr(cfg.eval, "wait_at_end", True)):
@@ -1573,15 +1803,16 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
-        "dataset_local_dir=outputs/5_hf_datasets/quest_teleop_InsertCylinder-3Arms-v0_rgb_arm_recovery",
-        "dataset_repo_id=Dc-dc/quest_teleop_SewNeedle-3Arms-v0_rgb_joint",
+        "dataset_local_dir=outputs/5_hf_datasets/InsertPeg-3Arms/expert_50/quest_teleop_InsertPeg-3Arms-v0_rgb_joint_zed",
+        # "dataset_repo_id=Dc-dc/quest_teleop_SewNeedle-3Arms-v0_rgb_joint",
         # 全新训练时使用下面的默认配置组；resume=true 时会在 Hydra 启动前
-        # 自动替换为原实验 .hydra/hydra.yaml 中记录的 env/policy。
-        "env=sim_insert_cylinder_3arms",
-        "policy=pre_zed_diffusion",
+        # # sim_insert_cylinder_3arms   sim_sew_needle_3arms  sim_insert_peg_3arms
+        "env=sim_insert_peg_3arms",
+        # act/pre_zed_act   pre_zed_dual_head_diffusion
+        "policy=pre_zed_dual_head_diffusion",
         # resume=false按当前env/policy全新训练；resume=true严格恢复原实验。
         "resume=false",
-        "resume_path='outputs/2_pretrain/train/2026-07-21/23-22-46_InsertCylinder-3Arms-v0_pre_zed_coupled_dual_head_diffusion/checkpoints/100000_loss=0.0087_sr=53.0_ar=556.51'",
+        "resume_path='outputs/2_pretrain/SewNeedle-3Arms-v0/2026-08-15/11-10-36_SewNeedle-3Arms-v0_dual_head_diffusion/checkpoints/235619_loss=0.0027'",
         "training.num_workers=5",
         "wandb.enable=true",
     ]

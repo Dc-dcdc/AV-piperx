@@ -18,6 +18,11 @@ import random
 import time
 import gymnasium as gym
 from lerobot.common.envs.utils import preprocess_observation
+from train.s1_pretrain.train.training_schedule import (
+    evaluation_has_started,
+    should_evaluate,
+    should_save_checkpoint,
+)
 
 if __package__:
     from .vector_info import as_bool_array as _as_bool_array
@@ -160,6 +165,8 @@ class TopKCheckpointManager:
         ckpt_path: Path,
         reward: float | None = None,
         success_rate: float | None = None,
+        *,
+        include_in_top_k: bool = True,
     ):
         ckpt_path = self._absolute_path(ckpt_path)
         candidate = {
@@ -174,7 +181,7 @@ class TopKCheckpointManager:
             self.latest_step = int(step)
             self.latest_path = ckpt_path
 
-        if self._is_rankable(candidate):
+        if include_in_top_k and self._is_rankable(candidate):
             # 防重入：评估结果返回后，用同step的新路径/新指标替换旧记录。
             self.top_k = [
                 item
@@ -200,11 +207,17 @@ class TopKCheckpointManager:
                     len(self.top_k),
                     self.max_keep,
                 )
-        else:
+        elif include_in_top_k:
             logging.info(
                 "checkpoint step=%d尚无有限%s指标，仅更新latest，不加入Top-K。",
                 int(step),
                 self.metric,
+            )
+        else:
+            logging.info(
+                "checkpoint step=%d位于评估起始epoch之前，"
+                "仅更新latest，不加入Top-K。",
+                int(step),
             )
 
         valid_names = {item["path"].name for item in self.top_k}
@@ -869,12 +882,11 @@ def evaluate_and_checkpoint_if_needed(
     temp_video_dir = None
     ar = -float("inf")
     
-    # 1. 评估逻辑 (优先读取 cfg.eval.eval_freq)
-    eval_freq = getattr(cfg.training, "eval_freq", 0)
-    is_last_step = (step == cfg.training.offline_steps - 1)
+    # 1. epoch模式在完整DataLoader遍历结束后判断；固定step模式保持原语义。
+    eval_due = should_evaluate(step, cfg)
     # 初始化本步的 reward 为极小值
     sr = -float('inf')
-    if (eval_freq > 0 and step > 0 and step % eval_freq == 0) or is_last_step:
+    if eval_due:
         logging.info(f"开始自主评估流程, 当前 Step: {step}")
         if eval_env is not None:
             temp_video_dir = Path(out_dir) / "eval" / f"videos_{base_identifier}"
@@ -907,8 +919,7 @@ def evaluate_and_checkpoint_if_needed(
 
                 final_identifier = f"{base_identifier}_sr={sr*100:.1f}_ar={ar:.2f}"
 
-    save_freq = getattr(cfg.training, "save_freq", 10000)
-    should_save = (save_freq > 0 and step > 0 and step % save_freq == 0) or is_last_step
+    should_save = should_save_checkpoint(step, cfg)
     if getattr(cfg.training, "save_checkpoint", False) and should_save:
         # 保存模型权重
         logging.info(f"保存模型快照... Step: {step}")
@@ -936,7 +947,14 @@ def evaluate_and_checkpoint_if_needed(
         # 触发 Top-K 筛选与清理
         if train_loss is not None:
             if ckpt_path.exists() and manager is not None:
-                manager.update(step, train_loss, ckpt_path, reward=ar, success_rate=sr)
+                manager.update(
+                    step,
+                    train_loss,
+                    ckpt_path,
+                    reward=ar,
+                    success_rate=sr,
+                    include_in_top_k=evaluation_has_started(step, cfg),
+                )
             elif manager is None:
                 logging.warning("⚠️ 警告: 未传入 TopKCheckpointManager，跳过 Top-K 模型清理逻辑。")
         else:

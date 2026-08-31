@@ -74,10 +74,10 @@
     <geom name="depth_wall_left" class="visual" type="box" material="depth_wall" pos="-1.2 0 0.24" size="0.015 0.90 1"/>
     <geom name="depth_wall_right" class="visual" type="box" material="depth_wall" pos="1.2 0 0.24" size="0.015 0.90 1"/>
 
-    <camera name="overhead_cam" pos="0 -0.303794 1.02524" fovy="58" mode="fixed" quat="0.976332 0.216277 0 0"/>
-    <geom class="frame" pos="0 -0.303794 1.02524" quat="0 0 0.976296 0.21644" mesh="d405_solid"/>
-    <camera name="worms_eye_cam" pos="0 -0.377167 0.0316055" fovy="58" mode="fixed" quat="0.672659 0.739953 0 0"/>
-    <geom class="frame" pos="0 -0.377167 0.0316055" quat="0 0 -0.672367 -0.740218" mesh="d405_solid"/>
+    <camera name="overhead_cam" pos="0 -0.503794 1.02524" fovy="58" mode="fixed" quat="0.976332 0.216277 0 0"/>
+    <geom class="frame" pos="0 -0.503794 1.02524" quat="0 0 0.976296 0.21644" mesh="d405_solid"/>
+    <camera name="worms_eye_cam" pos="0 -0.577167 0.0316055" fovy="58" mode="fixed" quat="0.672659 0.739953 0 0"/>
+    <geom class="frame" pos="0 -0.577167 0.0316055" quat="0 0 -0.672367 -0.740218" mesh="d405_solid"/>
     <!-- <geom class="frame" pos="0.6 -0.5 1.0" quat="0 1 0 1" mesh="extrusion_2040_1200"/>
     <geom class="frame" pos="0.59 -0.5 1.07" quat="0 0 0 1" mesh="extrusion_2040_1000"/>
     <geom class="frame" pos="-0.59 -0.5 1.07" quat="0 0 0 1" mesh="extrusion_2040_1000"/>

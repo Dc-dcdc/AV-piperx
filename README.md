@@ -26,14 +26,14 @@ pip install -e .
 /home/dc/miniforge3/envs/AV-piper/bin/python env/task/sim_envs.py
 
 # Quest -> MuJoCo -> IK 在线测试，PiperX 入口
-/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/quest_mujoco_test.py \
+/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/expert_data_collection/quest_mujoco_test.py \
   env_id=guided_vision/InsertCylinder-3Arms-v0 \
   display_camera=zed_cam_left \
   head_control=true \
   lock_roll=true
 
 # Quest 正式采集，建议显式传 env_id，避免脚本默认参数造成任务切换不明确
-/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/quest_teleop_collect.py \
+/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/expert_data_collection/quest_teleop_collect.py \
   env_id=guided_vision/InsertCylinder-3Arms-v0 \
   head_control=true \
   lock_roll=true
@@ -45,15 +45,15 @@ pip install -e .
 
 ```bash
 # Quest 映射和 IK 小步测试
-/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/quest_mujoco_test.py \
+/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/expert_data_collection/quest_mujoco_test.py \
   env_id=guided_vision/SewNeedle-3Arms-v0
 
 # Quest 正式采集
-/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/quest_teleop_collect.py \
+/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/expert_data_collection/quest_teleop_collect.py \
   env_id=guided_vision/SewNeedle-3Arms-v0
 
 # 策略 + Quest 接管采集；环境默认从 checkpoint 配置读取
-/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/quest_policy_collect.py \
+/home/dc/miniforge3/envs/AV-piper/bin/python data_collect/expert_data_collection/quest_policy_collect.py \
   ckpt_path=/path/to/sew_needle/checkpoint
 
 # 使用缝合针环境配置进行预训练
@@ -99,30 +99,30 @@ pip install -e .
 1. PiperX 仿真 XML 位于 `env/assets/piperx_sim.xml`，场景文件为 `env/assets/piperx_scene.xml`，任务入口分别为 `env/assets/task_insert_cylinder_piper.xml` 和 `env/assets/task_sew_needle.xml`。
 2. PiperX 环境入口为 `guided_vision/InsertCylinder-3Arms-v0` 和 `guided_vision/SewNeedle-3Arms-v0`。左臂 7 维、右臂 7 维、中间臂 6 轴，总动作维度 `20`，动作切片为 `left[0:7] + right[7:14] + middle[14:20]`。
 3. 关节、执行器和末端 site 名称需要继续和 `env/constants.py` 对齐，例如 `left_gripper_control`、`right_gripper_control`、`middle_zed_camera_center`。
-4. 圆柱入口使用 `InsertCylinderEnv`，缝合针入口使用 `SewNeedleEnv`，两者都支持 `enable_reward_debug`；正式训练或采集前应先用 `data_collect/quest_mujoco_test.py` 做 Quest 映射和 IK 小步测试。
+4. 圆柱入口使用 `InsertCylinderEnv`，缝合针入口使用 `SewNeedleEnv`，两者都支持 `enable_reward_debug`；正式训练或采集前应先用 `data_collect/expert_data_collection/quest_mujoco_test.py` 做 Quest 映射和 IK 小步测试。
 
 ## ✨ data_collect部分
 ### 1. 脚本说明
 | 文件/目录 | 作用 | 关键参数或输入输出 |
 |---|---|---|
-| `data_collect/quest_teleop_collect.py` | Quest3 遥操采集主程序，接收 Quest 位姿、映射到机器人动作、执行环境并保存成功轨迹 | 配置文件：`configs/data_collect/quest_teleop_collect.yaml`；`env_id` 选择环境；`record_cameras` 选择保存相机；`save_pose_action` 是否保存末端位姿动作；`save_videos` 是否保存相机视频；`head_control` 是否启用头显控制中间臂；`lock_roll/lock_pitch` 是否锁定中间臂姿态轴 |
-| `data_collect/quest_mujoco_test.py` | Quest3 到 MuJoCo 的在线遥操测试，不负责正式保存数据 | 配置文件：`configs/data_collect/quest_mujoco_test.yaml`；`env_id` 选择环境；`display_camera` 选择显示/发送相机；`unity_image_stream` 是否向 Quest 发送画面；`hand_position_scale/head_position_scale` 控制位移映射比例 |
-| `data_collect/quest_pose_mapping_test.py` | 只测试 Quest 位姿到 MuJoCo 坐标系的映射关系，适合排查坐标轴和姿态方向 | 输入 Quest UDP 数据；输出可视化位姿映射结果 |
-| `data_collect/collect_data_from_model.py` | 使用已经训练好的模型在仿真中自动收集成功轨迹 | `CKPT_PATH` 模型路径；`OUTPUT_DIR` 原始数据输出目录；`MAX_STEPS` 单条轨迹最大步数；`TARGET_SUCCESSES` 目标成功轨迹数；`SAVE_VIDEOS` 是否生成视频 |
-| `data_collect/quest_receive.py` | 接收 Quest/Unity 通过 UDP 发送的头显和手柄原始数据 | 输入：UDP JSON；输出：`HeadsetData` |
-| `data_collect/quest_control.py` | 将 Quest 头显和手柄位姿映射为三臂末端位姿动作 | 输入：`HeadsetData` 和机器人当前末端位姿；输出：`pose_action` |
-| `data_collect/robot_ik_solver.py` | 将三臂末端位姿动作转换为关节动作 | 输入：`pose_action`；输出：`joint_action`，可直接用于 `env.step` |
-| `data_collect/quest_send.py` | 将 MuJoCo 渲染画面通过 UDP 分片发送给 Unity/Quest 显示 | `unity_image_host` 接收端 IP；`unity_image_port` 接收端端口；`unity_image_hz` 发送频率；`unity_image_jpeg_quality` JPEG 压缩质量 |
-| `data_collect/headset_utils.py` | 定义 Quest 数据结构和按键/追踪状态工具 | 主要结构：`HeadsetData`、`HeadsetFeedback` |
+| `data_collect/expert_data_collection/quest_teleop_collect.py` | Quest3 遥操采集主程序，接收 Quest 位姿、映射到机器人动作、执行环境并保存成功轨迹 | 配置文件：`configs/data_collect/quest_teleop_collect.yaml`；`env_id` 选择环境；`record_cameras` 选择保存相机；`save_pose_action` 是否保存末端位姿动作；`save_videos` 是否保存相机视频；`head_control` 是否启用头显控制中间臂；`lock_roll/lock_pitch` 是否锁定中间臂姿态轴 |
+| `data_collect/expert_data_collection/quest_mujoco_test.py` | Quest3 到 MuJoCo 的在线遥操测试，不负责正式保存数据 | 配置文件：`configs/data_collect/quest_mujoco_test.yaml`；`env_id` 选择环境；`display_camera` 选择显示/发送相机；`unity_image_stream` 是否向 Quest 发送画面；`hand_position_scale/head_position_scale` 控制位移映射比例 |
+| `data_collect/expert_data_collection/quest_pose_mapping_test.py` | 只测试 Quest 位姿到 MuJoCo 坐标系的映射关系，适合排查坐标轴和姿态方向 | 输入 Quest UDP 数据；输出可视化位姿映射结果 |
+| `data_collect/expert_data_collection/collect_data_from_model.py` | 使用已经训练好的模型在仿真中自动收集成功轨迹 | `CKPT_PATH` 模型路径；`OUTPUT_DIR` 原始数据输出目录；`MAX_STEPS` 单条轨迹最大步数；`TARGET_SUCCESSES` 目标成功轨迹数；`SAVE_VIDEOS` 是否生成视频 |
+| `data_collect/expert_data_collection/quest_receive.py` | 接收 Quest/Unity 通过 UDP 发送的头显和手柄原始数据 | 输入：UDP JSON；输出：`HeadsetData` |
+| `data_collect/expert_data_collection/quest_control.py` | 将 Quest 头显和手柄位姿映射为三臂末端位姿动作 | 输入：`HeadsetData` 和机器人当前末端位姿；输出：`pose_action` |
+| `data_collect/expert_data_collection/robot_ik_solver.py` | 将三臂末端位姿动作转换为关节动作 | 输入：`pose_action`；输出：`joint_action`，可直接用于 `env.step` |
+| `data_collect/expert_data_collection/quest_send.py` | 将 MuJoCo 渲染画面通过 UDP 分片发送给 Unity/Quest 显示 | `unity_image_host` 接收端 IP；`unity_image_port` 接收端端口；`unity_image_hz` 发送频率；`unity_image_jpeg_quality` JPEG 压缩质量 |
+| `data_collect/expert_data_collection/headset_utils.py` | 定义 Quest 数据结构和按键/追踪状态工具 | 主要结构：`HeadsetData`、`HeadsetFeedback` |
 | `data_collect/transform_utils.py` | 存放坐标系转换、位姿矩阵、四元数等工具函数 | 用于 Unity/Quest 坐标系和 MuJoCo 坐标系之间的转换 |
 | `data_collect/meta quest3` | Unity Quest3 工程，包含发送 Quest 位姿和接收 MuJoCo 图像的脚本 | 需要在 Unity/Quest 端配置 UDP IP、端口和显示位置 |
 
 ### 2. Quest 遥操数据流
 ```text
 Quest/Unity
-  -> quest_receive.py
-  -> quest_control.py
-  -> robot_ik_solver.py
+  -> expert_data_collection/quest_receive.py
+  -> expert_data_collection/quest_control.py
+  -> expert_data_collection/robot_ik_solver.py
   -> env.step(joint_action)
   -> quest_teleop_collect.py 保存成功轨迹
 ```

@@ -6,10 +6,12 @@ defaults:
 
 hydra:
   run:
-    dir: outputs/2_pretrain/${env.task}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
-    # ${hydra.runtime.choices.policy}就是对应的policy名称，如果直接写${policy}会把文件里的参数都放进去
+    # 使用policy.name避免act/pre_zed_act这类子配置组中的“/”被解释为目录分隔符。
+    # 真实配置组选项仍由Hydra写入.hydra/hydra.yaml，严格续训不会丢失来源。
+    dir: outputs/2_pretrain/${env.task}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${policy.name}
   job:
-    name: ${hydra.runtime.choices.policy}_${now:%Y-%m-%d}_${now:%H-%M-%S}
+    # 日志文件名同样必须使用不含“/”的名称，否则file handler无法创建日志。
+    name: ${policy.name}_${now:%Y-%m-%d}_${now:%H-%M-%S}
   
   job_logging:
     handlers:
@@ -35,7 +37,7 @@ seed: ???
 # "dataset_index" into the returned item. The index mapping is made according to the order in which the
 # datsets are provided.
 dataset_local_dir: null   # 可以从本地数据集加载
-dataset_repo_id: lerobot/pusht
+dataset_repo_id: null
 view_delta_stats_cache_dir: outputs/buffer/view_action_delta_stats  # View增量统计缓存；不修改数据集原始stats。
 video_backend: pyav # 视频解码引擎，读取视频文件转化为图像张量
 
@@ -44,17 +46,17 @@ eval:
   # 双GPU可设根节点device=cuda:0、eval.device=cuda:1并开启异步评估。
   async_enabled: true
   device: ${device}
-  max_pending: 1          # 包含正在运行的任务；限制积压旧checkpoint
-  skip_if_busy: true      # 评估落后时跳过中间任务，最终step始终等待
+  max_pending: 1           # 包含正在运行的任务；限制积压旧checkpoint
+  skip_if_busy: false      # 评估落后时跳过中间任务，最终step始终等待
   wait_at_end: true       # 训练结束前等待最终评估与Top-K落盘
   startup_timeout_s: 180  # MuJoCo/VectorEnv子进程初始化超时
   shutdown_timeout_s: 30
   checkpoint_metric: "success" # 筛选指标：可选 'loss'、'reward'、'success'
-  max_checkpoints: 20     # 最多保存loss最小的几个模型快照
+  max_checkpoints: 5     # 最多保存loss最小的几个模型快照
   n_episodes: 100              # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 1    # 最多保存前几个 episode 的录像视频
   # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
-  batch_size: 15              # 每次并行评估环境数量
+  batch_size: 10              # 每次并行评估环境数量
   use_async_envs: true       # 是否使用异步环境并行评估，true时每个环境独立运行，false时所有环境同步运行
   records_resume: true  # 是否读取top-k的快照和视频列表 即top_k_records.json
   fps: 25               # 录制的 MP4 视频帧率
@@ -63,12 +65,29 @@ eval:
 
 
 training:
-  eval_freq: 2000
+  # null时沿用各policy配置中的固定offline_steps；设置正整数后，训练入口会
+  # 根据当前Sampler有效样本数、batch_size和最终drop_last语义自动计算总步数。
+  offline_epochs: 200
+  # offline_epochs非null时生效：每完整遍历2次DataLoader评估/保存一次。
+  # 固定step模式仍使用各自的eval_freq/save_freq配置。
+  eval_freq_epochs: 2
+  save_freq_epochs: 2
+  # epoch模式下，小于该epoch的周期评估全部跳过；期间保存时只保留latest。
+  # 0表示从训练开始就允许评估；若阈值大于总epoch，则全程不评估。
+  eval_start_epoch: 20
+  # null表示epoch模式保留最后的小batch（完整遍历数据），固定step模式继续
+  # 丢弃最后的小batch以兼容旧实验；也可显式设置true/false覆盖。
+  drop_last: null
+  eval_freq: null
   log_freq: 100           # 多少步记录一次日志，会在终端输出，并上传wandb
   save_checkpoint: true 
   persistent_workers: true # 多worker DataLoader跨epoch复用进程，减少视频/图像加载抖动
   prefetch_factor: 2       # 每个worker预取batch数；大图像训练时可按内存调到3或4
   
+  # 每个episode最后15帧只作为前面动作块的未来标签，
+  # 不再单独作为action chunk的采样起点。
+  drop_n_last_frames: 0
+
   image_transforms:
   # These transforms are all using standard torchvision.transforms.v2
   # You can find out how these transformations affect images here:
@@ -105,7 +124,7 @@ training:
       min_max: [0.8, 1.2]
 
 policy:
-  do_mask_loss_for_padding: false
+  do_mask_loss_for_padding: false  # 是否屏蔽episode末尾因未来动作不足而复制补齐的padding位置，使其不参与loss计算；真实有效动作仍正常训练
   # 单头/双头Diffusion策略的View动作语义：absolute保持原绝对关节目标；
   # delta_from_current 使整个未来动作块相对本次重规划的当前View关节。
   # 默认保留absolute，启用新实验时通过policy.view_action_representation覆盖。

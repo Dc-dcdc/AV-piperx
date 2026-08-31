@@ -1,12 +1,12 @@
 import unittest
 from unittest.mock import patch
 
-from data_collect.episode_seeding import (
+from data_collect.expert_data_collection.episode_seeding import (
     ENVIRONMENT_SEED_STRATEGY,
     REPLAY_ENVIRONMENT_SEED_STRATEGY,
     EpisodeSeedAssignment,
 )
-from data_collect.quest_policy_collect import (
+from data_collect.expert_data_collection.quest_policy_collect import (
     reset_control_state,
     resolve_append_replay_state,
 )
@@ -54,7 +54,7 @@ class QuestPolicySeedResetTest(unittest.TestCase):
         env = _RecordingEnv(calls)
 
         with patch(
-            "data_collect.quest_policy_collect.set_random_seed",
+            "data_collect.expert_data_collection.quest_policy_collect.set_random_seed",
             side_effect=lambda seed: calls.append(("runtime", seed)),
         ):
             reset_control_state(
@@ -139,7 +139,7 @@ class QuestPolicySeedResetTest(unittest.TestCase):
         )
 
         with patch(
-            "data_collect.quest_policy_collect.set_random_seed",
+            "data_collect.expert_data_collection.quest_policy_collect.set_random_seed",
             side_effect=lambda seed: calls.append(("runtime", seed)),
         ):
             reset_control_state(

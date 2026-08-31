@@ -14,7 +14,7 @@ env:
   state_dim: 20
   action_dim: 20
   fps: ${fps}
-  episode_length: 400
+  episode_length: 350
 
 wandb:
   project: ${env.task}_pretrain

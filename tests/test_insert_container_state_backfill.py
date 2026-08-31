@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 from omegaconf import OmegaConf
 
-from data_collect.backfill_insert_container_state import (
+from data_collect.recovery_data_generation.backfill_insert_container_state import (
     RingCandidate,
     _best_ring_component,
     _inclusive_grid,

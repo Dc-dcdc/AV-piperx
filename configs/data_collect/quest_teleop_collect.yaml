@@ -32,7 +32,11 @@ record_cameras:   # 保存到数据集中的相机，需和训练配置 input_sh
 
 
 # ===== 3. 仿真与控制 =====
-env_id: guided_vision/InsertPeg-3Arms-v0  # Gymnasium 仿真环境 ID
+# guided_vision/OpenDrawerRetrieve-3Arms-v0
+# guided_vision/InsertPeg-3Arms-v0
+# guided_vision/SewNeedle-3Arms-v0
+# guided_vision/InsertCylinder-3Arms-v0
+env_id: guided_vision/InsertPeg-3Arms-v0  # Gymnasium 仿真环境 ID，必须包含guided_vision命名空间
 hand_position_scale: 1      # 左右手柄位移映射到左右臂末端的缩放系数
 head_position_scale: 1      # 头显位移映射到中间臂末端的缩放系数
 hand_max_delta: 1.0           # 左右臂末端相对锚点的最大位移

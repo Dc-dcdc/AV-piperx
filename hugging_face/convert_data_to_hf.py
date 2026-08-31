@@ -859,10 +859,10 @@ if __name__ == "__main__":
     ACTION_KEY = "joint_action"
 
     # 存放原始采集数据的目录
-    RAW_DIR = "outputs/4_data_collect/quest_teleop_recovery/quest_teleop_InsertCylinder-3Arms-v0_rgb_arm_recovery"
+    RAW_DIR = "outputs/4_data_collect/quest_teleop_recovery/SewNeedle-3Arms/quest_teleop_SewNeedle-3Arms-v0_rgb_DART_early_success"
 
     # 本地 HF 数据集生成目录。
-    OUTPUT_DIR = "outputs/5_hf_datasets/quest_teleop_InsertCylinder-3Arms-v0_rgb_arm_recovery"
+    OUTPUT_DIR = "outputs/5_hf_datasets/SewNeedle-3Arms/expert_100/quest_teleop_SewNeedle-3Arms-v0_rgb_DART_early_success"
 
     # 本地 HF数据目录 已存在时是否覆盖重建。
     OVERWRITE = True

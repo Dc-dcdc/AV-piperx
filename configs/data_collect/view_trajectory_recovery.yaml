@@ -1,0 +1,150 @@
+# 主动视觉View关节“扰动后收缩回专家轨迹”的离线数据生成配置。
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+# ===== 1. 输入、输出与任务 =====
+# 输入必须是quest_teleop原始成功示范run；不建议把已有_aug分支再次作为输入。
+input_run_dir: outputs/4_data_collect/quest_teleop/quest_teleop_InsertCylinder-3Arms-v0_rgb
+# 输出保留完整原始成功episode，并追加每次只含一个恢复事件的短分支。
+output_run_dir: outputs/4_data_collect/quest_teleop_recovery/InsertCylinder-3Arms/quest_teleop_InsertCylinder-3Arms-v0_rgb_view_random_static_3+0
+# null时从输入run的metadata.json读取；支持SewNeedle/InsertCylinder/InsertPeg/HookPackage。
+env_id: null
+# true时复制成功原始episode；仅保留20维joint/state、初态字段和ZED双目视频。
+include_original: true
+# true时跳过身份一致且文件完整的结果，并从中断位置继续。
+resume: true
+# null表示处理全部成功源episode；正整数表示最多处理多少条成功源episode。
+max_source_episodes: null
+# null表示扫描全部；也可指定源编号，例如[3, 4, 10]。
+source_episode_indices: null
+# 单个源或单个恢复分支失败后继续生成其余数据。
+continue_on_error: true
+
+# ===== 2. 恢复事件采样 =====
+event_sampling:
+  # random/specified_region/hybrid模式下，每条成功源轨迹固定保存的分支数。
+  # model_risk模式忽略该固定配额，改用manifest中每条轨迹的实际锚点数；允许为0。
+  recovery_branches_per_source: 3
+  # random 保持原全轨迹随机行为；
+  # specified_region 只采指定归一化区间；
+  # hybrid 同时采指定区间和所有区间之外的随机事件；
+  # model_risk 按专家模型风险分数定向采样。
+  mode: random
+  # model_risk模式使用的JSONL/JSON锚点清单；其他模式忽略。
+  risk_manifest_path: null
+  # View生成器只读取独立的View风险分数，不使用Arm分数或训练loss权重。
+  score_key: view_score_smoothed
+  # 风险锚点失败时，只在锚点左右该帧数构成的同一局部区间内搜索。
+  fallback_radius_steps: 5
+  # 风险锚点及其局部区间不足目标数量时，是否再使用全轨迹随机候选。
+  fallback_to_random: false
+  # 以下全局参数在random模式中控制全部事件；在hybrid模式中只控制区域外事件；
+  # specified_region模式会忽略它们（exclude_initial_steps除外）。
+  # 全局/区域外候选锚点的相对优先权重；候选池本身保留全部有效帧。
+  injection_probability_per_frame: 0.015
+  # 已成功分支的全局/区域外锚点彼此至少间隔50帧（25 Hz下为2秒）。
+  min_injection_interval_steps: 5
+  # 避开episode开始阶段，保证扰动前已有稳定的任务上下文。
+  exclude_initial_steps: 16
+  # 区间相对于完整源episode归一化时间定义，采用[start,end)半开区间；
+  # 多个区间必须按start升序排列且互不重叠；当前默认指定SewNeedle对准区间。
+  normalized_regions:
+    # SewNeedle 抓针后接近孔口并进行精细对准的过程
+    - start: 0.35
+      end: 0.47
+      # 区域候选锚点的相对优先权重。
+      injection_probability_per_frame: 0.10
+      # 同一区域内已成功恢复分支的锚点最小间隔。
+      min_injection_interval_steps: 5
+  #   - start: 0.60
+  #     end: 0.72
+  #     injection_probability_per_frame: 0.10
+  #     min_injection_interval_steps: 5
+
+# ===== 3. View扰动分布 =====
+seed: 20260801
+view_joint_noise:
+  distribution: truncated_gaussian
+  # [waist, shoulder, elbow, forearm_roll, wrist_1, wrist_2]标准差，单位rad。
+  # std_rad: [0.025, 0.025, 0.025, 0.040, 0.040, 0.050]
+  # max_abs_rad: [0.060, 0.060, 0.060, 0.100, 0.100, 0.120] # 每个关节的绝对偏移上限，单位rad。
+
+  # 缩小到当前扰动的约65%
+  std_rad: [0.016, 0.016, 0.016, 0.026, 0.026, 0.032]
+  max_abs_rad: [0.040, 0.040, 0.040, 0.065, 0.065, 0.080]
+  # 相对max_abs归一化后的最小L2范数，避免生成近似原轨迹的无效分支。
+  min_normalized_l2: 0.5
+  # 与MuJoCo硬关节限位保留的安全余量，单位rad。
+  joint_limit_margin_rad: 0.005
+  # 每次分支尝试内部用于截断高斯拒绝采样的最大次数。
+  max_sampling_attempts: 1000
+
+# ===== 4. 五次最小加加速度收缩 =====
+recovery:
+  # moving_expert ：恢复期间所有角色沿专家轨迹同步前进（当前方法）；
+  # static_anchor_wait ：暂停专家时间轴，两只Arm和夹爪保持锚点状态，
+  # 受扰View返回锚点后所有角色再从锚点专家动作同步继续（轨迹对齐消融）。
+  trajectory_alignment_mode: moving_expert
+  # 自适应恢复步数下限/上限；25 Hz下对应0.8～1.6秒。
+  min_steps: 35
+  max_steps: 40
+  # 五次恢复曲线的附加峰值速度上限，按当前专家View动作速度p90设置，单位rad/s。
+  # 采样器会同步收紧偏移范围，确保在max_steps内也不突破该上限。
+  max_extra_velocity_rad_s: [0.292, 0.266, 0.160, 0.090, 0.366, 0.149]
+  # 实际View qpos与同一任务时刻专家View qpos的最大绝对误差阈值，单位rad。
+  success_max_abs_error_rad: 0.008
+  # 连续满足误差阈值多少帧才算真正恢复。
+  success_stable_steps: 3
+  # 计划曲线归零后，最多再执行多少步零偏移专家动作等待实际关节收敛。
+  # SewNeedle实测10步不足以稳定进入0.002 rad阈值，默认放宽到30步；实际达到后立即停止等待。
+  max_extra_zero_offset_steps: 10
+  # 设为0表示连续满足恢复阈值后立即停止记录，不额外保存专家跟随帧。
+  post_recovery_steps: 0
+  # 从恢复锚点前开始沿专家时间轴真实推进，用五次曲线平滑建立View偏移；
+  # 该阶段不写入训练数据，恢复标签使用锚点处真实到达的偏移。
+  unrecorded_setup_steps: 15
+
+# ===== 5. 重放与分支质量检查 =====
+validation:
+  # 扰动前完整重放的分组阈值，单位rad（夹爪为归一化值）。
+  max_arm_joint_abs_error: 0.002
+  max_gripper_abs_error: 0.005
+  max_view_joint_abs_error: 0.0001
+  # 恢复分支中左右臂/夹爪仍必须贴合同一时刻的专家轨迹。
+  branch_max_arm_joint_abs_error: 0.002
+  branch_max_gripper_abs_error: 0.020
+  # static_anchor_wait中以扰动建立结束时Arm/夹爪的实际状态为保持目标；
+  # 阈值允许位置控制制动时的短暂漂移，但仍限制未扰动角色近似静止。
+  static_hold_max_arm_joint_drift_rad: 0.005
+  static_hold_max_gripper_drift: 0.030
+  # 当前锚点失败时重新采样不同偏移的最大次数；耗尽后搜索同域邻近锚点。
+  max_branch_attempts: 3
+
+# ===== 6. 双目视频 =====
+# 当前脚本强制只保存训练使用的ZED左右目。
+cameras: [zed_cam_left, zed_cam_right]
+render_height: 480
+render_width: 640
+fps: 25
+video:
+  codec: libx264
+  pixel_format: yuv420p
+  crf: 23
+  gop: 2
+  macro_block_size: 1
+
+# ===== 7. MuJoCo服务器渲染 =====
+# auto不覆盖当前环境；无显示器服务器通常设为egl。
+mujoco_gl: auto
+# egl时可指定GPU编号；null表示由EGL自动选择。
+render_device: null
+
+# ===== 8. Hydra输出控制 =====
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false
+  output_subdir: null

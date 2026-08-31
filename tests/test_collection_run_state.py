@@ -3,7 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from data_collect.collection_run_state import ExclusiveRunLock, atomic_write_json
+from data_collect.expert_data_collection.collection_run_state import (
+    ExclusiveRunLock,
+    atomic_write_json,
+)
 
 
 class AtomicWriteJsonTest(unittest.TestCase):

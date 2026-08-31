@@ -260,6 +260,37 @@ class AsyncPretrainEvalTest(unittest.TestCase):
             self.assertIsNone(records["top_k"][0]["reward"])
             self.assertIsNone(records["top_k"][0]["success_rate"])
 
+    def test_pre_eval_loss_checkpoints_keep_only_latest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            manager = TopKCheckpointManager(
+                out_dir=out_dir,
+                max_keep=5,
+                metric="loss",
+                records_resume=False,
+            )
+            older = out_dir / "checkpoints" / "000100_loss=0.3000"
+            latest = out_dir / "checkpoints" / "000200_loss=0.2000"
+            older.mkdir(parents=True)
+            manager.update(
+                100,
+                0.3,
+                older,
+                include_in_top_k=False,
+            )
+            latest.mkdir()
+            manager.update(
+                200,
+                0.2,
+                latest,
+                include_in_top_k=False,
+            )
+
+            self.assertEqual(manager.top_k, [])
+            self.assertFalse(older.exists())
+            self.assertTrue(latest.exists())
+            self.assertEqual(manager.latest_path, latest.absolute())
+
     def test_resume_normalizes_legacy_infinity_records(self):
         with tempfile.TemporaryDirectory() as directory:
             out_dir = Path(directory)

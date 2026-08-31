@@ -1,0 +1,124 @@
+<mujoco model="open_drawer_retrieve_piper">
+    <!-- 三臂 Piper、桌面、相机与基础材质。 -->
+    <include file="piperx_scene.xml"/>
+
+    <compiler autolimits="true"/>
+
+    <asset>
+        <material name="cabinet_material" rgba="0.20 0.23 0.27 1"/>
+        <material name="drawer_material" rgba="0.30 0.48 0.65 1"/>
+        <material name="handle_material" rgba="0.95 0.55 0.12 1"/>
+        <material name="object_material" rgba="0.82 0.15 0.12 1"/>
+        <material name="target_material" rgba="0.15 0.78 0.36 0.30"/>
+        <material name="target_rim_material" rgba="0.12 0.55 0.27 1"/>
+    </asset>
+
+    <worldbody>
+        <!--
+            柜体前方朝向机器人。抽屉沿世界坐标 -Y 方向打开；关闭状态对应
+            drawer_slide_joint = 0，完全打开状态对应约 0.28 m。
+        -->
+        <!-- 柜体与抽屉共享关闭状态下的局部坐标原点。 -->
+        <body name="drawer_cabinet" pos="0 0.15 0">
+            <!-- 柜体底板：支撑抽屉并构成柜体底部。 -->
+            <geom name="cabinet_base" type="box" pos="0 0.01 0.006"
+                  size="0.21 0.19 0.006" material="cabinet_material"
+                  friction="1.0 0.005 0.0001"/>
+            <!-- 柜体后板：封闭柜体后方。 -->
+            <geom name="cabinet_back" type="box" pos="0 0.191 0.074"
+                  size="0.21 0.006 0.074" material="cabinet_material"/>
+            <!-- 柜体左侧板：构成抽屉腔体的左边界。 -->
+            <geom name="cabinet_left_wall" type="box" pos="-0.204 0.005 0.074"
+                  size="0.006 0.185 0.074" material="cabinet_material"/>
+            <!-- 柜体右侧板：构成抽屉腔体的右边界。 -->
+            <geom name="cabinet_right_wall" type="box" pos="0.204 0.005 0.074"
+                  size="0.006 0.185 0.074" material="cabinet_material"/>
+            <!-- 柜体顶板：遮挡关闭抽屉内的目标物，并构成柜体顶部。 -->
+            <geom name="cabinet_top" type="box" pos="0 0.005 0.154"
+                  size="0.21 0.185 0.006" material="cabinet_material"/>
+
+            <!-- 抽屉是柜体的可滑动子body；pos=0表示完全关闭。 -->
+            <body name="drawer" pos="0 0 0">
+                <joint name="drawer_slide_joint" type="slide" axis="0 -1 0"
+                       range="0 0.28" damping="1.0" frictionloss="0.3"/>
+
+                <!-- 抽屉底板：承载抽屉内的目标物。 -->
+                <geom name="drawer_floor" type="box" pos="0 0 0.068"
+                      size="0.175 0.165 0.005" material="drawer_material"
+                      mass="0.22" friction="1.3 0.005 0.0001"/>
+                <!-- 抽屉前面板：抽屉朝向机器人的外侧挡板。 -->
+                <geom name="drawer_front" type="box" pos="0 -0.171 0.08"
+                      size="0.18 0.006 0.066" material="drawer_material"
+                      mass="0.13"/>
+                <!-- 抽屉后挡板：限制目标物从抽屉后方滑出。 -->
+                <geom name="drawer_back" type="box" pos="0 0.171 0.095"
+                      size="0.175 0.006 0.025" material="drawer_material"
+                      mass="0.04"/>
+                <!-- 抽屉左侧挡板：限制目标物从抽屉左侧滑出。 -->
+                <geom name="drawer_left_side" type="box" pos="-0.17 0 0.095"
+                      size="0.005 0.165 0.025" material="drawer_material"
+                      mass="0.04"/>
+                <!-- 抽屉右侧挡板：限制目标物从抽屉右侧滑出。 -->
+                <geom name="drawer_right_side" type="box" pos="0.17 0 0.095"
+                      size="0.005 0.165 0.025" material="drawer_material"
+                      mass="0.04"/>
+
+                <!-- 把手位于抽屉前面板的横向中心。 -->
+                <!-- 把手左安装座：连接把手横杆左端与抽屉前面板。 -->
+                <geom name="drawer_handle_left_mount" type="box" pos="-0.055 -0.19 0.11"
+                      size="0.01 0.018 0.012" material="handle_material"
+                      mass="0.02"/>
+                <!-- 把手右安装座：连接把手横杆右端与抽屉前面板。 -->
+                <geom name="drawer_handle_right_mount" type="box" pos="0.055 -0.19 0.11"
+                      size="0.01 0.018 0.012" material="handle_material"
+                      mass="0.02"/>
+                <!-- 把手横杆：左夹爪实际抓握并施力打开抽屉的部件。 -->
+                <geom name="drawer_handle" type="capsule" fromto="-0.055 -0.208 0.11 0.055 -0.208 0.11"
+                      size="0.012" material="handle_material" mass="0.04"
+                      friction="1.5 0.01 0.0001"/>
+                <site name="drawer_handle_site" type="sphere" pos="0 -0.208 0.11"
+                      size="0.006" rgba="1 0.75 0.20 0.75" group="3"/>
+                <site name="drawer_reference_site" type="sphere" pos="0 0 0.047"
+                      size="0.006" rgba="0.25 0.65 1 0.65" group="3"/>
+            </body>
+        </body>
+
+        <!-- 目标物位于抽屉右侧，开抽屉后由右臂取出。 -->
+        <body name="drawer_object" pos="0.06 0.10 0.103">
+            <joint name="drawer_object_joint" type="free"/>
+            <!-- 待取目标物：右夹爪需要从抽屉中抓取并放入目标托盘。 -->
+            <geom name="drawer_object_geom" type="box" size="0.025 0.022 0.03"
+                  material="object_material" mass="0.06"
+                  friction="1.5 0.01 0.0001" solref="0.01 1"/>
+            <site name="drawer_object_site" type="sphere" size="0.006"
+                  rgba="1 0.3 0.2 0.8" group="3"/>
+        </body>
+
+        <!-- 柜体顶板右前区域的目标托盘；中央非碰撞标记可直接用于放置成功判定。 -->
+        <body name="retrieval_target" pos="0.07 0.30 0.16">
+            <!-- 目标托盘底部标记：显示有效放置区域，不参与碰撞。 -->
+            <geom name="retrieval_target_base" type="box" pos="0 0 0.003"
+                  size="0.075 0.065 0.003" material="target_material"
+                  contype="0" conaffinity="0"/>
+            <!-- 目标托盘后边框：构成托盘远离机器人的后侧边界。 -->
+            <geom name="retrieval_target_back_rim" type="box" pos="0 0.06 0.018"
+                  size="0.075 0.003 0.018" material="target_rim_material"/>
+            <!-- 目标托盘前边框：构成托盘靠近机器人的前侧边界。 -->
+            <geom name="retrieval_target_front_rim" type="box" pos="0 -0.06 0.018"
+                  size="0.075 0.003 0.018" material="target_rim_material"/>
+            <!-- 目标托盘左边框：构成托盘左侧边界。 -->
+            <geom name="retrieval_target_left_rim" type="box" pos="-0.07 0 0.018"
+                  size="0.003 0.054 0.018" material="target_rim_material"/>
+            <!-- 目标托盘右边框：构成托盘右侧边界。 -->
+            <geom name="retrieval_target_right_rim" type="box" pos="0.07 0 0.018"
+                  size="0.003 0.054 0.018" material="target_rim_material"/>
+            <site name="retrieval_target_site" type="box" pos="0 0 0.018"
+                  size="0.063 0.048 0.004" rgba="0.15 0.90 0.38 0.35"
+                  group="3"/>
+        </body>
+
+        <!-- drawer_slide_joint 接近上限时，抽屉参考点应接近该位点。 -->
+        <site name="drawer_open_goal_site" type="sphere" pos="0 0.01 0.047"
+              size="0.008" rgba="0.20 0.75 1 0.40" group="3"/>
+    </worldbody>
+</mujoco>

@@ -72,6 +72,14 @@ ROBOT_INIT_CONFIGS = {
         "right_base_pos": [0.55, 0.05, 0.0],
         "middle_base_pos": MIDDLE_BASE_POS,
     },
+    "open_drawer_retrieve": {
+        "left_arm_pose": LEFT_ARM_POSE,
+        "right_arm_pose": RIGHT_ARM_POSE,
+        "middle_arm_pose": [0.0, 1.0, -1.5, 1.0, 0.0, 0.0],
+        "left_base_pos": [-0.55, -0.15, 0.0],
+        "right_base_pos": [0.55, -0.15, 0.0],
+        "middle_base_pos": MIDDLE_BASE_POS,
+    },
 }
 LEFT_JOINT_NAMES = [
     "left_waist",

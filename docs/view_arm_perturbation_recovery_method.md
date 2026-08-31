@@ -101,17 +101,11 @@ u_t^{V,\mathrm{rec}}=u_t^{V,E},
 
 这种非对称监督保留了清晰的条件关系：View 恢复时 Arm 标签不变，Arm 恢复时 View 标签不变。因此，双头策略可以从同一监督框架中分别学习视点误差恢复和操作状态误差恢复，而不会混淆两个扰动来源。
 
-## 3. 恢复事件采样
+## 3. 模式相关的恢复锚点选择
 
-对每条长度为 \(T\) 的成功专家轨迹，在合法时间范围内随机采样恢复事件起点 \(t_0\)。每个候选帧以概率 \(p\) 独立成为候选事件：
+对每条长度为 \(T\) 的成功专家轨迹，先在合法的全局时间范围或指定归一化时间域内建立完整候选锚点池。配置中的 `injection_probability_per_frame` 不再执行独立伯努利丢弃，而作为候选域的相对优先权重 \(w_d\)。固定随机种子据此生成可复现的无放回优先顺序。
 
-
-z_t\sim\operatorname{Bernoulli}(p).
-
-
-若伯努利候选在最小间隔约束下不足 3 个，代码会使用同一随机种子从合法区间重构事件集合，保证在数学上可行时达到最小事件数。因此，最终事件分布是受到事件数量、间隔和尾部长度共同约束的条件分布，而不是纯粹的独立伯努利分布。
-
-事件集合还必须满足：
+最终成功锚点集合必须满足：
 
 
 t_0\ge T_{\mathrm{initial}},
@@ -125,23 +119,23 @@ t_0\ge T_{\mathrm{initial}},
 t_0\le T-H,
 
 
-其中 \(H\) 为注入、恢复、稳定确认和恢复后记录所需的最坏情况剩余长度。当前配置为：
+其中 \(H\) 为恢复、稳定确认和恢复后记录所需的最坏情况剩余长度。在 `random`、`specified_region` 和 `hybrid` 模式下，每条源轨迹要求固定保存 \(B=3\) 条分支；在 `model_risk` 模式下，Arm和View分别从全局风险候选池分配总预算，每条轨迹不设最低数量，仅设置防止过度集中的上限。恢复生成器随后以风险清单中该轨迹的实际锚点数作为目标，因此简单轨迹可以为零，困难轨迹可以生成多个恢复分支。每个主锚点先在当前帧重新采样扰动，失败次数达到 `max_branch_attempts` 后，再在同一时间域内按帧距离由近到远搜索其他锚点。
 
-- 候选概率 \(p=0.015\)；
+当前配置为：
+
+- 全局候选优先权重 \(w=0.015\)，指定区域可单独覆盖；
 - 初始排除长度 \(T_{\mathrm{initial}}=16\) 帧；
 - 最小事件间隔 \(T_{\mathrm{interval}}=50\) 帧；
-- 每条源轨迹生成 3～5 个事件。
+- 非 `model_risk` 模式每条源轨迹固定生成 3 个成功恢复分支；
+- `model_risk` 模式按manifest逐轨迹动态确定目标数量，允许为0。
 
-View 的未记录扰动建立阶段不推进物理时间，其最坏情况尾部长度为
-
-
-H_V=N_{\max}+N_{\mathrm{extra}}+N_{\mathrm{post}}+1=87.
+View 与 Arm 都从锚点前 \(S=10\) 帧开始建立扰动。锚点之后必须保留的最坏情况尾部长度为
 
 
-Arm 分支的未记录扰动阶段会推进专家时间轴，因此
+H=N_{\max}+N_{\mathrm{extra}}+N_{\mathrm{post}}+1=87.
 
 
-H_A=S+N_{\max}+N_{\mathrm{extra}}+N_{\mathrm{post}}+1=97.
+同时锚点还必须满足 \(t_0\ge S\)，使快照能够从 \(t_0-S\) 开始真实物理推进。
 
 
 ## 4. 有界关节扰动模型
@@ -340,26 +334,22 @@ v_{A,j}^{\max}
 
 ### 7.1 未记录的 View 扰动建立
 
-在事件帧 \(t_0\) 恢复完整环境快照。由于 View 臂不参与物体接触，当前实现在不调用 `physics.step()` 的情况下，通过 MuJoCo `qpos` 插值建立反事实相机位姿：
+在恢复锚点 \(t_0\) 之前的 \(t_0-S\) 帧恢复完整环境快照，并沿专家时间轴执行 \(S\) 个真实 MuJoCo 控制步。第 \(i\) 个建立动作只修改 View 目标：
 
 
-q_{V}^{\mathrm{setup}}(u)
-=
-q_V^{\mathrm{start}}
-+s(u)
-\left(
-q_{t_0}^{V,E}+\Delta q^V-q_V^{\mathrm{start}}
-\right).
+a_{t_0-S+i}^{V,\mathrm{setup}}
+=a_{t_0-S+i}^{V,E}
++s\!\left(\frac{i+1}{S}\right)\Delta q_{\mathrm{sample}}^V.
 
 
-设置阶段共使用 \(S_V=10\) 个插值点，但不推进任务物理时间、不渲染图像，也不写入训练数据。最终强制满足
+设置阶段推进真实物理时间，但不渲染图像，也不写入训练数据；Arm 与夹爪继续执行相同源帧的专家动作。在锚点处测量真实到达偏移
 
 
-q_{t_0}^{V,\mathrm{actual}}
-=q_{t_0}^{V,E}+\Delta q^V.
+\Delta q_{\mathrm{real}}^V
+=q_{t_0}^{V,\mathrm{actual}}-q_{t_0}^{V,E}.
 
 
-随后将 View 关节速度置零，并把对应 actuator control 同步到该目标。当前实现使用绝对误差 \(10^{-10}\) 检查实际偏移与采样偏移的一致性。这里的 10 个插值点仅用于建立平滑的运动学状态序列，没有真实控制步或模拟时间含义。
+只有当实际偏移满足关节可行域和归一化强度下限时才进入记录阶段。后续恢复时长和动作标签均以 \(\Delta q_{\mathrm{real}}^V\) 为初值；采样偏移仅用于建立扰动并用于记录执行跟踪误差。
 
 ### 7.2 View 恢复标签
 
@@ -376,7 +366,7 @@ View 动作标签为
 u_{t_0+k}^{V,\mathrm{rec}}
 =
 u_{t_0+k}^{V,E}
-+r(u_k)\Delta q^V.
++r(u_k)\Delta q_{\mathrm{real}}^V.
 
 
 完成 \(N\) 个计划恢复步后，View 动作标签强制恢复为对应专家动作目标，即对 \(k\ge N\) 有 \(u_{t_0+k}^{V,\mathrm{rec}}=u_{t_0+k}^{V,E}\)。
@@ -406,7 +396,7 @@ B_n\neq B_{n+1}.
 
 ### 8.2 未记录的物理扰动注入
 
-Arm 可能处于抓取、交接或放置接触状态，因此不能像 View 一样直接修改 `qpos`。当前实现通过真实 MuJoCo 控制步平滑注入扰动，并同步推进专家时间轴。对注入阶段第 \(k\) 步：
+Arm 可能处于抓取、交接或放置接触状态，因此同样通过真实 MuJoCo 控制步平滑注入扰动，并同步推进专家时间轴。对注入阶段第 \(k\) 步：
 
 
 u_k^{\mathrm{in}}=\frac{k+1}{S_A},
@@ -645,29 +635,30 @@ a_t=a_t^E,
 **输出：** 原始专家轨迹与恢复分支组成的数据集 \(\mathcal D_R\)。
 
 1. 对每条专家轨迹执行一次无扰动 MuJoCo 重放，验证状态误差和最终任务成功。
-2. 在合法时间范围内随机采样 3～5 个恢复事件帧，并保存事件帧的完整环境快照。
-3. 对每个事件：
-   1. 从事件快照恢复环境；
+2. 在合法时间域内建立全部候选恢复锚点，按配置权重生成确定性优先顺序，并为每条源轨迹设置固定分支配额 \(B\)。
+3. 在配额尚未满足时：
+   1. 从恢复锚点前 \(M\) 帧的环境快照恢复环境；
    2. 根据关节/执行器限位计算扰动可行域；
    3. 从满足局部可行域和最小扰动强度的有界条件高斯分布采样 \(\Delta q^\rho\)；
-   4. 若 \(\rho=V\)，通过不推进物理时间的 `qpos` 插值建立 View OOD 状态；
-   5. 若 \(\rho\in\{L,R\}\)，通过真实物理步沿移动专家轨迹平滑注入 Arm 扰动；
-   6. 根据扰动幅值和速度上限计算恢复步数 \(N\)；
+   4. 通过 \(M\) 个真实物理步沿移动专家轨迹平滑建立对应角色的扰动，其余角色继续执行同一时刻的专家动作；
+   5. 在恢复锚点测量实际到达偏移 \(\Delta q_{\mathrm{real}}^\rho\)，并将其作为恢复初值；
+   6. 根据实际扰动幅值和速度上限计算恢复步数 \(N\)；
    7. 按五次曲线生成并执行恢复动作，同时记录双目图像、状态和动作；
    8. 完成全部 \(N\) 个计划恢复步后，累计连续 \(K\) 帧满足恢复误差阈值，再记录 \(N_{\mathrm{post}}\) 帧；
    9. 在后台执行完整专家后缀并验证最终任务成功；
-   10. 若任一条件失败，恢复快照并重新采样；重试耗尽后跳过该事件。
+   10. 若任一条件失败，在当前锚点重新采样偏移；重试耗尽后将该锚点标记为不可用，并在同一归一化时间域搜索最近候选锚点。
+   11. 若候选池耗尽仍未达到 \(B\)，保留已完成结果、在元数据中标记配额不足，并使本次生成任务最终报错。
 4. 在单个角色恢复数据集中，原始成功轨迹只保留一次，并与所有成功恢复分支共同组成输出数据集。
 
 ## 12. 当前关键参数
 
 | 参数 | View | Arm |
 |---|---:|---:|
-| 每帧事件概率 | 0.015 | 0.015 |
-| 每源轨迹事件数 | 3～5 | 3～5 |
+| 候选锚点优先权重 | 0.015（可按时间域覆盖） | 0.015（可按时间域覆盖） |
+| 每源轨迹恢复分支数 | 非model-risk固定3；model-risk按manifest动态确定 | 非model-risk固定3；model-risk按manifest动态确定 |
 | 最小事件间隔 | 50 帧 | 50 帧 |
-| 扰动进入步数 | 10 个 `qpos` 插值循环点，末端再同步一次 | 10 个真实控制步 |
-| 扰动进入时是否推进时间轴 | 否 | 是 |
+| 扰动进入步数 | 10 个真实控制步 | 10 个真实控制步 |
+| 扰动进入时是否推进时间轴 | 是 | 是 |
 | 恢复步数范围 | 20～40 | 20～40 |
 | 恢复速度上限 | 配置固定值 | 专家动作速度 P90 |
 | 恢复误差阈值 | 0.002 rad | 0.002 rad |
@@ -682,28 +673,29 @@ a_t=a_t^E,
 
 | 方法组成 | 文件 | 函数或位置 |
 |---|---|---|
-| 五次平滑函数 \(s(u)\) | `data_collect/generate_contractive_view_recovery_trajectories.py` | `_quintic_smoothstep`，158 行附近 |
+| 五次平滑函数 \(s(u)\) | `data_collect/recovery_data_generation/view_recovery_trajectories.py` | `_quintic_smoothstep`，158 行附近 |
 | 剩余比例 \(r(u)\) | 同上 | `_quintic_remaining_fraction`，172 行附近 |
 | 自适应恢复步数 | 同上 | `_adaptive_recovery_steps`，182 行附近 |
-| 随机事件帧采样 | 同上 | `_sample_injection_frames`，206 行附近 |
-| View 可行扰动域 | 同上 | `_local_feasible_offset_bounds`，290 行附近 |
-| View 有界高斯拒绝采样 | 同上 | `_sample_recovery_offset`，330 行附近 |
-| View 动作写回 | 同上 | `_recovery_action`，382 行附近 |
-| View 未记录扰动建立 | 同上 | `_apply_unrecorded_view_disturbance`，605 行附近 |
-| View 恢复与成功检查 | 同上 | `_generate_recovery_branch`，891 行附近 |
-| Arm 动作写回 | `data_collect/generate_contractive_arm_recovery_trajectories.py` | `_arm_recovery_action`，80 行附近 |
+| 模式相关候选锚点 | 同上 | `_build_view_recovery_candidates` |
+| 同域邻近锚点回退 | 同上 | `_neighbor_view_candidates` |
+| View 可行扰动域 | 同上 | `_local_feasible_offset_bounds` |
+| View 有界高斯拒绝采样 | 同上 | `_sample_recovery_offset` |
+| View 动作写回 | 同上 | `_recovery_action` |
+| View 未记录扰动建立 | 同上 | `_apply_unrecorded_view_disturbance` |
+| View 恢复与成功检查 | 同上 | `_generate_recovery_branch` |
+| Arm 动作写回 | `data_collect/recovery_data_generation/arm_recovery_trajectories.py` | `_arm_recovery_action`，80 行附近 |
 | 左右 Arm 均衡分配 | 同上 | `_assign_balanced_arms`，98 行附近 |
 | Arm 速度 P90 | 同上 | `_arm_velocity_percentile`，116 行附近 |
 | Arm 可行扰动域 | 同上 | `_local_arm_feasible_offset_bounds`，179 行附近 |
 | Arm 有界高斯拒绝采样 | 同上 | `_sample_arm_recovery_offset`，221 行附近 |
 | Arm 未记录物理注入 | 同上 | `_apply_unrecorded_arm_disturbance`，311 行附近 |
 | Arm 恢复与成功检查 | 同上 | `_generate_arm_recovery_branch`，475 行附近 |
-| View 配置 | `configs/data_collect/contractive_view_trajectory_recovery.yaml` | `event_sampling`、`view_joint_noise`、`recovery` |
-| Arm 配置 | `configs/data_collect/contractive_arm_trajectory_recovery.yaml` | `event_sampling`、`arm_joint_noise`、`auto_velocity`、`recovery` |
+| View 配置 | `configs/data_collect/view_trajectory_recovery.yaml` | `event_sampling`、`view_joint_noise`、`recovery` |
+| Arm 配置 | `configs/data_collect/arm_trajectory_recovery.yaml` | `event_sampling`、`arm_joint_noise`、`auto_velocity`、`recovery` |
 
 ## 14. 实现说明与论文表述边界
 
-### 14.1 Arm 当前使用采样偏移作为恢复锚点
+### 14.1 恢复使用物理系统实际到达的偏移
 
 Arm 扰动通过真实动力学注入，因此注入结束后的实际偏移
 
@@ -712,17 +704,11 @@ Arm 扰动通过真实动力学注入，因此注入结束后的实际偏移
 =q_{t_s}^{B,\mathrm{actual}}-q_{t_s}^{B,E}
 
 
-可能与采样偏移 \(\Delta q^B\) 不完全一致。当前代码只检查
-
-
-\|\Delta q_{\mathrm{real}}^B-\Delta q^B\|_\infty\le0.02\ \mathrm{rad},
-
-
-但恢复动作仍使用采样偏移 \(\Delta q^B\)。因此部分分支在记录后的最初几帧仍可能继续增大实际误差。论文若描述当前实现，应明确写为“从采样扰动目标收缩”；若要严格声称“从实际 OOD 状态单调开始恢复”，应先改为使用 \(\Delta q_{\mathrm{real}}^B\) 作为恢复锚点，并增加未记录的自适应稳定阶段。
+可能与采样偏移 \(\Delta q^B\) 不完全一致。当前 View 与 Arm 生成器均在恢复锚点读取实际状态，以 \(\Delta q_{\mathrm{real}}\) 计算扰动强度、恢复时长和后续恢复标签。采样偏移仅作为扰动建立阶段的控制目标，并单独写入元数据用于分析执行跟踪误差。
 
 ### 14.2 当前事件采样并非覆盖完整时间轴
 
-为保证恢复、稳定确认和后缀验证有足够长度，事件起点必须位于 \([T_{\mathrm{initial}},T-H]\)。因此，当前 Arm 数据不会在最后 97 帧注入扰动。随机时间采样也会低估持续时间较短的任务阶段。论文当前可以表述为“在所有合法恢复时刻随机采样”，不应直接表述为“覆盖任务的全部阶段”，除非后续增加阶段均衡采样或末端专家动作延长机制。
+为保证扰动建立、恢复、稳定确认和后缀验证有足够长度，恢复锚点必须位于合法时间范围内。归一化时间域配置仍可能低估持续时间较短或未被指定的任务阶段。论文应明确报告所用时间域和候选锚点分布，不应直接表述为“覆盖任务的全部阶段”。
 
 ### 14.3 恢复数据成功不等于策略恢复成功
 
@@ -730,7 +716,7 @@ Arm 扰动通过真实动力学注入，因此注入结束后的实际偏移
 
 ### 14.4 最终样本分布包含成功筛选
 
-被采样的扰动只是候选。View 事件最多重试 3 次，Arm 事件最多重试 10 次；只有满足注入跟踪、未扰动角色稳定、受扰角色恢复和最终任务成功的分支才会被保存。因此，论文应将最终数据描述为“由物理可行性和任务成功共同筛选的有界扰动恢复分布”，不应将最终样本直接等同于原始截断高斯样本。
+被采样的扰动只是候选。当前锚点的偏移重采样耗尽后，生成器还会在同一时间域搜索邻近锚点；只有满足未扰动角色稳定、实际扰动强度、受扰角色恢复和最终任务成功的分支才会被保存。因此，论文应将最终数据描述为“由物理可行性和任务成功共同筛选的有界扰动恢复分布”，并报告锚点失败率与回退次数，不能将最终样本直接等同于原始截断高斯样本。
 
 ### 14.5 View 与 Arm 数据合并需要去重
 

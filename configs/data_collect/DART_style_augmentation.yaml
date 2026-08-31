@@ -1,0 +1,140 @@
+# DART-style Unified-Action Noise Augmentation配置。
+#
+# 该基线在完整专家轨迹的每个控制步同时扰动左右Arm与View共18个连续关节，
+# 两个夹爪动作保持专家值。MuJoCo执行带噪动作，但joint_action始终保存同期
+# 未加噪专家动作。由于没有在偏移状态重新查询在线专家，本数据必须称为
+# DART-style，而不是严格DART。
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+# ===== 1. 输入、输出与任务 =====
+# 只允许使用纯专家Quest run；episode目录不能把已有恢复分支当成源专家。
+input_run_dir: outputs/4_data_collect/quest_teleop/quest_teleop_SewNeedle-3Arms-v0_rgb
+# 与Arm/View/Mixed Recovery分开保存，避免方法语义和resume指纹混淆。
+output_run_dir: outputs/4_data_collect/quest_teleop_recovery/SewNeedle-3Arms/quest_teleop_SewNeedle-3Arms-v0_rgb_DART_early_success
+# null表示从源metadata.json读取并严格核对env_id。
+env_id: null
+# null表示使用全部成功专家轨迹；正整数仅用于小规模冒烟。
+max_source_episodes: null
+# null表示不手工限定源episode；也可以写成[0, 2, 7]。
+source_episode_indices: null
+
+# ===== 2. 策略残差协方差 =====
+covariance:
+  # 纯专家策略残差估计脚本生成的npz。null时使用下方对角标准差，适合先验证
+  # 数据链路；正式DART-style对比应改为预计算协方差文件。
+  path: null
+  # npz中的18×18物理关节角协方差字段，单位rad²。
+  key: covariance_rad2
+  # path=null时使用的调试协方差标准差，顺序为左Arm6、右Arm6、View6。
+  diagonal_std_rad: [
+    0.016, 0.016, 0.016, 0.026, 0.026, 0.032,
+    0.016, 0.016, 0.016, 0.026, 0.026, 0.032,
+    0.016, 0.016, 0.016, 0.026, 0.026, 0.032
+  ]
+  # full保留全部跨关节/跨角色相关性；block_diagonal只保留左Arm、右Arm、
+  # View三个6×6块；diagonal只保留逐关节方差。
+  structure: full
+  # 向对角协方差收缩，降低有限残差样本导致的病态相关性。
+  shrinkage: 0.1
+  # 对半正定矩阵特征值设置数值下限，单位rad²。
+  eigenvalue_floor: 1.0e-10
+  # 标准差整体倍率；协方差在代码中乘以该值的平方。
+  global_scale: 0.5
+
+# ===== 3. 每步动作噪声 =====
+noise:
+  # 明确禁止夹爪扰动；当前生成器只接受false。
+  perturb_grippers: false
+  # 标准DART-style每个控制步重新采样；当前生成器只接受1。
+  resample_interval_steps: 1
+  # 18维截断上限，顺序同diagonal_std_rad；与现有Arm/View扰动上限对齐。
+  max_abs_rad: [
+    0.040, 0.040, 0.040, 0.065, 0.065, 0.080,
+    0.040, 0.040, 0.040, 0.065, 0.065, 0.080,
+    0.040, 0.040, 0.040, 0.065, 0.065, 0.080
+  ]
+  # 带噪目标与关节/执行器硬限位之间保留的安全余量。
+  joint_limit_margin_rad: 0.005
+  # 联合高斯因截断或当前动作可行域被拒绝时的最大重采样次数。
+  max_sampling_attempts: 1000
+  # 噪声种子按(source, variant, rollout_attempt, frame)派生，不受处理顺序影响。
+  seed: 20260826
+
+# ===== 4. 监督标签语义 =====
+supervision:
+  # 当前仅支持同期预录专家动作；元数据会标记strict_dart=false。
+  mode: recorded_time_aligned_reference
+  # HF转换必须继续选择joint_action，不能选择executed_joint_action。
+  action_key: joint_action
+
+# ===== 5. 精确增强帧预算 =====
+augmentation_budget:
+  # target_augmented_frames：先按源episode名义长度规划，再按成功轨迹实际
+  # 保存帧数动态补充候选，累计达到目标后停止；不会用padding补齐。
+  # variants_per_source：每条源轨迹固定生成相同数量的带噪版本。
+  mode: target_augmented_frames
+  # InsertPeg Arm+View Recovery新增帧为18031。若对比其他数据，必须改为对应
+  # 恢复帧数，例如InsertPeg Arm-only为7657。
+  target_augmented_frames: 18031
+  # 仅在mode=variants_per_source时生效。
+  variants_per_source: 1
+  # 每条源轨迹最多进入预算规划多少次；1可避免DART数据集中于少数初态。
+  max_variants_per_source: 1
+  # true只要求初始候选的名义源长度能精确组成目标；提前成功造成实际长度
+  # 变短时，生成器会继续使用剩余候选动态补足。
+  exact_match: true
+  # 打乱预算候选顺序的确定性随机种子，避免总是选择编号靠前的专家轨迹。
+  selection_seed: 20260826
+
+# ===== 6. 带噪rollout验收 =====
+rollout:
+  # true会在输出run中保存一份全部原始专家episode，转换HF后可直接得到
+  # Expert + DART-style数据集，无需使用Arm/View专用merge脚本。
+  include_original: true
+  # 为避免不可逆失败后的同期动作成为错误标签，第一版只保存最终成功轨迹。
+  # 如果任务提前成功，则立即保存已执行的专家动作前缀，不要求源轨迹等长。
+  require_final_success: true
+  # 当前只支持整条丢弃；不会保存失败前缀或裁剪轨迹。
+  failed_rollout_policy: discard
+  # 同一source/variant使用不同确定性噪声最多重试的次数。
+  max_attempts_per_variant: 10
+  # 单个源轨迹失败后是否继续处理其他源轨迹。
+  continue_on_error: true
+  # 允许在相同配置指纹下续生成已有输出。
+  resume: true
+  # false表示最终成功增强帧不足计划值时以非零异常结束，但保留已有结果。
+  allow_budget_shortfall: false
+
+# ===== 7. 名义专家重放校验 =====
+validation:
+  # 这些阈值只用于确认恢复初态后无噪专家轨迹能够严格重放。
+  max_arm_joint_abs_error: 0.002
+  max_gripper_abs_error: 0.005
+  max_view_joint_abs_error: 0.0001
+
+# ===== 8. 双目视频 =====
+cameras: [zed_cam_left, zed_cam_right]
+render_height: 480
+render_width: 640
+fps: 25
+video:
+  codec: libx264
+  pixel_format: yuv420p
+  crf: 23
+  gop: 2
+  macro_block_size: 1
+
+# ===== 9. MuJoCo服务器渲染 =====
+mujoco_gl: auto
+render_device: null
+
+# ===== 10. Hydra输出控制 =====
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false
+  output_subdir: null

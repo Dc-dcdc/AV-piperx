@@ -1,11 +1,12 @@
 #!/usr/bin/env python
-"""合并同一任务的 Arm/View 恢复 LeRobot 数据集。
+"""合并同一任务的 Arm/View/Mixed 恢复 LeRobot 数据集。
 
-合并结果只保留一份原始专家轨迹，并保留两份数据集中的全部恢复分支：
+合并结果只保留一份原始专家轨迹，并保留各输入数据集中的全部恢复分支：
 
     原始专家 episode（去重）
       + Arm recovery episode
       + View recovery episode
+      + Mixed recovery episode（可选）
 
 脚本依赖源 HF 数据集 ``meta_data/info.json`` 中的 ``source_raw_dir``，
 通过 raw episode 的 ``info.json`` 恢复 ``source_episode``、``variant_index``
@@ -167,6 +168,114 @@ def list_raw_episode_dirs(raw_dir: Path) -> list[Path]:
     ]
 
 
+def raw_episode_dirs_from_manifest(
+    *,
+    dataset_dir: Path,
+    raw_dir: Path,
+    info: dict[str, Any],
+    expected_episode_count: int,
+) -> list[Path] | None:
+    """按抽样清单恢复HF episode到raw episode的一一映射。
+
+    完整转换的数据集没有 ``episode_manifest``，仍由
+    :func:`list_raw_episode_dirs` 按raw目录排序映射。经过子采样的数据集则不能
+    再假设raw/HF数量相同，必须以清单中的episode顺序为准。
+    """
+
+    manifest_value = info.get("episode_manifest")
+    if not manifest_value:
+        return None
+    manifest_path = Path(str(manifest_value)).expanduser()
+    if not manifest_path.is_absolute():
+        manifest_path = dataset_dir / manifest_path
+    manifest_path = manifest_path.resolve()
+    if not manifest_path.is_relative_to(dataset_dir):
+        raise ValueError(
+            "episode_manifest必须位于当前HF数据集目录内: "
+            f"dataset={dataset_dir}, manifest={manifest_path}"
+        )
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"找不到episode_manifest: {manifest_path}")
+
+    manifest = read_json(manifest_path)
+    records = manifest.get("episodes")
+    if not isinstance(records, list):
+        raise ValueError(f"{manifest_path}缺少episodes列表。")
+    if len(records) != int(expected_episode_count):
+        raise ValueError(
+            f"episode_manifest与HF索引数量不一致: "
+            f"manifest={len(records)}, hf={expected_episode_count}"
+        )
+
+    raw_episodes_root = (raw_dir / "episodes").resolve()
+    raw_episode_dirs: list[Path] = []
+    identities: set[tuple[int, int]] = set()
+    for hf_episode_index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise ValueError(
+                f"episode_manifest记录[{hf_episode_index}]必须是对象。"
+            )
+        declared_index = record.get("new_episode_index")
+        if declared_index is None or int(declared_index) != hf_episode_index:
+            raise ValueError(
+                f"episode_manifest记录[{hf_episode_index}]的new_episode_index="
+                f"{declared_index!r}，必须与HF episode顺序一致。"
+            )
+
+        raw_episode_value = record.get("raw_episode_dir")
+        raw_episode_name = record.get("raw_episode_name")
+        if raw_episode_value:
+            raw_episode_dir = Path(str(raw_episode_value)).expanduser()
+            if not raw_episode_dir.is_absolute():
+                raw_episode_dir = raw_episodes_root / raw_episode_dir
+        elif raw_episode_name:
+            raw_episode_dir = raw_episodes_root / str(raw_episode_name)
+        else:
+            raise ValueError(
+                f"episode_manifest记录[{hf_episode_index}]缺少"
+                "raw_episode_dir/raw_episode_name。"
+            )
+        raw_episode_dir = raw_episode_dir.resolve()
+        if not raw_episode_dir.is_relative_to(raw_episodes_root):
+            raise ValueError(
+                f"episode_manifest记录[{hf_episode_index}]指向source_raw_dir之外: "
+                f"{raw_episode_dir}"
+            )
+        if raw_episode_name is not None and raw_episode_dir.name != str(raw_episode_name):
+            raise ValueError(
+                f"episode_manifest记录[{hf_episode_index}]的raw_episode_name="
+                f"{raw_episode_name!r}与路径名{raw_episode_dir.name!r}不一致。"
+            )
+        if not (raw_episode_dir / "arrays.npz").is_file() or not (
+            raw_episode_dir / "info.json"
+        ).is_file():
+            raise FileNotFoundError(
+                f"episode_manifest引用的raw episode不完整: {raw_episode_dir}"
+            )
+
+        identity = parse_raw_episode_name(raw_episode_dir.name)
+        if identity in identities:
+            raise ValueError(
+                "episode_manifest包含重复raw source/variant: "
+                f"source={identity[0]}, variant={identity[1]}"
+            )
+        identities.add(identity)
+        declared_source = record.get("source_episode")
+        declared_variant = record.get("variant_index")
+        if declared_source is not None and int(declared_source) != identity[0]:
+            raise ValueError(
+                f"episode_manifest记录[{hf_episode_index}]的source_episode="
+                f"{declared_source}与raw目录{identity[0]}不一致。"
+            )
+        if declared_variant is not None and int(declared_variant) != identity[1]:
+            raise ValueError(
+                f"episode_manifest记录[{hf_episode_index}]的variant_index="
+                f"{declared_variant}与raw目录{identity[1]}不一致。"
+            )
+        raw_episode_dirs.append(raw_episode_dir)
+    return raw_episode_dirs
+
+
 def read_parquet_dataset(dataset_dir: Path) -> pa.Table:
     parquet_paths = sorted((dataset_dir / "data").glob("*.parquet"))
     if not parquet_paths:
@@ -206,17 +315,25 @@ def load_dataset_source(role: str, dataset_dir_value: str | Path) -> DatasetSour
 
     info = read_json(info_path)
     raw_dir = resolve_raw_dir(dataset_dir, info)
-    raw_episode_dirs = list_raw_episode_dirs(raw_dir)
     table = read_parquet_dataset(dataset_dir)
     episode_data_index = load_file(episode_index_path)
     starts = episode_data_index.get("from")
     ends = episode_data_index.get("to")
     if starts is None or ends is None or len(starts) != len(ends):
         raise ValueError(f"非法episode_data_index: {episode_index_path}")
+    raw_episode_dirs = raw_episode_dirs_from_manifest(
+        dataset_dir=dataset_dir,
+        raw_dir=raw_dir,
+        info=info,
+        expected_episode_count=len(starts),
+    )
+    if raw_episode_dirs is None:
+        raw_episode_dirs = list_raw_episode_dirs(raw_dir)
     if len(raw_episode_dirs) != len(starts):
         raise ValueError(
             f"{role}数据映射数量不一致: raw={len(raw_episode_dirs)}, "
-            f"hf={len(starts)}。请确认HF数据由当前source_raw_dir完整转换而来。"
+            f"hf={len(starts)}。完整转换数据应与source_raw_dir数量一致；"
+            "子采样数据必须在info.json中提供有效的episode_manifest。"
         )
     if int(info.get("total_episodes", len(starts))) != len(starts):
         raise ValueError(
@@ -295,28 +412,48 @@ def load_dataset_source(role: str, dataset_dir_value: str | Path) -> DatasetSour
     )
 
 
-def validate_source_compatibility(arm: DatasetSource, view: DatasetSource) -> None:
-    for key in ("codebase_version", "fps", "video", "camera_keys"):
-        if arm.info.get(key) != view.info.get(key):
-            raise ValueError(
-                f"Arm/View数据集的{key}不一致: {arm.info.get(key)!r} != {view.info.get(key)!r}"
-            )
-    if not arm.table.schema.equals(view.table.schema, check_metadata=False):
-        raise ValueError("Arm/View Parquet schema不一致，不能合并。")
+def validate_source_compatibility(sources: dict[str, DatasetSource]) -> None:
+    """确认所有恢复数据集具有相同schema和专家episode集合。
 
-    arm_original_ids = {
-        episode.source_episode for episode in arm.episodes if not episode.is_augmented
+    各角色的恢复episode数量可以不同；合并时会保留每个输入中的
+    全部恢复分支，只对重复的原始专家episode去重。
+    """
+
+    if len(sources) < 2:
+        raise ValueError("至少需要两个恢复HF数据集。")
+    dataset_dirs = [source.dataset_dir for source in sources.values()]
+    if len(set(dataset_dirs)) != len(dataset_dirs):
+        raise ValueError("Arm/View/Mixed必须指向彼此不同的HF数据集目录。")
+    reference_role, reference = next(iter(sources.items()))
+    reference_original_ids = {
+        episode.source_episode
+        for episode in reference.episodes
+        if not episode.is_augmented
     }
-    view_original_ids = {
-        episode.source_episode for episode in view.episodes if not episode.is_augmented
-    }
-    if arm_original_ids != view_original_ids:
-        only_arm = sorted(arm_original_ids - view_original_ids)
-        only_view = sorted(view_original_ids - arm_original_ids)
-        raise ValueError(
-            "Arm/View原始专家episode集合不一致。"
-            f" only_arm={only_arm[:20]}, only_view={only_view[:20]}"
-        )
+    for role, source in list(sources.items())[1:]:
+        for key in ("codebase_version", "fps", "video", "camera_keys"):
+            if reference.info.get(key) != source.info.get(key):
+                raise ValueError(
+                    f"{reference_role}/{role}数据集的{key}不一致: "
+                    f"{reference.info.get(key)!r} != {source.info.get(key)!r}"
+                )
+        if not reference.table.schema.equals(source.table.schema, check_metadata=False):
+            raise ValueError(
+                f"{reference_role}/{role} Parquet schema不一致，不能合并。"
+            )
+        original_ids = {
+            episode.source_episode
+            for episode in source.episodes
+            if not episode.is_augmented
+        }
+        if reference_original_ids != original_ids:
+            only_reference = sorted(reference_original_ids - original_ids)
+            only_current = sorted(original_ids - reference_original_ids)
+            raise ValueError(
+                f"{reference_role}/{role}原始专家episode集合不一致。"
+                f" only_{reference_role}={only_reference[:20]}, "
+                f"only_{role}={only_current[:20]}"
+            )
 
 
 def episode_lookup(source: DatasetSource) -> dict[tuple[int, int], DatasetEpisode]:
@@ -329,10 +466,17 @@ def episode_lookup(source: DatasetSource) -> dict[tuple[int, int], DatasetEpisod
     return result
 
 
-def verify_original_episode_equality(arm: DatasetSource, view: DatasetSource) -> None:
-    """确认被去掉的专家轨迹和保留版本数值完全相同。"""
-    arm_lookup = episode_lookup(arm)
-    view_lookup = episode_lookup(view)
+def verify_original_episode_equality(
+    sources: dict[str, DatasetSource], original_source: str
+) -> None:
+    """确认所有将被去掉的专家轨迹与保留版本数值完全相同。"""
+
+    if original_source not in sources:
+        raise ValueError(
+            f"original_source={original_source!r}没有对应输入数据集。"
+        )
+    clean_source = sources[original_source]
+    clean_lookup = episode_lookup(clean_source)
     compare_columns = [
         "observation.state",
         "action",
@@ -341,36 +485,55 @@ def verify_original_episode_equality(arm: DatasetSource, view: DatasetSource) ->
         "next.done",
     ]
     original_ids = sorted(
-        episode.source_episode for episode in arm.episodes if not episode.is_augmented
+        episode.source_episode
+        for episode in clean_source.episodes
+        if not episode.is_augmented
     )
-    for source_episode in original_ids:
-        arm_episode = arm_lookup[(source_episode, -1)]
-        view_episode = view_lookup[(source_episode, -1)]
-        arm_table = arm.table.slice(arm_episode.start, arm_episode.frame_count).select(compare_columns)
-        view_table = view.table.slice(view_episode.start, view_episode.frame_count).select(compare_columns)
-        if not arm_table.equals(view_table, check_metadata=False):
-            raise ValueError(
-                "发现Arm/View中的原始专家轨迹不相同，已停止自动去重: "
-                f"source_episode={source_episode}。可先检查两个raw数据来源。"
-            )
-    logging.info("已验证 %d 条重复原始专家轨迹数值完全一致。", len(original_ids))
+    comparison_count = 0
+    for role, source in sources.items():
+        if role == original_source:
+            continue
+        lookup = episode_lookup(source)
+        for source_episode in original_ids:
+            clean_episode = clean_lookup[(source_episode, -1)]
+            compared_episode = lookup[(source_episode, -1)]
+            clean_table = clean_source.table.slice(
+                clean_episode.start, clean_episode.frame_count
+            ).select(compare_columns)
+            compared_table = source.table.slice(
+                compared_episode.start, compared_episode.frame_count
+            ).select(compare_columns)
+            if not clean_table.equals(compared_table, check_metadata=False):
+                raise ValueError(
+                    f"发现{original_source}/{role}中的原始专家轨迹不相同，"
+                    "已停止自动去重: "
+                    f"source_episode={source_episode}。可先检查raw数据来源。"
+                )
+            comparison_count += 1
+    logging.info(
+        "已验证 %d 组重复原始专家轨迹数值完全一致。", comparison_count
+    )
 
 
 def choose_episodes(
-    arm: DatasetSource,
-    view: DatasetSource,
+    sources: dict[str, DatasetSource],
     original_source: str,
 ) -> list[DatasetEpisode]:
-    sources = {"arm": arm, "view": view}
+    if original_source not in sources:
+        raise ValueError(
+            f"original_source={original_source!r}没有对应输入数据集。"
+        )
     clean_source = sources[original_source]
     originals = {
         episode.source_episode: episode
         for episode in clean_source.episodes
         if not episode.is_augmented
     }
-    arm_augmented: dict[int, list[DatasetEpisode]] = {}
-    view_augmented: dict[int, list[DatasetEpisode]] = {}
-    for source, target in ((arm, arm_augmented), (view, view_augmented)):
+    augmented_by_role: dict[str, dict[int, list[DatasetEpisode]]] = {
+        role: {} for role in sources
+    }
+    for role, source in sources.items():
+        target = augmented_by_role[role]
         for episode in source.episodes:
             if episode.is_augmented:
                 target.setdefault(episode.source_episode, []).append(episode)
@@ -378,23 +541,18 @@ def choose_episodes(
     selected: list[DatasetEpisode] = []
     for source_episode in sorted(originals):
         selected.append(originals[source_episode])
-        selected.extend(
-            sorted(
-                arm_augmented.get(source_episode, []),
-                key=lambda episode: episode.variant_index,
+        for role in sources:
+            selected.extend(
+                sorted(
+                    augmented_by_role[role].get(source_episode, []),
+                    key=lambda episode: episode.variant_index,
+                )
             )
-        )
-        selected.extend(
-            sorted(
-                view_augmented.get(source_episode, []),
-                key=lambda episode: episode.variant_index,
-            )
-        )
 
     selected_augmented = {id(episode) for episode in selected if episode.is_augmented}
     all_augmented = {
         id(episode)
-        for source in (arm, view)
+        for source in sources.values()
         for episode in source.episodes
         if episode.is_augmented
     }
@@ -537,8 +695,7 @@ def vector_stats(values: np.ndarray) -> dict[str, torch.Tensor]:
 def build_merged_stats(
     table: pa.Table,
     camera_keys: list[str],
-    arm_stats: dict[str, torch.Tensor],
-    view_stats: dict[str, torch.Tensor],
+    sources: dict[str, DatasetSource],
 ) -> dict[str, torch.Tensor]:
     flattened: dict[str, torch.Tensor] = {}
     for key in NUMERIC_STAT_KEYS:
@@ -552,39 +709,58 @@ def build_merged_stats(
         for stat_name, tensor in vector_stats(values).items():
             flattened[f"{key}/{stat_name}"] = tensor
 
-    # 当前转换流程在没有jpg帧时使用固定图像统计。只有两边统计一致时才可无损继承；
+    # 当前转换流程在没有jpg帧时使用固定图像统计。只有所有来源统计一致时才可无损继承；
     # 若未来源数据改为真实图像统计，应先扩展此脚本为从合并视频重新抽帧统计。
+    reference_role, reference = next(iter(sources.items()))
     for camera_key in camera_keys:
         for stat_name in ("mean", "std", "min", "max"):
             key = f"{camera_key}/{stat_name}"
-            if key not in arm_stats or key not in view_stats:
-                raise KeyError(f"源stats缺少图像统计: {key}")
-            if not torch.equal(arm_stats[key], view_stats[key]):
-                raise ValueError(
-                    f"Arm/View图像统计不一致: {key}。为了避免写入不准确统计，"
-                    "请先统一图像统计覆盖，或扩展脚本从视频重新计算。"
-                )
-            flattened[key] = view_stats[key].clone()
+            if key not in reference.stats:
+                raise KeyError(f"{reference_role}源stats缺少图像统计: {key}")
+            for role, source in sources.items():
+                if key not in source.stats:
+                    raise KeyError(f"{role}源stats缺少图像统计: {key}")
+                if not torch.equal(reference.stats[key], source.stats[key]):
+                    raise ValueError(
+                        f"{reference_role}/{role}图像统计不一致: {key}。"
+                        "为了避免写入不准确统计，请先统一图像统计覆盖，"
+                        "或扩展脚本从视频重新计算。"
+                    )
+            flattened[key] = reference.stats[key].clone()
     return flattened
 
 
 def write_support_files(
     staging_dir: Path,
-    arm: DatasetSource,
-    view: DatasetSource,
+    sources: dict[str, DatasetSource],
+    original_source: str,
     total_episodes: int,
     total_frames: int,
     composition: dict[str, dict[str, int]],
 ) -> None:
-    info = dict(view.info)
+    info = dict(sources[original_source].info)
     info.pop("source_raw_dir", None)
+    has_mixed = "mixed" in sources
+    merge_type = (
+        "deduplicated_arm_view_mixed_recovery_v1"
+        if has_mixed
+        else "deduplicated_arm_view_recovery_v1"
+    )
     info.update(
         {
             "total_episodes": total_episodes,
             "total_frames": total_frames,
-            "source_hf_dirs": [str(arm.dataset_dir), str(view.dataset_dir)],
-            "source_raw_dirs": [str(arm.raw_dir), str(view.raw_dir)],
-            "merge_type": "deduplicated_arm_view_recovery_v1",
+            "source_hf_dirs": [
+                str(source.dataset_dir) for source in sources.values()
+            ],
+            "source_raw_dirs": [str(source.raw_dir) for source in sources.values()],
+            "source_hf_dirs_by_role": {
+                role: str(source.dataset_dir) for role, source in sources.items()
+            },
+            "source_raw_dirs_by_role": {
+                role: str(source.raw_dir) for role, source in sources.items()
+            },
+            "merge_type": merge_type,
             "composition": composition,
             "episode_manifest": "recovery_manifest.json",
         }
@@ -599,9 +775,11 @@ def write_support_files(
         "- LeRobot\n"
         "- recovery\n"
         "---\n"
-        "# Deduplicated Arm/View recovery dataset\n\n"
+        f"# Deduplicated {'Arm/View/Mixed' if has_mixed else 'Arm/View'} recovery dataset\n\n"
         "This dataset contains one copy of each clean expert episode, all Arm recovery "
-        "branches, and all View recovery branches. See `recovery_manifest.json` for "
+        "branches, all View recovery branches"
+        + (", and all Mixed recovery branches" if has_mixed else "")
+        + ". See `recovery_manifest.json` for "
         "episode provenance.\n"
     )
     (staging_dir / "README.md").write_text(readme, encoding="utf-8")
@@ -616,17 +794,23 @@ def write_support_files(
 def merge_datasets(args: argparse.Namespace) -> Path | None:
     arm = load_dataset_source("arm", args.arm_dir)
     view = load_dataset_source("view", args.view_dir)
-    validate_source_compatibility(arm, view)
-    if args.verify_originals:
-        verify_original_episode_equality(arm, view)
-
-    selected = choose_episodes(arm, view, args.original_source)
     sources = {"arm": arm, "view": view}
+    # argparse 的可选路径默认可能是空字符串；空字符串表示未启用 Mixed，
+    # 不能把它解析成项目根目录后再尝试加载数据集。
+    if args.mixed_dir is not None and str(args.mixed_dir).strip():
+        sources["mixed"] = load_dataset_source("mixed", args.mixed_dir)
+    validate_source_compatibility(sources)
+    if args.verify_originals:
+        verify_original_episode_equality(sources, args.original_source)
+
+    selected = choose_episodes(sources, args.original_source)
     composition: dict[str, dict[str, int]] = {
         "original": {"episodes": 0, "frames": 0},
         "arm_recovery": {"episodes": 0, "frames": 0},
         "view_recovery": {"episodes": 0, "frames": 0},
     }
+    if "mixed" in sources:
+        composition["mixed_recovery"] = {"episodes": 0, "frames": 0}
     for episode in selected:
         bucket = composition[episode.recovery_type]
         bucket["episodes"] += 1
@@ -643,10 +827,21 @@ def merge_datasets(args: argparse.Namespace) -> Path | None:
         logging.info("dry-run完成，未写入任何文件。")
         return None
 
-    output_dir = resolve_path(args.output_dir)
+    output_dir_value = args.output_dir
+    if output_dir_value is None:
+        suffix = (
+            "arm_view_mixed_random_recovery_3+0"
+            if "mixed" in sources
+            else "arm_view_random_recovery_3+0"
+        )
+        output_dir_value = (
+            "outputs/5_hf_datasets/InsertCylinder-3Arms/"
+            f"quest_teleop_InsertCylinder-3Arms-v0_rgb_{suffix}"
+        )
+    output_dir = resolve_path(output_dir_value)
     if output_dir == ROOT:
         raise ValueError("output-dir不能是项目根目录。")
-    for source_dir in (arm.dataset_dir, view.dataset_dir):
+    for source_dir in (source.dataset_dir for source in sources.values()):
         if output_dir.is_relative_to(source_dir) or source_dir.is_relative_to(output_dir):
             raise ValueError(
                 "output-dir不能与源数据集相同，也不能是源数据集的父目录或子目录: "
@@ -678,7 +873,7 @@ def merge_datasets(args: argparse.Namespace) -> Path | None:
                 episode=episode,
                 new_episode_index=new_episode_index,
                 global_index=global_index,
-                camera_keys=list(view.info["camera_keys"]),
+                camera_keys=list(sources[args.original_source].info["camera_keys"]),
                 staging_dir=staging_dir,
                 link_mode=args.link_mode,
             )
@@ -727,15 +922,14 @@ def merge_datasets(args: argparse.Namespace) -> Path | None:
         )
         merged_stats = build_merged_stats(
             table=merged_table,
-            camera_keys=list(view.info["camera_keys"]),
-            arm_stats=arm.stats,
-            view_stats=view.stats,
+            camera_keys=list(sources[args.original_source].info["camera_keys"]),
+            sources=sources,
         )
         save_file(merged_stats, staging_dir / "meta_data" / "stats.safetensors")
         write_support_files(
             staging_dir=staging_dir,
-            arm=arm,
-            view=view,
+            sources=sources,
+            original_source=args.original_source,
             total_episodes=len(selected),
             total_frames=total_frames,
             composition=composition,
@@ -743,12 +937,16 @@ def merge_datasets(args: argparse.Namespace) -> Path | None:
         write_json(
             staging_dir / "recovery_manifest.json",
             {
-                "schema_version": 1,
-                "merge_type": "deduplicated_arm_view_recovery",
+                "schema_version": 2 if "mixed" in sources else 1,
+                "merge_type": (
+                    "deduplicated_arm_view_mixed_recovery"
+                    if "mixed" in sources
+                    else "deduplicated_arm_view_recovery"
+                ),
                 "original_source": args.original_source,
                 "source_datasets": {
-                    "arm": str(arm.dataset_dir),
-                    "view": str(view.dataset_dir),
+                    role: str(source.dataset_dir)
+                    for role, source in sources.items()
                 },
                 "total_episodes": len(selected),
                 "total_frames": total_frames,
@@ -763,7 +961,9 @@ def merge_datasets(args: argparse.Namespace) -> Path | None:
             raise RuntimeError(
                 f"Parquet回读帧数不一致: {written_table.num_rows} != {total_frames}"
             )
-        expected_video_count = len(selected) * len(view.info["camera_keys"])
+        expected_video_count = len(selected) * len(
+            sources[args.original_source].info["camera_keys"]
+        )
         actual_video_count = sum(1 for _ in (staging_dir / "videos").glob("*.mp4"))
         if actual_video_count != expected_video_count:
             raise RuntimeError(
@@ -787,28 +987,42 @@ def merge_datasets(args: argparse.Namespace) -> Path | None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="去重并合并同一任务的Arm/View恢复LeRobot数据集。"
+        description=(
+            "去重并合并同一任务的Arm/View恢复LeRobot数据集，"
+            "并可选加入Mixed恢复数据集。"
+        )
     )
     parser.add_argument(
         "--arm-dir",
-        default="outputs/5_hf_datasets/quest_teleop_InsertCylinder-3Arms-v0_rgb_arm_recovery",
+        default="outputs/5_hf_datasets/InsertPeg-3Arms/expert_100/quest_teleop_InsertPeg-3Arms-v0_rgb_arm_random_static_3+0",
         help="Arm恢复HF数据集目录。",
     )
     parser.add_argument(
         "--view-dir",
-        default="outputs/5_hf_datasets/quest_teleop_InsertCylinder-3Arms-v0_rgb_view_recovery",
+        default="outputs/5_hf_datasets/InsertPeg-3Arms/expert_100/quest_teleop_InsertPeg-3Arms-v0_rgb_view_random_static_3+0",
         help="View恢复HF数据集目录。",
     )
     parser.add_argument(
+        "--mixed-dir",
+        default="",
+        help=(
+            "可选的Mixed恢复HF数据集目录；传入后合并结果为"
+            "专家+Arm+View+Mixed，不传则保持原Arm+View合并行为。"
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
-        default="outputs/5_hf_datasets/quest_teleop_InsertCylinder-3Arms-v0_rgb_arm_view_recovery",
-        help="合并后的单一HF数据集目录。",
+        default="outputs/5_hf_datasets/InsertPeg-3Arms/expert_100/quest_teleop_InsertPeg-3Arms-v0_rgb_arm_view_random_static_3+0",
+        help=(
+            "合并后的单一HF数据集目录；不指定时根据是否传入Mixed自动使用"
+            "arm_view或arm_view_mixed名称。"
+        ),
     )
     parser.add_argument(
         "--original-source",
-        choices=("arm", "view"),
+        choices=("arm", "view", "mixed"),
         default="view",
-        help="重复原始专家轨迹保留哪一侧；默认保留View数据集中的副本。",
+        help="重复原始专家轨迹保留哪个来源；默认保留View数据集中的副本。",
     )
     parser.add_argument(
         "--link-mode",
@@ -820,7 +1034,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--verify-originals",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="去重前是否逐条确认Arm/View原始轨迹的状态、动作和时间戳完全一致。",
+        help="去重前是否逐条确认所有来源的原始轨迹状态、动作和时间戳完全一致。",
     )
     parser.add_argument(
         "--dry-run",

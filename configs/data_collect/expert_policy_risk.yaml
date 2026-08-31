@@ -1,0 +1,91 @@
+# 使用纯专家数据训练的Diffusion Policy扫描专家轨迹中的高风险动作锚点。
+# 运行方式：
+# /home/dc/miniforge3/envs/AV-piper/bin/python \
+#   data_collect/recovery_data_generation/score_expert_policy_risk.py \
+#   --config configs/data_collect/expert_policy_risk.yaml
+#
+# 命令行仍可覆盖任意字段，例如：
+#   --num-samples 8 --threshold-quantile 0.8 --max-episodes 2
+
+# ===== 1. 输入、模型与输出路径 =====
+paths:
+  # convert_data_to_hf.py生成的纯专家LeRobot/HF数据集；不能包含恢复或_aug分支。
+  dataset_local_dir: outputs/5_hf_datasets/SewNeedle-3Arms/quest_teleop_SewNeedle-3Arms-v0_rgb_joint_zed
+  # 与上述HF数据逐条对应的Quest原始纯专家run；用于恢复原始episode编号并校验动作哈希。
+  raw_dir: outputs/4_data_collect/quest_teleop/quest_teleop_SewNeedle-3Arms-v0_rgb
+  # 纯专家训练得到的EMA pretrained_model目录，也可填写其直接父checkpoint目录。
+  # 禁止使用online_model，避免用未平滑的在线训练权重筛选恢复锚点。
+  checkpoint: outputs/2_pretrain/SewNeedle-3Arms-v0/baseline_expert/01-25-35_SewNeedle-3Arms-v0_dual_head_diffusion/checkpoints/104000_loss=0.0047_sr=57.0_ar=568.94/pretrained_model
+  # 输出frame_scores.parquet、selected_anchors.jsonl和summary.json的目录。
+  # 改变扫描参数时建议使用新目录，避免覆盖已有实验结果。
+  output_dir: outputs/4_data_collect/model_risk/SewNeedle-3Arms/expert_dual_head_104000_stride1_k4_global_budget
+
+# ===== 2. 策略与设备 =====
+model:
+  # 策略结构必须与checkpoint一致；可选diffusion、dual_head_diffusion、coupled_dual_head_diffusion。
+  policy_name: dual_head_diffusion
+  # 原始episode的arrays.npz中作为专家监督动作的字段名。
+  action_key: joint_action
+  # 推理设备；多GPU机器可写cuda:0、cuda:1，调试时也可写cpu。
+  device: cuda:0
+
+# ===== 3. 本地数据读取与严格映射 =====
+dataset:
+  # LeRobot视频解码后端；当前专家数据使用pyav。
+  video_backend: pyav
+  # HF动作与raw动作映射时允许的最大绝对误差；0.0表示逐元素完全一致。
+  # 除非确认Parquet写入发生了可解释的数值舍入，否则不要放宽。
+  mapping_atol: 0.0
+
+# ===== 4. 扫描性能与采样规模 =====
+runtime:
+  # 一次送入GPU的观测起点数量；显存不足时降低，显存充足时可适当提高。
+  batch_size: 16
+  # DataLoader并行解码进程数；过大可能增加内存和视频随机读取压力。
+  num_workers: 4
+  # 每个观测起点独立执行多少次扩散采样；越大统计越稳定，但耗时近似线性增加。
+  num_samples: 4
+  # 扩散采样与随机探索锚点的基础随机种子，保证相同配置下可复现。
+  seed: 1000
+  # 每隔多少个真实帧扫描一次；1表示逐帧扫描，4表示扫描16、20、24……帧。
+  frame_stride: 1
+  # 跳过每条episode开头的帧数，避免在任务尚未形成稳定上下文时注入扰动。
+  min_frame_index: 16
+  # 最多扫描多少个候选帧；null表示不限制。小规模冒烟可设置为16或32。
+  max_frames: null
+  # 最多扫描多少条专家episode；null表示全部。调试时可设置为1或2。
+  max_episodes: null
+
+# ===== 5. 风险分数与全局阈值 =====
+risk_scoring:
+  # 对同一episode相邻扫描点进行中值平滑的窗口，必须为正奇数。
+  # 覆盖的真实帧跨度约为smooth_window×frame_stride。
+  smooth_window: 3
+  # 在全部合法候选帧中取该分位数作为model_risk阈值。
+  # 0.9表示只把最高10%的分数作为高风险候选；若希望扩大候选池，可降至0.75～0.8。
+  threshold_quantile: 0.9
+
+# ===== 6. 最终锚点选择 =====
+anchor_selection:
+  # 高风险候选在扫描序列中相隔不超过该数值时合并为同一风险区间，并保留区间峰值。
+  # 注意它作用于实际frame_index；若要合并相邻扫描点，该值至少应等于frame_stride。
+  merge_gap: 3
+  # 同一episode同一角色的锚点最小帧间隔；20帧在25 Hz下约为0.8秒。
+  nms_distance: 20
+  # Arm在全部专家轨迹范围内最多保留的锚点总数；不再要求每条轨迹都有锚点。
+  # 旧配置约100条轨迹×每条3个Arm锚点，因此以300作为等量预算参考。
+  arm_total_anchor_budget: 300
+  # View在全部专家轨迹范围内最多保留的锚点总数；可按恢复采集成本单独控制。
+  view_total_anchor_budget: 200
+  # 单条episode单个角色最多获得的锚点数；仅防止少数异常轨迹占满预算，不是固定配额。
+  # 简单且低风险的轨迹允许为0；困难轨迹可以获得多个锚点。
+  max_anchors_per_episode: 6
+  # 从全局总预算中预留给随机探索锚点的比例；0.1表示最多10%，不按episode强制补齐。
+  random_exploration_ratio: 0.1
+
+# ===== 7. 与恢复生成器的尾部帧预算保持一致 =====
+recovery_compatibility:
+  # Arm锚点之后至少保留的帧数：max恢复25 + 最多等待10 + 专家跟随15 + 边界1 = 51。
+  arm_required_future_frames: 51
+  # View锚点之后至少保留的帧数：max恢复40 + 最多等待10 + 专家跟随15 + 边界1 = 66。
+  view_required_future_frames: 66

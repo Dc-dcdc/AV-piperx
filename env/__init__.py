@@ -40,6 +40,15 @@ ENVS = {
         "observation_width": 640,
         "init_config": "insert_peg",
     },
+    "guided_vision/OpenDrawerRetrieve-3Arms-v0": {
+        "entry_point": "env.task.open_drawer_retrieve_env:OpenDrawerRetrieveEnv",
+        "num_arms": 3,
+        "episode_length": 400,
+        "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
+        "observation_height": 480,
+        "observation_width": 640,
+        "init_config": "open_drawer_retrieve",
+    },
 }
 
 

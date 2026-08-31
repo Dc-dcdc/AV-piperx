@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from data_collect.episode_seeding import (
+from data_collect.expert_data_collection.episode_seeding import (
     MAX_UINT32_SEED,
     EpisodeSeedStream,
     ReplaySeedStream,

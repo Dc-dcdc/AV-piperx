@@ -117,6 +117,45 @@ def configure_torch_runtime(deterministic: bool):
     torch.use_deterministic_algorithms(False)
 
 
+def resolve_amp_dtype(dtype_name) -> torch.dtype:
+    """解析独立评估的AMP类型，并与预训练入口使用相同的命名约定。"""
+    if isinstance(dtype_name, torch.dtype):
+        if dtype_name in {torch.bfloat16, torch.float16}:
+            return dtype_name
+        raise ValueError(
+            f"独立评估不支持amp_dtype={dtype_name}，可选bfloat16或float16。"
+        )
+
+    normalized = str(dtype_name).lower().removeprefix("torch.")
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if normalized in {"fp16", "float16", "half"}:
+        return torch.float16
+    raise ValueError(
+        f"独立评估不支持amp_dtype={dtype_name!r}，可选bfloat16或float16。"
+    )
+
+
+def eval_precision_name(eval_cfg) -> str:
+    """返回实际评估精度名称，用于日志、输出目录和汇总记录。"""
+    mode = str(getattr(eval_cfg, "mode", "fast_repro"))
+    if not bool(getattr(eval_cfg, "use_amp", False)) or mode == "strict":
+        return "fp32"
+    amp_dtype = resolve_amp_dtype(getattr(eval_cfg, "amp_dtype", "bfloat16"))
+    return "bf16" if amp_dtype == torch.bfloat16 else "fp16"
+
+
+def make_eval_autocast_context(eval_cfg, device):
+    """创建显式指定dtype的评估autocast上下文，避免CUDA默认回退为FP16。"""
+    if not bool(getattr(eval_cfg, "use_amp", False)):
+        return nullcontext()
+    amp_dtype = resolve_amp_dtype(getattr(eval_cfg, "amp_dtype", "bfloat16"))
+    return torch.autocast(
+        device_type=torch.device(device).type,
+        dtype=amp_dtype,
+    )
+
+
 def prepare_policy_observation(raw_obs: dict, expected_keys: set[str], device) -> dict[str, torch.Tensor]:
     """只转换 policy 真正需要的观测键；兼容单环境和 gym.vector 的 batch 观测。"""
     batch = {}
@@ -843,7 +882,7 @@ def build_batch_output_dir(eval_cfg, run_dir: Path) -> Path:
 
     source = getattr(eval_cfg, "checkpoint_source", "all")
     mode = getattr(eval_cfg, "mode", "fast_repro")
-    precision = "amp" if getattr(eval_cfg, "use_amp", False) and mode != "strict" else "fp32"
+    precision = eval_precision_name(eval_cfg)
     ablation_tag = (
         coupling_ablation_tag(eval_cfg)
         + output_corrector_ablation_tag(eval_cfg)
@@ -972,6 +1011,13 @@ def write_eval_summary(summary_dir: Path, rows: list[dict], eval_cfg, source_pat
         "source_path": str(source_path),
         "checkpoint_source": getattr(eval_cfg, "checkpoint_source", "all"),
         "mode": getattr(eval_cfg, "mode", "fast_repro"),
+        "precision": eval_precision_name(eval_cfg),
+        "use_amp": bool(getattr(eval_cfg, "use_amp", False)),
+        "amp_dtype": (
+            str(getattr(eval_cfg, "amp_dtype", "bfloat16"))
+            if bool(getattr(eval_cfg, "use_amp", False))
+            else None
+        ),
         "seed": eval_cfg.seed,
         "n_episodes": eval_cfg.n_episodes,
         "eval_batch_size": int(getattr(eval_cfg, "batch_size", getattr(eval_cfg, "num_envs", 1))),
@@ -1009,6 +1055,8 @@ def write_eval_summary(summary_dir: Path, rows: list[dict], eval_cfg, source_pat
         "max_steps",
         "seed",
         "mode",
+        "precision",
+        "amp_dtype",
         "videos_dir",
         "episode_results_path",
         "checkpoint_path",
@@ -1241,7 +1289,7 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
         # ==========================================
         # 🌟 5.调用评估函数
         # ==========================================
-        with torch.autocast(device_type=device.type) if getattr(eval_cfg, "use_amp", False) else nullcontext():
+        with make_eval_autocast_context(eval_cfg, device):
             eval_info = custom_eval_policy(
                 env=eval_env,
                 policy=policy,
@@ -1286,6 +1334,12 @@ def evaluate_one_checkpoint(eval_cfg, checkpoint_path: Path, device, output_root
             "checkpoint_path": str(ckpt_path),
             "step": checkpoint_step(ckpt_path),
             "mode": eval_mode,
+            "precision": eval_precision_name(eval_cfg),
+            "amp_dtype": (
+                str(getattr(eval_cfg, "amp_dtype", "bfloat16"))
+                if bool(getattr(eval_cfg, "use_amp", False))
+                else None
+            ),
             "seed": eval_cfg.seed,
             "n_episodes": eval_cfg.n_episodes,
             "eval_batch_size": int(getattr(eval_env, "num_envs", 1)),
@@ -1350,6 +1404,11 @@ def main(eval_cfg):
         logging.warning("strict/deterministic 模式下自动关闭 AMP，避免混合精度带来的数值差异。")
         eval_cfg.use_amp = False
 
+    # 快速评估默认与预训练保持一致，显式使用BF16；这里提前校验配置，
+    # 避免加载完模型后才因拼写错误失败。
+    precision = eval_precision_name(eval_cfg)
+    logging.info("独立评估推理精度: %s", precision)
+
     seed_everything(eval_cfg.seed, deterministic=deterministic)
     if deterministic:
         patch_act_position_embedding_for_determinism()
@@ -1412,6 +1471,12 @@ def main(eval_cfg):
                 "checkpoint_path": str(checkpoint_path),
                 "step": checkpoint_step(checkpoint_path),
                 "mode": eval_mode,
+                "precision": eval_precision_name(eval_cfg),
+                "amp_dtype": (
+                    str(getattr(eval_cfg, "amp_dtype", "bfloat16"))
+                    if bool(getattr(eval_cfg, "use_amp", False))
+                    else None
+                ),
                 "seed": eval_cfg.seed,
                 "n_episodes": eval_cfg.n_episodes,
                 "eval_batch_size": int(getattr(eval_cfg, "batch_size", getattr(eval_cfg, "num_envs", 1))),
@@ -1452,9 +1517,9 @@ if __name__ == "__main__":
     # 🎯 核心配置区：在这里自由修改你的评估参数！
     # ==========================================
     eval_cfg = SimpleNamespace(
-        seed=1000,
+        seed=100,
         # 可以指向单个 checkpoint，也可以指向整次训练 run 目录或 run/checkpoints 目录。
-        ckpt_path=        "outputs/2_pretrain/post_diffusion_output_corrector/InsertCylinder-3Arms-v0/2026-07-27/19-41-43_InsertCylinder-3Arms-v0_pre_zed_post_diffusion_output_corrector/checkpoints/055000_loss=0.0017_sr=85.0_ar=729.92",
+        ckpt_path=        "outputs/2_pretrain/SewNeedle-3Arms-v0/2026-08-19/00-51-30_SewNeedle-3Arms-v0_dual_head_diffusion",
         checkpoint_source="all",  # all: 读取目录下 checkpoint全部文件；   top_k/latest: 读取 checkpoints/top_k_records.json中记录的模型
         max_checkpoints=None,     # 调试时可设为 1/2，正式评估保持 None
         eval_output_dir=None,     # None 时自动保存到 run_dir/policy_eval/固定配置名，方便断点续评
@@ -1466,11 +1531,11 @@ if __name__ == "__main__":
         
         # ⚙️ 评估参数设置
         mode="fast_repro",          # fast_repro: 快速且固定 seeds；  strict: 最强可复现但更慢
-        n_episodes=200,             # 评估多少个任务                 
+        n_episodes=100,             # 评估多少个任务
         max_episodes_rendered=0,    # 全量评估建议 0；需要视频时再改为 1/2
         fps=25,                     # 视频帧率，和环境控制频率对齐
         max_steps=400,              # 每个任务的最大步数
-        batch_size=15,               # 并行评估环境数量；设为 1 即回到单环境评估
+        batch_size=10,               # 并行评估环境数量；设为 1 即回到单环境评估
         use_async_envs=True,        # True 使用多进程 AsyncVectorEnv，False 使用单进程 SyncVectorEnv
         device="cuda",              # 如需完全规避 CUDA 非确定算子，可临时改成 "cpu"
         deterministic=False,        # 通常不用手动改；strict 模式会自动开启
@@ -1480,6 +1545,7 @@ if __name__ == "__main__":
         render_camera=['overhead_cam'],         # 保存video的相机视角    
         # ⚡ 快速评估默认开启混合精度；严格对比指标时可改 False
         use_amp=True,
+        amp_dtype="bfloat16",       # 与预训练及训练中异步评估保持一致；可选bfloat16/float16
 
         # 耦合推理消融；None沿用checkpoint，0关闭对应方向，1保持完整耦合。
         view_to_arm_coupling_scale=None,
